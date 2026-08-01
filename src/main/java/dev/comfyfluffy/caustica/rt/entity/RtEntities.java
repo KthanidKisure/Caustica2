@@ -71,8 +71,8 @@ import java.util.Queue;
  *
  * <p>Per-frame cost is real (per-entity capture + buffer uploads + a BLAS build); capped by {@code
  * -Dcaustica.rt.maxEntities}. Changed-entity geometry and refit scratch reuse the existing per-entity
- * graphics-timeline-guarded ring; motion uploads suballocate from a guarded per-frame-slot arena. A generic
- * size-bucketed recycling free-list was tried and measured slower per-call than trusting VMA's own allocator.
+ * graphics-timeline-guarded ring; motion uploads suballocate from a guarded per-frame-slot arena. Other
+ * transient allocations use VMA directly.
  */
 public final class RtEntities {
     public static final RtEntities INSTANCE = new RtEntities();
@@ -846,7 +846,7 @@ public final class RtEntities {
      * Upload this entity's world-space motion-vector displacement. Captures are entity-local, so the delta
      * is {@code (anchorCur + vertexCur) - (anchorPrev + vertexPrev)}. If every vertex agrees,
      * store it as a rigid vector in the geometry-table entry; otherwise write a per-vertex {@code vec4}
-     * buffer directly, avoiding the old intermediate {@code float[]}.
+     * buffer directly.
      */
     private Motion uploadVertexMotion(RtContext ctx, FrameBuild build, FloatArrayList cur,
                                       EntityPrev prev, float anchorX, float anchorY, float anchorZ) {

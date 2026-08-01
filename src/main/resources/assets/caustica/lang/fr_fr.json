@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "Rebonds de chemin",
 	"caustica.options.rt.maxBounces.tooltip": "Nombre maximal de rebonds secondaires de path tracing après le premier impact. Une valeur plus élevée capture plus de lumière indirecte, mais coûte plus cher.",
 
-	"caustica.options.rt.sunSize": "Taille du soleil",
-	"caustica.options.rt.sunSize.tooltip": "Rayon angulaire du disque du soleil et de la lune. Des disques plus grands créent des pénombres plus douces.",
-
 	"caustica.options.rt.entities": "Entités en lancer de rayons",
 	"caustica.options.rt.entities.tooltip": "Inclut les entités et entités de bloc dans la scène en lancer de rayons.",
 

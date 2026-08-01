@@ -261,6 +261,12 @@ public final class RtContext {
                 Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT, 0L);
     }
 
+    /** Create a transient, persistently mapped buffer for synchronous GPU-to-CPU transfers. */
+    public RtBuffer createReadbackBuffer(long size, String label) {
+        return createBuffer(size, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, label, false,
+                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, 0L);
+    }
+
     private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, boolean asyncShared,
                                   int hostAccessFlags, long addressAlignment) {
         if (addressAlignment < 0L

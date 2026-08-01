@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "Rebotes de camino",
 	"caustica.options.rt.maxBounces.tooltip": "Número máximo de rebotes secundarios de trazado de caminos tras el impacto primario. Un valor más alto captura más luz indirecta, pero cuesta más.",
 
-	"caustica.options.rt.sunSize": "Tamaño del sol",
-	"caustica.options.rt.sunSize.tooltip": "Radio angular del disco del sol y la luna. Los discos más grandes proyectan penumbras más suaves.",
-
 	"caustica.options.rt.entities": "Entidades con trazado de rayos",
 	"caustica.options.rt.entities.tooltip": "Incluye entidades y entidades de bloque en la escena con trazado de rayos.",
 

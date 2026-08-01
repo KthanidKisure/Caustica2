@@ -23,6 +23,12 @@ public final class CausticaClient implements ClientModInitializer {
 	public void onInitializeClient() {
 		CausticaMod.LOGGER.info("Caustica client initialized");
 
+		// Class-init runs DebugScreenEntries.register(...) via its ID field; touching the class here
+		// makes the entry discoverable in F3's entry list. Off by default -- the player opts in the
+		// same way as any other optional vanilla entry (e.g. GPU utilization).
+		@SuppressWarnings("unused")
+		Object registerExposureDebugEntry = RtExposureDebugEntry.ID;
+
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.
 		ClientTickEvents.START_CLIENT_TICK.register(client -> {
@@ -41,7 +47,7 @@ public final class CausticaClient implements ClientModInitializer {
 				}
 			}
 
-			// P2: once RT is up, keep section residency synced to vanilla's loaded chunks around
+			// Once RT is up, keep section residency synced to vanilla's loaded chunks around
 			// the player — builds newly-in-range sections, frees out-of-range ones, per tick.
 			if (rtInitDone) {
 				RtContext ctx = RtContext.currentOrNull();
@@ -67,6 +73,7 @@ public final class CausticaClient implements ClientModInitializer {
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
+			RtComposite.INSTANCE.resetExposureHistory();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
 		});
 

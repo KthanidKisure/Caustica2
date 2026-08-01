@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "Rimbalzi del percorso",
 	"caustica.options.rt.maxBounces.tooltip": "Numero massimo di rimbalzi secondari del path tracing dopo il primo colpo. Valori più alti catturano più luce indiretta, ma costano di più.",
 
-	"caustica.options.rt.sunSize": "Dimensione del sole",
-	"caustica.options.rt.sunSize.tooltip": "Raggio angolare del disco del sole e della luna. Dischi più grandi proiettano penombre più morbide.",
-
 	"caustica.options.rt.entities": "Entità con ray tracing",
 	"caustica.options.rt.entities.tooltip": "Include entità ed entità blocco nella scena con ray tracing.",
 

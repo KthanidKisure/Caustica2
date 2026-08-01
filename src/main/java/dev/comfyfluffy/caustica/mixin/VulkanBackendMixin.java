@@ -11,6 +11,7 @@ import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.rt.RtHdr;
 import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK12;
@@ -102,6 +103,7 @@ public abstract class VulkanBackendMixin {
 			}
 		}
 		VulkanDiagnostics.addDeviceFaultExtension(augmented, physicalDevice);
+		RtHdr.addDeviceExtension(augmented, physicalDevice);
 		RtDeviceBringup.addExtensions(augmented, physicalDevice);
 		args.set(0, augmented);
 
@@ -144,7 +146,7 @@ public abstract class VulkanBackendMixin {
 	}
 
 	/**
-	 * P0 verification — once the RT-augmented device is created, confirm the RT entry
+	 * Once the RT-augmented device is created, confirm the RT entry
 	 * points loaded and log the RT/AS limits. {@code device} is the local assigned just
 	 * before {@code createVma} runs.
 	 */

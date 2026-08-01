@@ -64,10 +64,16 @@ public final class RtFrameStats {
                     "frame.prepareTlas",
                     "frame.recordTlas",
                     "frame.trace",
+                    "frame.skyLut",
+                    // Wavefront trace and downstream debug stages.
+                    "frame.tracePrimary",
+                    "frame.traceIndirect",
                     "frame.exposure",
                     "frame.dlssRr",
                     "frame.upscale",
+                    "frame.bloom",
                     "frame.displayMap",
+                    "frame.debugPresent",
                     "frame.copyOutput"
             },
             new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",

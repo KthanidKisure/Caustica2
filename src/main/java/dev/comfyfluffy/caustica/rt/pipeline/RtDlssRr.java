@@ -27,7 +27,7 @@ public final class RtDlssRr {
         return CausticaConfig.Rt.DlssRr.ENABLED.value();
     }
 
-    // DLSS feature flags. IsHDR (bit 0): color is linear HDR (rgba16f) — RR requires it ("HDR Color
+    // DLSS feature flags. IsHDR (bit 0): color is scene-linear ACEScg HDR (rgba16f) — RR requires it ("HDR Color
     // required"). MVLowRes (bit 1): motion vectors are at render/input resolution, not display — RR
     // requires it ("Low resolution Motion Vectors required"). DepthInverted (bit 3): the depth guide is
     // HW reversed-Z (near=1, far=0). AutoExposure (bit 6): in HDR mode DLSS needs the scene exposure

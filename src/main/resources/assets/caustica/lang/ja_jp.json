@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "パスのバウンス数",
 	"caustica.options.rt.maxBounces.tooltip": "最初のヒット後に行う二次パストレーシングバウンスの最大数。高いほど間接光を多く捉えますが、負荷も増えます。",
 
-	"caustica.options.rt.sunSize": "太陽のサイズ",
-	"caustica.options.rt.sunSize.tooltip": "太陽と月の円盤の角半径。大きいほど影の半影が柔らかくなります。",
-
 	"caustica.options.rt.entities": "レイトレーシング対象エンティティ",
 	"caustica.options.rt.entities.tooltip": "エンティティとブロックエンティティをレイトレーシングシーンに含めます。",
 

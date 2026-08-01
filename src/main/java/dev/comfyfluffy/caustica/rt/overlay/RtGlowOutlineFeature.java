@@ -41,7 +41,7 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
     private RtContext ctx;
     private RtOverlayPipelines.Pipeline maskPipeline;
     private RtOverlayPipelines.Pipeline compositePipeline;
-    private RtOverlayPipelines.StorageImageSet compositeSet;
+    private RtOverlayPipelines.ReadOnlyImageSet compositeSet;
     private RtImage maskImage;
 
     // This frame's prepared draw data (valid between prepare() returning true and record()).
@@ -120,13 +120,13 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
     private void ensureResources(RtContext ctx, int width, int height) {
         this.ctx = ctx;
         if (maskPipeline == null) {
-            maskPipeline = new RtOverlayPipelines.Spec("entity_glow.vert.spv", "entity_glow.frag.spv")
+            maskPipeline = new RtOverlayPipelines.Spec("entity_glow/vertex.vert.spv", "entity_glow/fragment.frag.spv")
                     .vertex(RtOverlayPipelines.VertexFormat.POSITION)
                     .attachment(MASK_FORMAT)
                     .push(MASK_PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT)
                     .build(ctx, "glow mask");
-            compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "glow composite");
-            compositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "entity_glow_composite.frag.spv")
+            compositeSet = RtOverlayPipelines.readOnlyImageSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "glow composite");
+            compositePipeline = new RtOverlayPipelines.Spec("overlay_composite/vertex.vert.spv", "overlay_composite/glow.frag.spv")
                     .blend(RtOverlayPipelines.Blend.ALPHA)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .descriptorSetLayout(compositeSet.layout)
@@ -139,7 +139,7 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
             maskImage = ctx.createStorageImage(width, height, MASK_FORMAT,
                     "glow outline mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         }
-        compositeSet.bind(ctx, 0, maskImage.view);
+        compositeSet.bind(ctx, maskImage.view);
     }
 
     @Override

@@ -198,9 +198,9 @@ public final class RtDeviceBringup {
             RAY_QUERY_FEATURE);
 
     private enum SerBackend {
-        NONE("none", null, "world_primary.rgen.spv", "world.rgen.spv"),
+        NONE("none", null, "primary.rgen.spv", "indirect.rgen.spv"),
         EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
-                "world_primary.rgen.spv", "world_ser.rgen.spv");
+                "primary.rgen.spv", "indirect_ser.rgen.spv");
 
         final String label;
         final String extensionName;
@@ -307,7 +307,7 @@ public final class RtDeviceBringup {
      * Reserve one additional physical queue at device-creation time. Minecraft's queue-family map only
      * requests handles for its graphics/compute/transfer queues; fetching a higher queue index without first
      * increasing the matching {@link VkDeviceQueueCreateInfo#queueCount()} would be invalid. Prefer a
-     * compute-only family, but add a previously-unused compute family when that leaves the Minecraft queues
+     * compute-only family, but add a dedicated compute family when that leaves the Minecraft queues
      * untouched and has a free physical slot.
      */
     public static void reserveComputeQueue(VkDeviceCreateInfo deviceCreateInfo,

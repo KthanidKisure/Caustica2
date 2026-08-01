@@ -159,7 +159,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
         }
         imageSetPool = RtOverlayPipelines.sampledImageSetPool(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, MAX_ATLAS_PAGES, "name tag");
         sampler = RtOverlayPipelines.createNearestClampSampler(ctx, "name tag font atlas");
-        pipeline = new RtOverlayPipelines.Spec("name_tag.vert.spv", "name_tag.frag.spv")
+        pipeline = new RtOverlayPipelines.Spec("name_tag/vertex.vert.spv", "name_tag/fragment.frag.spv")
                 .vertex(RtOverlayPipelines.VertexFormat.POSITION_TEX_COLOR)
                 .blend(RtOverlayPipelines.Blend.ALPHA)
                 .attachment(RtWorldOverlay.TARGET_FORMAT)

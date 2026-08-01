@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "Path-Bounces",
 	"caustica.options.rt.maxBounces.tooltip": "Maximale Anzahl sekundärer Pathtracing-Bounces nach dem Primärtreffer. Höhere Werte erfassen mehr indirektes Licht, kosten aber mehr Leistung.",
 
-	"caustica.options.rt.sunSize": "Sonnengröße",
-	"caustica.options.rt.sunSize.tooltip": "Winkelradius der Sonnen- und Mondscheibe. Größere Scheiben erzeugen weichere Halbschatten.",
-
 	"caustica.options.rt.entities": "Raytracing-Entitäten",
 	"caustica.options.rt.entities.tooltip": "Entitäten und Blockentitäten in die Raytracing-Szene einbeziehen.",
 

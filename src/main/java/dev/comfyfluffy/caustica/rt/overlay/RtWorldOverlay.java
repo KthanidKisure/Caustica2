@@ -42,12 +42,10 @@ import dev.comfyfluffy.caustica.rt.accel.RtImage;
  * {@link RtOverlayFeature}; pipelines come from {@link RtOverlayPipelines}.
  *
  * <p>Routing every feature through one shared buffer instead of blending straight onto vanilla's SDR
- * {@code main} is what keeps SDR/HDR presentation unified: {@link #record} now folds that buffer into
+ * {@code main} keeps SDR/HDR presentation unified: {@link #record} folds that buffer into
  * {@link RtUiOverlay}'s transparent overlay before the vanilla GUI renders, so the GUI remains topmost and
- * the final present path only has one UI image to blend. (Block outline's own private MSAA-mask-resolve path
- * predates this buffer and still runs before its result ever reaches {@code overlayImage} — an FXAA pass over
- * the shared buffer was tried and removed as looking worse than expected; MSAA remains the only edge-AA
- * mechanism today.)
+ * the final present path only has one UI image to blend. The block outline applies its private MSAA
+ * mask-resolve before its result reaches {@code overlayImage}; MSAA is the overlay edge-AA mechanism.
  */
 public final class RtWorldOverlay {
     public static final RtWorldOverlay INSTANCE = new RtWorldOverlay();
@@ -66,7 +64,7 @@ public final class RtWorldOverlay {
     private RtContext ctxRef;
     private RtImage overlayImage;
     private RtOverlayPipelines.Pipeline uiCompositePipeline;
-    private RtOverlayPipelines.StorageImageSet uiCompositeSet;
+    private RtOverlayPipelines.ReadOnlyImageSet uiCompositeSet;
 
     private RtWorldOverlay() {
     }
@@ -112,11 +110,11 @@ public final class RtWorldOverlay {
     private void ensureOverlayBuffer(RtContext ctx, int width, int height) {
         this.ctxRef = ctx;
         if (uiCompositePipeline == null) {
-            uiCompositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "world overlay UI composite");
+            uiCompositeSet = RtOverlayPipelines.readOnlyImageSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "world overlay UI composite");
             // PREMULTIPLIED_ALPHA, not ALPHA: overlayImage ends up holding premultiplied content once more
             // than one feature has drawn into it (see Blend.ALPHA's doc) — blending it into the shared UI
             // image with the straight-alpha recipe would double-multiply by alpha.
-            uiCompositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
+            uiCompositePipeline = new RtOverlayPipelines.Spec("overlay_composite/vertex.vert.spv", "overlay_composite/passthrough.frag.spv")
                     .blend(RtOverlayPipelines.Blend.PREMULTIPLIED_ALPHA)
                     .attachment(TARGET_FORMAT)
                     .descriptorSetLayout(uiCompositeSet.layout)
@@ -129,7 +127,7 @@ public final class RtWorldOverlay {
             overlayImage = ctx.createStorageImage(width, height, TARGET_FORMAT,
                     "world overlay " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         }
-        uiCompositeSet.bind(ctx, 0, overlayImage.view);
+        uiCompositeSet.bind(ctx, overlayImage.view);
     }
 
     private void record(RtContext ctx, List<RtOverlayFeature> ready, long targetView, int width, int height) {

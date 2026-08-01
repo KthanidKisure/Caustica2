@@ -15,9 +15,9 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
  * <p><b>One rectangle light per emissive quad.</b> {@code emit()}/{@code emitQuad()} always write a quad
  * as two lockstep triangles (0,1,2)(0,2,3) over 4 consecutive verts with prim/cornerUv records in step,
  * so quad {@code k} is triangles {@code 2k, 2k+1} and its corners are verts {@code 4k..4k+3}. Unlike the
- * old branch's disc, the light is the emissive footprint's <b>bounding rectangle</b> (half-axes in the
+ * The light is the emissive footprint's <b>bounding rectangle</b> (half-axes in the
  * record): it doesn't overshoot the emitter shape, and its (s,t) parameterization <i>is</i> the affine
- * sprite-local UV map that the S3 exact-Le fetch needs.
+ * sprite-local UV map used for exact radiance lookup.
  *
  * <p><b>Radiance matches the closest-hit.</b> Per-texel shaded emission is {@code albedo * mask *
  * emissionStrength}, where the mask source (LabPBR {@code _s} blue channel / heuristic mask x block
@@ -30,7 +30,7 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
  * emissive sample, hence {@code Le_rect * rectArea == quadArea * mean(albedo*mask)}.
  *
  * <p><b>Membership.</b> An in-buffer quad gets {@code TerrainPrim.flags} bit 0 set on both triangles, so
- * the raygen can gate its direct-hit emission term (S1). Emitters too weak or too sparse (fill-ratio
+ * the raygen can gate its direct-hit emission term. Emitters too weak or too sparse (fill-ratio
  * gate) stay excluded and are always-gathered on path hits — bit-identical to the no-NEE path.
  */
 final class RtLightCollector {
@@ -55,8 +55,14 @@ final class RtLightCollector {
     /**
      * An emitter whose rectangle-mean radiance luminance is below this is too weak to bother sampling:
      * keep it out of the buffer (always-gathered on hits instead).
+     *
+     * <p>Expressed as a fraction of the emissive baseline rather than as an absolute radiance, because
+     * "too weak to sample" is a statement about this emitter relative to a full-strength one, not about
+     * cd/m². Expressing it relative to the configured baseline keeps material brightness and sampling
+     * eligibility independent.
      */
-    private static final float LE_LUM_EPS = 0.005f;
+    private static final float LE_LUM_EPS =
+            0.001f * RtMaterialRegistry.defaultEmissionLuminanceCdM2();
 
     /** Samples per axis over the quad's (a,b) parameter square; matches the emission grid resolution. */
     private static final int SCAN = RtEmissionGrid.SIZE;
@@ -201,21 +207,30 @@ final class RtLightCollector {
 
             // Rectangle-mean radiance: every emissive sample lies inside the rectangle, so
             // sum/rectSamples preserves the quad's total emissive power at rectArea. emissionStrength()
-            // is the material's final HDR strength (EMISSIVE_STRENGTH baseline * any JSON multiplier,
+            // is the material's final HDR luminance (look-package baseline or absolute JSON override,
             // baked in RtMaterialRegistry) — the single knob shared with world.rchit's direct-hit shading.
-            float tintR = p[pb + 4], tintG = p[pb + 5], tintB = p[pb + 6];
+            // Texture-grid averages are already linear BT.709; captured vertex/biome tint is still
+            // sRGB-encoded. Combine in the authored basis, use its invariant Y for the membership gate,
+            // then store the emitter in the scene's linear ACEScg transport basis.
+            float tintR = srgbToLinear(p[pb + 4]);
+            float tintG = srgbToLinear(p[pb + 5]);
+            float tintB = srgbToLinear(p[pb + 6]);
             float scale = factor * desc.emissionStrength() / rectSamples;
-            float leR = sumR * scale * tintR;
-            float leG = sumG * scale * tintG;
-            float leB = sumB * scale * tintB;
-            float lum = 0.2126f * leR + 0.7152f * leG + 0.0722f * leB;
+            float le709R = sumR * scale * tintR;
+            float le709G = sumG * scale * tintG;
+            float le709B = sumB * scale * tintB;
+            float lum = 0.2126f * le709R + 0.7152f * le709G + 0.0722f * le709B;
             if (lum < LE_LUM_EPS || fill < minFillRatio) {
                 continue; // excluded: always-gathered on path hits, no energy lost
             }
+            // Same OCIO-derived Linear Rec.709/D65 -> ACEScg/AP1/D60 matrix as world_common.slang.
+            float leR = 0.61309743f * le709R + 0.33952314f * le709G + 0.04737945f * le709B;
+            float leG = 0.07019372f * le709R + 0.91635388f * le709G + 0.01345240f * le709B;
+            float leB = 0.02061559f * le709R + 0.10956977f * le709G + 0.86981463f * le709B;
 
             float aC = 0.5f * (aLo + aHi);
             float bC = 0.5f * (bLo + bHi);
-            // Sprite-local UV frame of the rectangle (S3 exact-Le fetch): affine map from the light's
+            // Sprite-local UV frame of the rectangle: affine map from the light's
             // (s,t) in [-1,1]^2 to sprite-local UV, evaluated from the same bilinear corner map.
             float uvCu;
             float uvCv;
@@ -267,11 +282,16 @@ final class RtLightCollector {
         return Float.intBitsToFloat(bits);
     }
 
+    private static float srgbToLinear(float value) {
+        return value <= 0.04045f ? value / 12.92f
+                : (float) Math.pow((value + 0.055f) / 1.055f, 2.4f);
+    }
+
     /**
-     * Packed light record, 5 vec4s / 80 B (matches the S1 shader struct):
+     * Packed light record, 5 vec4s / 80 B (matches the shader struct):
      * {@code {pos.xyz, rectArea} {normal.xyz, materialId} {halfU.xyz, packHalf2(uvHu)}
-     * {halfV.xyz, packHalf2(uvHv)} {Le.rgb, packHalf2(uvCenter)}}. Positions/axes section-local here;
-     * publish adds the section-origin-minus-rebase offset to pos only.
+     * {halfV.xyz, packHalf2(uvHv)} {Le2020.rgb, packHalf2(uvCenter)}}. Positions/axes section-local
+     * here; publish adds the section-origin-minus-rebase offset to pos only.
      */
     private static void append(FloatArrayList out,
                                float px, float py, float pz, float area,

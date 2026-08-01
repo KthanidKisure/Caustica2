@@ -102,9 +102,10 @@ final class RtLightHierarchy {
                         + crossZ * section.lights[source + 6] < 0.0f) {
                     packedLights[destination + 7] = Float.intBitsToFloat(NORMAL_FLIP_BIT);
                 }
-                double luminance = 0.2126 * unpackUnsignedFloat(packedLe & 0x7ff, 6)
-                        + 0.7152 * unpackUnsignedFloat((packedLe >>> 11) & 0x7ff, 6)
-                        + 0.0722 * unpackUnsignedFloat((packedLe >>> 22) & 0x3ff, 5);
+                // Collector output and the packed GPU record are linear ACEScg/AP1.
+                double luminance = 0.27222872 * unpackUnsignedFloat(packedLe & 0x7ff, 6)
+                        + 0.67408177 * unpackUnsignedFloat((packedLe >>> 11) & 0x7ff, 6)
+                        + 0.05368952 * unpackUnsignedFloat((packedLe >>> 22) & 0x3ff, 5);
                 double power = Math.max(0.0, section.lights[source + 3] * luminance);
                 powers[lightIndex] = power;
                 sectionPower += power;

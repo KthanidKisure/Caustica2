@@ -4,6 +4,7 @@ import com.mojang.blaze3d.platform.NativeImage;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.SpriteContentsAccessor;
 import dev.comfyfluffy.caustica.rt.RtContext;
+import dev.comfyfluffy.caustica.rt.RtLookPackage;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.gen.MaterialHeaderData;
 import dev.comfyfluffy.caustica.rt.gen.MaterialHeaderData.Float4;
@@ -45,14 +46,32 @@ public final class RtMaterialRegistry {
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
     public static final int FEATURE_STOCHASTIC_ALPHA = 16;
-    // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo — the single knob
-    // (formerly duplicated as a literal in world.rgen.slang and RtLightCollector). Baked into every
+    // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo. Baked into every
     // emissive RtMaterialDesc.emissionStrength at compile time (compileDesc/compileEntityDesc), times
-    // any resource-pack emission.strength multiplier; see header()'s packing and RtMaterialOverrides.
-    private static final float EMISSIVE_STRENGTH = 5.0f;
+    // any resource-pack absolute emission.strength_cd_m2 override; see header() and RtMaterialOverrides.
+    //
+    // Photometric: cd/m² of the emitting surface, per {@link dev.comfyfluffy.caustica.rt.RtSceneUnits}.
+    //
+    // Anchored on LUMINOUS EXITANCE, not on flame luminance: a full-strength emitter face radiates about
+    // 1,000 lm/m², so one 1 m² block face is a ~1,000 lm lamp — a 75 W-equivalent bulb, which is what a
+    // glowstone block is meant to be in a room. Lambertian exitance M = π·L, so L = 1000/π = 318 cd/m².
+    //
+    // A flame really is far brighter per unit area than a glowstone block, so one baseline cannot be
+    // right for both; the mask supplies coverage, not intensity. Exitance is the correct thing to anchor
+    // because it is what the emitter contributes to the room, and it happens to land a torch's small
+    // emissive footprint near 40 lm—a candle to a small torch.
+    public static float defaultEmissionLuminanceCdM2() {
+        return RtLookPackage.current().lighting().blockEmissionLuminanceCdM2();
+    }
     private static final int EMISSION_STRENGTH_SHIFT = 8;
     private static final int EMISSION_STRENGTH_MASK = 65535;
-    private static final float MAX_EMISSION_STRENGTH = 32.0f;
+    // Ceiling of the 16-bit fixed-point strength field, raised with the baseline above. HALF_MAX is the
+    // real transport ceiling downstream — Payload.emissionSss is a half2 lane and Light.le is packed
+    // R11G11B10 — so clamping here rather than higher keeps the encoded value representable end to end.
+    // The quantisation step is MAX/65535 ≈ 1 cd/m², i.e. 0.007% at the baseline. A resource pack's
+    // maximum 5x multiplier would reach 75,000 and clamps to this: a 0.19 EV reduction on something
+    // already several EV past display white, so invisible.
+    private static final float MAX_EMISSION_STRENGTH = 65504.0f;
     private static final int MAX_LOD_SHIFT = 24;
 
     private static final int MODEL_VARIANTS = 2; // ordinary opaque/cutout and transparent dielectric
@@ -141,7 +160,7 @@ public final class RtMaterialRegistry {
                 false, true, RtMaterialDesc.EmissionSummary.NONE), whiteAverage(), fallbackEntry, null);
         int lavaId = headers.size();
         // Lava's fluid mesher assigns this singleton id (no sprite resolve), so its light color comes from
-        // the lava_still albedo grid — a mean-color area light instead of the old branch's white lava.
+        // the lava_still albedo grid, producing a mean-color area light.
         add(headers, descriptions, grids, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA,
                 true, true, uniformWhiteSummary()), whiteAverage(), fallbackEntry,
                 albedoGridFor(sprites, spriteStats, "block/lava_still"));
@@ -460,7 +479,8 @@ public final class RtMaterialRegistry {
         } else {
             emissionSource = RtMaterialDesc.EmissionSource.NONE;
         }
-        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : EMISSIVE_STRENGTH;
+        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE
+                ? 0.0f : defaultEmissionLuminanceCdM2();
         return new RtMaterialDesc(model, source, features, roughness, metalness, ior, transmission,
                 emissionSource, emissionStrength, emissionSummary);
     }
@@ -472,7 +492,8 @@ public final class RtMaterialRegistry {
                 : (authored ? RtMaterialDesc.Source.LAB_PBR : RtMaterialDesc.Source.HEURISTIC);
         RtMaterialDesc.EmissionSource emissionSource = (features & FEATURE_SPEC) != 0
                 ? RtMaterialDesc.EmissionSource.LAB_PBR : RtMaterialDesc.EmissionSource.NONE;
-        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : EMISSIVE_STRENGTH;
+        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE
+                ? 0.0f : defaultEmissionLuminanceCdM2();
         return new RtMaterialDesc(MODEL_OPAQUE, source, features, RtMaterials.ENTITY_ROUGH, 0.0f,
                 1.0f, 0.0f, emissionSource, emissionStrength, emissionSummary);
     }
@@ -518,7 +539,7 @@ public final class RtMaterialRegistry {
                                              float albedoInvDu, float albedoInvDv) {
         int packedFeatures = desc.features() | (entry.maxLod() << MAX_LOD_SHIFT);
         // Packed unconditionally (0 for non-emissive materials): the shader multiplies surface.emission
-        // by this every time, regardless of source, so EMISSIVE_STRENGTH never needs its own copy there.
+        // by this every time, regardless of source, so the package baseline needs no shader copy.
         int strength = Math.round(Math.min(MAX_EMISSION_STRENGTH, desc.emissionStrength())
                 * (EMISSION_STRENGTH_MASK / MAX_EMISSION_STRENGTH));
         packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;

@@ -9,14 +9,13 @@ import java.util.Map;
  *
  * <p>Every dielectric is a volume: {@code world.rgen} refracts at the interface and pushes a
  * participating medium whose extinction attenuates the segment inside. IOR is therefore the whole
- * material description — it drives both the Snell bend and the Fresnel split, and getting it wrong is
- * visible as the wrong amount of distortion. Everything translucent used to share one per-model
- * constant, so ice refracted exactly like window glass.
+ * material description—it drives both the Snell bend and the Fresnel split, and determines the visible
+ * distortion for each material.
  *
  * <p>Sprite-keyed rather than block-keyed because the material registry compiles per sprite, and
  * resolved once per sprite so it adds no variants to the profile x model x emission cross product. A
  * resource pack that renames textures falls back to the soda-lime default, and a
- * {@code caustica/materials/*.json} rule can set {@code transmission.ior} explicitly.
+ * {@code materials/*.json} rule can set {@code transmission.ior} explicitly.
  */
 public final class RtDielectrics {
     private RtDielectrics() {}

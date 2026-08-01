@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * Mutable GPU section-table state owned by the render thread. M0 centralizes the table buffer, slot
+ * Mutable GPU section-table state owned by the render thread. This class centralizes the table buffer, slot
  * registry, and published static-instance list here while {@link RtTerrain} retains publication order.
  */
 final class RtSectionTable {

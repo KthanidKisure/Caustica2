@@ -11,10 +11,10 @@ public record RtMaterialDesc(
         float transmission,
         EmissionSource emissionSource,
         /**
-         * Final HDR emission strength: {@code EMISSIVE_STRENGTH} (the material-compile-time baseline,
-         * see {@link RtMaterialRegistry}) times any resource-pack {@code emission.strength} multiplier.
+         * Final HDR emitting-surface luminance in cd/m²: the look-package block baseline, replaced by
+         * a resource-pack {@code emission.strength_cd_m2} value when present.
          * 0 when {@code emissionSource == NONE}. Applied uniformly regardless of source — LabPBR,
-         * heuristic-mask, or state-uniform all get the same baseline, an override just scales it.
+         * heuristic-mask, or state-uniform all get the same baseline unless absolutely overridden.
          */
         float emissionStrength,
         EmissionSummary emissionSummary

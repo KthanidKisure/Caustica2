@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "Отскоки пути",
 	"caustica.options.rt.maxBounces.tooltip": "Максимальное число вторичных отскоков path tracing после первичного попадания. Более высокие значения захватывают больше непрямого света, но обходятся дороже.",
 
-	"caustica.options.rt.sunSize": "Размер солнца",
-	"caustica.options.rt.sunSize.tooltip": "Угловой радиус диска солнца и луны. Более крупные диски дают более мягкие полутени.",
-
 	"caustica.options.rt.entities": "Трассируемые сущности",
 	"caustica.options.rt.entities.tooltip": "Включает сущности и блочные сущности в сцену с трассировкой лучей.",
 

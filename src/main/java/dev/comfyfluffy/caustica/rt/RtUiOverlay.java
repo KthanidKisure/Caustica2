@@ -21,7 +21,7 @@ import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.RenderPipelines;
 
 /**
- * HDR Phase 2 (step A) — transparent final-UI overlay. World-space overlay features and the vanilla GUI/HUD
+ * Transparent final-UI overlay. World-space overlay features and the vanilla GUI/HUD
  * are routed into one transparent {@code RGBA8} target, then that single image is composited back over the
  * world (from {@code GameRendererMixin}, right after {@code GuiRenderer.render} returns). In SDR this
  * reproduces vanilla; the point is to keep SDR-authored UI out of the world's HDR tonemap once HDR
@@ -66,8 +66,8 @@ public final class RtUiOverlay {
     }
 
     /**
-     * Runs regardless of HDR mode (the GUI redirect + composite-back reproduces vanilla exactly in SDR —
-     * GPU-verified during HDR Phase 2 step A) since {@code RtWorldOverlay}'s composite point is this same
+     * Runs regardless of HDR mode because the GUI redirect and composite-back reproduce vanilla in SDR,
+     * while {@code RtWorldOverlay}'s composite point is this same
      * seam and needs it to fire every frame. Active only once the game has finished loading: the composite
      * pipeline lazily compiles its shaders, which are not available during the loading screen (would crash
      * with "Couldn't find source for core/screenquad"). Gating the redirect here keeps the loading-screen

@@ -15,9 +15,6 @@
 	"caustica.options.rt.maxBounces": "路径反弹",
 	"caustica.options.rt.maxBounces.tooltip": "主命中之后的二级路径追踪反弹最大次数。数值越高能捕捉更多间接光，但成本也越高。",
 
-	"caustica.options.rt.sunSize": "太阳大小",
-	"caustica.options.rt.sunSize.tooltip": "太阳和月亮圆盘的角半径。圆盘越大，投射的半影越柔和。",
-
 	"caustica.options.rt.entities": "光追实体",
 	"caustica.options.rt.entities.tooltip": "将实体和方块实体加入光追场景。",
 

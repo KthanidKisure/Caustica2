@@ -160,8 +160,8 @@ public final class RtBlockMaterials {
                 normalCount++;
             }
             // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
-            // sprites proven to occur on an emitting block state. A resource-pack emission.strength
-            // override only scales this once resolved (RtMaterialOverrides.Rule.apply) — it never
+            // sprites proven to occur on an emitting block state. A resource-pack
+            // emission.strength_cd_m2 override replaces the level once resolved — it never
             // changes which sprites get a mask compiled here.
             if ((features & RtMaterialRegistry.FEATURE_SPEC) == 0 && emissionSemantics.permits(sprite)) {
                 features |= RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION;
@@ -533,7 +533,7 @@ public final class RtBlockMaterials {
                     : RtMaterialRegistry.FEATURE_NORMAL, (a, b) -> a | b);
         }
         // Also register any non-block sprite a rule targets, even lacking _s/_n, so overrides
-        // (roughness/metalness/model, or an emission.strength multiplier once some other source
+        // (roughness/metalness/model, or an absolute emission.strength_cd_m2 once some other source
         // supplies emission) have a compiled Candidate/Entry to apply to.
         for (RtMaterialOverrides.Rule rule : overrides.rules()) {
             if (rule.block() != null || blockNames.contains(rule.sprite())) {
