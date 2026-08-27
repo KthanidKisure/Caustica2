@@ -20,6 +20,7 @@ import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BiomeColors;
+import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.ModelBakery;
@@ -1184,12 +1185,33 @@ public final class RtComposite {
             // around inside — is what makes a storm deck read as heavy rather than merely large.
             float cloudWeather = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value()
                     * Math.min(rainLevel + thunderLevel * 0.5f, 1f);
+            // Cloud colour and height come from the same attribute system. CLOUD_HEIGHT is a world Y,
+            // so it is rebased alongside everything else below.
+            float cloudR = 1f, cloudG = 1f, cloudB = 1f;
+            float vanillaCloudHeight = Float.NaN;
+            if (level != null) {
+                var reader = level.environmentAttributes();
+                int cloudColor = reader.getValue(EnvironmentAttributes.CLOUD_COLOR, cameraBlockPos);
+                cloudR = srgbToLinear(((cloudColor >> 16) & 0xFF) / 255f);
+                cloudG = srgbToLinear(((cloudColor >> 8) & 0xFF) / 255f);
+                cloudB = srgbToLinear((cloudColor & 0xFF) / 255f);
+                vanillaCloudHeight = reader.getValue(EnvironmentAttributes.CLOUD_HEIGHT, cameraBlockPos);
+            }
+            Float4 dimCloud = new Float4(cloudR, cloudG, cloudB,
+                    CausticaConfig.Rt.Clouds.VANILLA_TINT.value());
+            // Vanilla's cloud height wins when enabled and actually reported — a dimension with no cloud
+            // layer leaves the attribute absent, in which case the configured altitude is the only
+            // sensible answer rather than dropping the deck to zero.
+            float cloudDeckBase = CausticaConfig.Rt.Clouds.VANILLA_HEIGHT.value()
+                    && !Float.isNaN(vanillaCloudHeight)
+                    ? vanillaCloudHeight
+                    : CausticaConfig.Rt.Clouds.ALTITUDE.value();
             float cloudCoverage = CausticaConfig.Rt.Clouds.COVERAGE.value();
             cloudCoverage += (1f - cloudCoverage) * cloudWeather * 0.85f;
             Float4 cloud0 = new Float4(
                     cloudCoverage,
                     CausticaConfig.Rt.Clouds.DENSITY.value() * (1f + cloudWeather * 1.5f),
-                    CausticaConfig.Rt.Clouds.ALTITUDE.value() - terrain.blockY,
+                    cloudDeckBase - terrain.blockY,
                     CausticaConfig.Rt.Clouds.THICKNESS.value());
             Float4 cloud1 = new Float4(
                     (terrain.blockX & WATER_ANCHOR_MASK) + cloudWind * 0.8f,
@@ -1203,6 +1225,46 @@ public final class RtComposite {
                     CausticaConfig.Rt.Clouds.SHADOW_STRENGTH.value(),
                     CausticaConfig.Rt.Clouds.SHADOW_FLOOR.value() * (1f - cloudWeather * 0.5f),
                     wetness, 0f);
+            // Vanilla environment colours. 26.2 moved per-biome and per-dimension colour out of
+            // BiomeSpecialEffects into the EnvironmentAttributes system, which samples and interpolates
+            // across biome boundaries itself — so this is vanilla's own blended value at the camera,
+            // not a nearest-biome lookup that would pop at a border.
+            //
+            // Sampled once per frame at the camera. Sky and fog colour are whole-view properties; a
+            // per-pixel lookup would buy nothing and cost a chunk-lookup per ray.
+            int skyboxMode = 0;
+            float skyR = 0f, skyG = 0f, skyB = 0f;
+            float fogR = 0f, fogG = 0f, fogB = 0f;
+            float fogTintStrength = 0f;
+            if (level != null) {
+                var reader = level.environmentAttributes();
+                int skyColor = reader.getValue(EnvironmentAttributes.SKY_COLOR, cameraBlockPos);
+                int fogColor = reader.getValue(EnvironmentAttributes.FOG_COLOR, cameraBlockPos);
+                skyR = srgbToLinear(((skyColor >> 16) & 0xFF) / 255f);
+                skyG = srgbToLinear(((skyColor >> 8) & 0xFF) / 255f);
+                skyB = srgbToLinear((skyColor & 0xFF) / 255f);
+                fogR = srgbToLinear(((fogColor >> 16) & 0xFF) / 255f);
+                fogG = srgbToLinear(((fogColor >> 8) & 0xFF) / 255f);
+                fogB = srgbToLinear((fogColor & 0xFF) / 255f);
+                skyboxMode = switch (level.dimensionType().skybox()) {
+                    case OVERWORLD -> 0;
+                    case END -> 1;
+                    case NONE -> 2;
+                };
+                // In the Overworld the physical atmosphere is the truth and vanilla's fog colour is a
+                // light artistic tint on top of it. Elsewhere there is no atmosphere to defer to, so
+                // vanilla's colour becomes the whole answer.
+                fogTintStrength = skyboxMode == 0
+                        ? CausticaConfig.Rt.Fog.BIOME_RESPONSE.value() * 0.5f
+                        : 1.0f;
+            }
+            Float4 dimSky = new Float4(skyR, skyG, skyB, skyboxMode);
+            Float4 dimFog = new Float4(fogR, fogG, fogB, fogTintStrength);
+            Float4 pom = new Float4(
+                    CausticaConfig.Rt.Pom.DEPTH.value(),
+                    CausticaConfig.Rt.Pom.QUALITY.value(),
+                    CausticaConfig.Rt.Pom.FADE_LOD.value(),
+                    0f);
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1242,7 +1304,11 @@ public final class RtComposite {
                     fog,
                     cloud0,
                     cloud1,
-                    cloud2
+                    cloud2,
+                    pom,
+                    dimSky,
+                    dimFog,
+                    dimCloud
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
@@ -1533,6 +1599,14 @@ public final class RtComposite {
             // celestials atlas not yet loaded — keep full-range UVs (fallback texture is the block atlas)
         }
         celestialUvMoonPhase = moonPhase;
+    }
+
+    /**
+     * sRGB EOTF for a single 0..1 channel. The environment-attribute colours arrive as packed sRGB
+     * bytes; the shader tints in linear, so they cross the transfer function exactly once, here.
+     */
+    private static float srgbToLinear(float code) {
+        return code <= 0.04045f ? code / 12.92f : (float) Math.pow((code + 0.055f) / 1.055f, 2.4);
     }
 
     private static Float4 linearAcesCgFromSrgb(double r, double g, double b, float w) {

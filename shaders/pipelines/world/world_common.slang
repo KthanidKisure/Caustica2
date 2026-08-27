@@ -103,7 +103,23 @@ public struct WorldPush {
     // cloud2: x ground-shadow strength (0 disables shadowing without disabling the deck), y the
     // multiple-scattering floor the shadow cannot darken past, z rain wetness 0..1, w unused.
     public float4   cloud2;
+    // ---- Parallax occlusion mapping. x depth in sprite-widths (0 disables it entirely), y step-count
+    // scale, z ray-cone LOD at which it has faded out, w unused.
+    public float4   pom;
+    // ---- Dimension / biome environment colours, read from 26.2's EnvironmentAttributes system.
+    // dimSky: rgb = SKY_COLOR (linear BT.709), w = skybox mode (0 overworld, 1 end, 2 none/nether).
+    // dimFog: rgb = FOG_COLOR (linear BT.709), w = how strongly it tints scattering, 0 = not at all.
+    public float4   dimSky;
+    public float4   dimFog;
+    // dimCloud: rgb = vanilla CLOUD_COLOR (linear BT.709), w = tint strength (0 = leave the deck lit
+    // purely by the atmosphere).
+    public float4   dimCloud;
 };
+
+// Skybox modes, mirroring vanilla's DimensionType.Skybox enum.
+public static const uint SKYBOX_OVERWORLD = 0u;
+public static const uint SKYBOX_END = 1u;
+public static const uint SKYBOX_NONE = 2u;
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
 // grid-relative owner section uses three unsigned 10-bit coordinates; the geometric normal is

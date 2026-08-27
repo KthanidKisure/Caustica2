@@ -58,7 +58,7 @@ public final class CausticaConfig {
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
-            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
+            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -738,7 +738,20 @@ public final class CausticaConfig {
             /** Extinction per block inside fully dense cloud. Higher reads as darker, more solid cumulus. */
             public static final FloatSetting DENSITY =
                     clampedFloat("caustica.rt.clouds.density", "clouds.density", 0.045f, 0.0f, 1.0f);
-            /** Deck base, world Y. Vanilla's cloud plane is 192. */
+            /**
+             * Follow vanilla's CLOUD_HEIGHT environment attribute instead of {@link #ALTITUDE}. On by
+             * default so a dimension or datapack that moves its cloud layer moves this deck with it.
+             */
+            public static final BooleanSetting VANILLA_HEIGHT =
+                    bool("caustica.rt.clouds.vanillaHeight", "clouds.vanilla-height", true);
+            /**
+             * How strongly vanilla's CLOUD_COLOR tints the deck. Applied hue-only, so it recolours
+             * without overriding the atmosphere's own time-of-day response. 0 leaves the deck lit
+             * purely by the sun and sky.
+             */
+            public static final FloatSetting VANILLA_TINT =
+                    clampedFloat("caustica.rt.clouds.vanillaTint", "clouds.vanilla-tint", 0.5f, 0.0f, 1.0f);
+            /** Deck base, world Y. Used when vanilla-height is off, or when vanilla reports none. */
             public static final FloatSetting ALTITUDE =
                     clampedFloat("caustica.rt.clouds.altitude", "clouds.altitude", 192.0f, -512.0f, 4096.0f);
             /** Deck depth in blocks. Thin decks read as stratus, thick ones as cumulus. */
@@ -824,6 +837,30 @@ public final class CausticaConfig {
                     clampedFloat("caustica.rt.grade.sharpness", "grade.sharpness", 0.0f, 0.0f, 1.0f);
 
             private Grade() {
+            }
+        }
+
+        /**
+         * Parallax occlusion mapping from the LabPBR height channel (_n alpha). Gives packs that author
+         * depth into the height map — Patrix and similar — real surface parallax instead of flat
+         * normal shading. Silhouettes stay flat: this shifts texture coordinates, it does not displace
+         * geometry.
+         */
+        public static final class Pom {
+            /**
+             * Depth in sprite-widths. 0 disables it and its march entirely. 0.05 is subtle and safe;
+             * past ~0.12 the flat silhouettes start giving the illusion away at grazing angles.
+             */
+            public static final FloatSetting DEPTH =
+                    clampedFloat("caustica.rt.pom.depth", "pom.depth", 0.0f, 0.0f, 0.5f);
+            /** Scales the march's step count. Below 1 is faster and steppier on tall height fields. */
+            public static final FloatSetting QUALITY =
+                    clampedFloat("caustica.rt.pom.quality", "pom.quality", 1.0f, 0.1f, 2.0f);
+            /** Ray-cone LOD at which POM has faded out. Lower means it stops sooner with distance. */
+            public static final FloatSetting FADE_LOD =
+                    clampedFloat("caustica.rt.pom.fadeLod", "pom.fade-lod", 4.0f, 0.0f, 12.0f);
+
+            private Pom() {
             }
         }
 

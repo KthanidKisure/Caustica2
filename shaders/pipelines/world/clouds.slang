@@ -328,7 +328,21 @@ public struct CloudResult {
     public float transmittance; // what fraction of the sky behind the deck survives
 };
 
-public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, float3 direction) {
+// Vanilla's CLOUD_COLOR for the camera's position, applied hue-only. Same reasoning as the fog tint:
+// preserving the deck's own luminance means a dark authored cloud colour cannot black out a sunlit
+// deck, and the time-of-day response computed from the atmosphere survives the tint.
+float3 tintCloud(float3 scattering, float3 tint709, float strength) {
+    float clamped = clamp(strength, 0.0, 1.0);
+    if (clamped <= 0.0) {
+        return scattering;
+    }
+    float3 tint = bt709ToAcesCg(max(tint709, float3(0.0)));
+    float tintLuma = max(dot(tint, ACESCG_LUMA), 1.0e-4);
+    return lerp(scattering, scattering * (tint / tintLuma), clamped);
+}
+
+public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, float3 direction,
+                               float3 tint709, float tintStrength) {
     CloudResult result;
     result.scattering = float3(0.0, 0.0, 0.0);
     result.transmittance = 1.0;
@@ -380,5 +394,6 @@ public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, flo
         }
         t += stepSize;
     }
+    result.scattering = tintCloud(result.scattering, tint709, tintStrength);
     return result;
 }
