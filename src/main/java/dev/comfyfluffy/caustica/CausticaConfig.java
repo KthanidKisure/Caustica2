@@ -58,7 +58,7 @@ public final class CausticaConfig {
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
-            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
+            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -92,6 +92,13 @@ public final class CausticaConfig {
         FILE.setComment("reflex",
                 " NVIDIA Reflex. Requires supported NVIDIA hardware and drivers.\n"
                         + " minimum-interval-us controls frame limiting; 0 disables the limit.");
+        FILE.setComment("fog",
+                " Exponential height fog. density is extinction per block at height (0 disables it);\n"
+                        + " scale-height is how fast it thins going up. Fog colour is taken from the sky, not set here.");
+        FILE.setComment("clouds",
+                " Volumetric cloud deck. coverage 0 disables it entirely (and costs nothing).\n"
+                        + " altitude is the deck base in world Y; thickness is its depth in blocks.\n"
+                        + " Clouds are lit from the sun/moon through the same atmosphere as the sky, so they have no colour setting.");
         FILE.setComment("lights",
                 " Controls direct lighting from glowing blocks such as torches, glowstone, and lava.\n"
                         + " Set ris-candidates to 0 to disable it. stats, dump, and dump-radius are debugging options.");
@@ -683,6 +690,143 @@ public final class CausticaConfig {
          * The renderer configures the swapchain latency mode, paces frames with {@code vkLatencySleepNV},
          * and emits simulation, render-submit, and present latency markers.
          */
+        /**
+         * Exponential height fog. Off by default: {@code density} is the extinction per block at
+         * {@code height}, so 0 leaves the renderer bit-identical to a build without this feature.
+         * Colour is not configurable on purpose — the fog is lit from the sky-view LUT, so it tracks
+         * time of day and sun direction on its own.
+         */
+        public static final class Fog {
+            /** Extinction per block at the reference height. ~0.004 is a light haze, ~0.03 is thick. */
+            public static final FloatSetting DENSITY =
+                    clampedFloat("caustica.rt.fog.density", "fog.density", 0.0f, 0.0f, 1.0f);
+            /** Blocks over which density falls by 1/e going up. Large values approach uniform distance fog. */
+            public static final FloatSetting SCALE_HEIGHT =
+                    clampedFloat("caustica.rt.fog.scaleHeight", "fog.scale-height", 24.0f, 1.0f, 1024.0f);
+            /** World Y at which density equals DENSITY. Sea level by default. */
+            public static final FloatSetting HEIGHT =
+                    clampedFloat("caustica.rt.fog.height", "fog.height", 62.0f, -512.0f, 1024.0f);
+            /**
+             * How strongly rain thickens the fog, as a multiple of density at full rain. Rain haze is
+             * the single biggest visual cue that it is raining at distance, so this defaults high.
+             */
+            public static final FloatSetting WEATHER_RESPONSE =
+                    clampedFloat("caustica.rt.fog.weatherResponse", "fog.weather-response", 3.0f, 0.0f, 32.0f);
+            /**
+             * How strongly biome climate modulates fog. Cold and wet biomes get more haze, hot and dry
+             * biomes less. 0 makes fog uniform everywhere.
+             */
+            public static final FloatSetting BIOME_RESPONSE =
+                    clampedFloat("caustica.rt.fog.biomeResponse", "fog.biome-response", 0.6f, 0.0f, 1.0f);
+            /** Single-scattering albedo. 1 scatters everything; lower values also absorb, darkening distance. */
+            public static final FloatSetting ALBEDO =
+                    clampedFloat("caustica.rt.fog.albedo", "fog.albedo", 0.92f, 0.0f, 1.0f);
+
+            private Fog() {
+            }
+        }
+
+        /**
+         * Volumetric cloud deck. Off by default: {@code coverage} 0 skips the march entirely, so a
+         * default build pays nothing. The deck is marched only on rays that may see the sun and moon
+         * discs (primary and specular), so it does not contribute to bounce lighting.
+         */
+        public static final class Clouds {
+            /** 0 clear, 1 overcast. Raising it grows existing clouds outward rather than fading in haze. */
+            public static final FloatSetting COVERAGE =
+                    clampedFloat("caustica.rt.clouds.coverage", "clouds.coverage", 0.0f, 0.0f, 1.0f);
+            /** Extinction per block inside fully dense cloud. Higher reads as darker, more solid cumulus. */
+            public static final FloatSetting DENSITY =
+                    clampedFloat("caustica.rt.clouds.density", "clouds.density", 0.045f, 0.0f, 1.0f);
+            /** Deck base, world Y. Vanilla's cloud plane is 192. */
+            public static final FloatSetting ALTITUDE =
+                    clampedFloat("caustica.rt.clouds.altitude", "clouds.altitude", 192.0f, -512.0f, 4096.0f);
+            /** Deck depth in blocks. Thin decks read as stratus, thick ones as cumulus. */
+            public static final FloatSetting THICKNESS =
+                    clampedFloat("caustica.rt.clouds.thickness", "clouds.thickness", 90.0f, 1.0f, 2048.0f);
+            /** Domain drift in blocks per second. 0 freezes the deck. */
+            public static final FloatSetting WIND_SPEED =
+                    clampedFloat("caustica.rt.clouds.windSpeed", "clouds.wind-speed", 1.5f, 0.0f, 256.0f);
+            /** High-frequency edge erosion. 0 gives smooth blobs, 1 gives wispy, broken silhouettes. */
+            public static final FloatSetting DETAIL =
+                    clampedFloat("caustica.rt.clouds.detail", "clouds.detail", 0.45f, 0.0f, 1.0f);
+            /**
+             * How strongly vanilla weather drives the deck. 1 takes coverage to overcast and thickens
+             * and darkens the deck as rain and thunder ramp; 0 ignores weather entirely.
+             */
+            public static final FloatSetting WEATHER_RESPONSE =
+                    clampedFloat("caustica.rt.clouds.weatherResponse", "clouds.weather-response", 1.0f, 0.0f, 1.0f);
+            /**
+             * How strongly the deck shadows the world. 0 leaves the ground lit as if the sky were clear
+             * and skips the shadow march entirely; 1 is full Beer's law through the coarse deck.
+             */
+            public static final FloatSetting SHADOW_STRENGTH =
+                    clampedFloat("caustica.rt.clouds.shadowStrength", "clouds.shadow-strength", 1.0f, 0.0f, 4.0f);
+            /**
+             * Floor the cloud shadow cannot darken past, standing in for light that scatters through the
+             * deck and arrives diffusely. 0 gives physically-too-dark overcast; real overcast sits around
+             * 0.1-0.2 of clear-sky direct.
+             */
+            public static final FloatSetting SHADOW_FLOOR =
+                    clampedFloat("caustica.rt.clouds.shadowFloor", "clouds.shadow-floor", 0.15f, 0.0f, 1.0f);
+            /**
+             * How wet rain makes sky-exposed surfaces: darker and glossier while it rains. 0 disables the
+             * effect and its upward visibility ray. Snowy biomes are excluded automatically — snow does
+             * not wet a surface.
+             */
+            public static final FloatSetting WETNESS =
+                    clampedFloat("caustica.rt.clouds.wetness", "clouds.wetness", 1.0f, 0.0f, 1.0f);
+            /** Stand-in for in-cloud multiple scattering, as a fraction of zenith sky radiance. */
+            public static final FloatSetting AMBIENT =
+                    clampedFloat("caustica.rt.clouds.ambient", "clouds.ambient", 0.35f, 0.0f, 4.0f);
+
+            private Clouds() {
+            }
+        }
+
+        /**
+         * Scene-referred colour grading and output sharpening, both applied in the display pass.
+         *
+         * <p>The grade defaults reproduce the "Ultra Realism Tonemapper for UE5" post-process volume.
+         * They transfer exactly rather than approximately because UE's default working colour space is
+         * AP1, the same space this renderer paths in. Note the guide tuned those numbers against AgX
+         * Punchy; with the ACES 2.0 view transform they will land somewhere different, which is a
+         * reason to set {@code view-transform} to match, not a reason to change the numbers.
+         */
+        public static final class Grade {
+            /** Master switch. Off leaves the display pass bit-identical to an ungraded build. */
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.grade.enabled", "grade.enabled", false);
+            public static final FloatSetting SATURATION =
+                    clampedFloat("caustica.rt.grade.saturation", "grade.saturation", 0.75f, 0.0f, 4.0f);
+            public static final FloatSetting CONTRAST =
+                    clampedFloat("caustica.rt.grade.contrast", "grade.contrast", 1.05f, 0.1f, 4.0f);
+            public static final FloatSetting GAIN =
+                    clampedFloat("caustica.rt.grade.gain", "grade.gain", 1.30f, 0.0f, 8.0f);
+            /** Multiplies the global saturation inside the highlight region, as UE composes them. */
+            public static final FloatSetting HIGHLIGHT_SATURATION =
+                    clampedFloat("caustica.rt.grade.highlightSaturation", "grade.highlight-saturation",
+                            0.95f, 0.0f, 4.0f);
+            /** Multiplies the global gain inside the highlight region. */
+            public static final FloatSetting HIGHLIGHT_GAIN =
+                    clampedFloat("caustica.rt.grade.highlightGain", "grade.highlight-gain",
+                            1.60f, 0.0f, 8.0f);
+            /** Luma at which the highlight region starts blending in (UE's ColorCorrectionHighlightsMin). */
+            public static final FloatSetting HIGHLIGHTS_MIN =
+                    clampedFloat("caustica.rt.grade.highlightsMin", "grade.highlights-min",
+                            0.28f, 0.0f, 1.0f);
+            /**
+             * RCAS strength, 0 disables it and its four extra taps. Applied after the output transform
+             * on display code values — PQ code values on the HDR path — so a highlight receives the
+             * same apparent enhancement as a midtone rather than hundreds of times more overshoot.
+             */
+            public static final FloatSetting SHARPNESS =
+                    clampedFloat("caustica.rt.grade.sharpness", "grade.sharpness", 0.0f, 0.0f, 1.0f);
+
+            private Grade() {
+            }
+        }
+
         public static final class Reflex {
             public static final BooleanSetting ENABLED = bool("caustica.rt.reflex", "reflex.enabled", false);
             public static final BooleanSetting LOW_LATENCY_BOOST =
@@ -813,6 +957,41 @@ public final class CausticaConfig {
         public static final class Tonemap {
             public static final FloatSetting GAMMA =
                     clampedFloat("caustica.rt.tonemap.gamma", "tonemap.gamma", 1.0f, 0.1f, 5.0f);
+            /**
+             * SDR view transform: {@code aces2} (default), {@code agx-punchy}, or {@code agx-base}.
+             * The AgX options are baked from sobotka/AgX — the same config the "Ultra Realism
+             * Tonemapper for UE5" guide installs into Unreal — so this renderer and that Unreal setup
+             * resolve to the same image transform.
+             *
+             * <p>SDR ONLY. AgX has no HDR output transform; every view in that config terminates in a
+             * ~100 nit display encoding. When HDR output is enabled the PQ path stays ACES 2.0 whatever
+             * this is set to, so on an HDR display this setting changes nothing that reaches the screen.
+             */
+            public static final StringSetting VIEW_TRANSFORM =
+                    string("caustica.rt.tonemap.viewTransform", "tonemap.view-transform",
+                            "aces2", Tonemap::sanitizeViewTransform);
+
+            private static String sanitizeViewTransform(String value) {
+                if ("agx-punchy".equalsIgnoreCase(value)) {
+                    return "agx-punchy";
+                }
+                if ("agx-base".equalsIgnoreCase(value)) {
+                    return "agx-base";
+                }
+                return "aces2";
+            }
+
+            /** Resource name under {@code /caustica/color/luts/} for the selected SDR view transform. */
+            public static String sdrLutResource() {
+                switch (VIEW_TRANSFORM.get()) {
+                    case "agx-punchy":
+                        return "sdr_agx_punchy_rec709.bin";
+                    case "agx-base":
+                        return "sdr_agx_base_rec709.bin";
+                    default:
+                        return "sdr_aces2_rec709.bin";
+                }
+            }
 
             private Tonemap() {
             }
