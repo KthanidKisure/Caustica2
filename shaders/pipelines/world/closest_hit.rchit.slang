@@ -150,34 +150,35 @@ float pomHeightAt(MaterialHeader header, float2 localUv, float lod) {
     return samplePageNormalAo(header.texturePage, pageUv, lod).a;
 }
 
-// Returns the parallax-shifted ATLAS uv. `pomParams`: x depth in sprite-widths (0 disables), y step
-// count scale, z LOD at which POM has faded out entirely.
-float2 parallaxOffsetUv(MaterialHeader header, float2 atlasUv, float lod, float3 n,
-                        float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
-                        float3 vdir, float3 pomParams) {
+// The march itself, in the sprite's own [0,1] space. Terrain reaches this through an atlas-rect
+// conversion; entities pass their UV straight in, because an entity texture is its own bindless image
+// rather than a region of a shared atlas — there is no rect to map through, and running terrain's
+// conversion on an identity rect would be a no-op at best and a silent scale error at worst.
+float2 parallaxLocalUv(MaterialHeader header, float2 localUv, float lod, float3 n,
+                       float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
+                       float3 vdir, float3 pomParams) {
     float depthScale = pomParams.x;
     if (depthScale <= 0.0 || (header.features & MATERIAL_FEATURE_NORMAL) == 0u) {
-        return atlasUv;
+        return localUv;
     }
     // Distance fade. POM's cost is per-hit and its benefit vanishes once a sprite covers a few pixels,
     // so it is faded out by ray-cone LOD rather than switched off at a hard distance -- a hard cutoff
     // would pop a visible seam across the ground as you walk.
     float fade = 1.0 - smoothstep(pomParams.z - 1.0, pomParams.z, lod);
     if (fade <= 0.0) {
-        return atlasUv;
+        return localUv;
     }
     float3 T;
     float3 B;
     if (!hitTangentFrame(n, p0, p1, p2, t0, t1, t2, T, B)) {
-        return atlasUv;
+        return localUv;
     }
     // View direction in tangent space. At grazing angles vz goes to zero and the offset would explode,
     // so it is floored -- the classic POM stretching artifact is worse than the lost parallax.
     float3 viewT = float3(dot(vdir, T), dot(vdir, B), dot(vdir, n));
     float vz = max(abs(viewT.z), 0.35);
 
-    float2 localUv = clamp((atlasUv - header.albedoUv.xy) * header.albedoUv.zw,
-            float2(0.0), float2(1.0));
+    localUv = clamp(localUv, float2(0.0), float2(1.0));
     // Total UV travel for a ray descending the full height range.
     float2 maxOffset = (viewT.xy / vz) * depthScale * fade;
 
@@ -218,9 +219,20 @@ float2 parallaxOffsetUv(MaterialHeader header, float2 atlasUv, float lod, float3
         }
         stepDepth *= 0.5;
     }
-    float2 shifted = clamp((lo + hi) * 0.5, float2(0.0), float2(1.0));
-    // Back to atlas space. Clamping happened in local space, so this can never bleed into a
-    // neighbouring sprite -- the single most common way POM goes wrong on an atlas.
+    return clamp((lo + hi) * 0.5, float2(0.0), float2(1.0));
+}
+
+// Terrain: convert into the sprite's local space, march, convert back. Clamping happens inside the
+// march, in local space, so the result can never bleed into a neighbouring sprite -- the single most
+// common way POM goes wrong on a texture atlas.
+float2 parallaxOffsetUv(MaterialHeader header, float2 atlasUv, float lod, float3 n,
+                        float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
+                        float3 vdir, float3 pomParams) {
+    if (pomParams.x <= 0.0 || (header.features & MATERIAL_FEATURE_NORMAL) == 0u) {
+        return atlasUv;
+    }
+    float2 localUv = (atlasUv - header.albedoUv.xy) * header.albedoUv.zw;
+    float2 shifted = parallaxLocalUv(header, localUv, lod, n, p0, p1, p2, t0, t1, t2, vdir, pomParams);
     return header.albedoUv.xy + shifted / max(header.albedoUv.zw, float2(1.0e-8));
 }
 
@@ -415,8 +427,16 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
         float entityLod = rayConeTextureLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(texSlot)]),
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
-        float4 entityTexel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod);
         MaterialHeader header = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
+        // Parallax on entity geometry, before the albedo fetch so colour and material channels stay in
+        // register — same rule as terrain. Entity UVs are already in the texture's own space, so the
+        // march runs directly rather than through an atlas rect. Mob armour, shulker shells and chest
+        // trim carry LabPBR height in packs like Patrix, and without this they stay flat while the
+        // blocks around them do not.
+        euvCoord = parallaxLocalUv(header, euvCoord, entityLod, n, ep0, ep1, ep2,
+                                   euv[e0], euv[e1], euv[e2], vdir,
+                                   ConstPtr<WorldPush>(pc.worldPushAddr)[0].pom.xyz);
+        float4 entityTexel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod);
         uint material = header.model;
         float3 baseAlbedo709 = srgbToLinear(entityTexel.rgb) * srgbToLinear(pr.tint.rgb);
         float3 opticalColor709 = material == MATERIAL_DIELECTRIC
