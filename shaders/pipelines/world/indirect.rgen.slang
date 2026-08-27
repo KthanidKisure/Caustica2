@@ -385,8 +385,12 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 reservoirA.GetDimensions(reservoirW, reservoirH);
                 // The images are double-width, so the addressable pixel count is half the texel width.
                 int renderWidth = int(reservoirW) / 2;
-                if (all(prevPix >= int2(0, 0)) && prevPix.x < renderWidth
-                        && prevPix.y < int(reservoirH)) {
+                // Clamped rather than skipped: a pixel whose reprojection left the screen still has
+                // usable neighbours, and anchoring the spatial taps at the edge is better than
+                // dropping reuse entirely for everything moving off-frame.
+                prevPix = int2(clamp(prevPix.x, 0, renderWidth - 1),
+                               clamp(prevPix.y, 0, int(reservoirH) - 1));
+                {
                     PackedReservoir history = loadReservoir(prevPix, parity);
                     // Geometric rejection: same depth and normal, or the sample belonged to another
                     // surface that merely happened to land on this pixel last frame.
@@ -397,6 +401,23 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                         r = temporalCombine(r, history, hitPos, n, v, rd, diffAlb, F0, rough,
                                             false, activeSss, seed);
                     }
+                }
+                // Spatial reuse. Taps read the same history image, for the reason given in
+                // restir.slang: sampling this frame's output would race the concurrent writes of the
+                // very dispatch doing the sampling.
+                int spatialTaps = min(int(worldPush.restir.z), RESTIR_MAX_SPATIAL_TAPS);
+                float spatialRadius = worldPush.restir.w;
+                for (int tap = 0; tap < spatialTaps; ++tap) {
+                    int2 tapPix = prevPix + spatialTapOffset(spatialRadius, seed);
+                    if (any(tapPix < int2(0, 0)) || tapPix.x >= renderWidth
+                            || tapPix.y >= int(reservoirH)) {
+                        continue;
+                    }
+                    if (!temporalSurfaceMatches(payload.hitT, gDepth[tapPix], n, gNormal[tapPix].xyz)) {
+                        continue;
+                    }
+                    r = temporalCombine(r, loadReservoir(tapPix, parity), hitPos, n, v, rd,
+                                        diffAlb, F0, rough, false, activeSss, seed);
                 }
                 storeReservoir(int2(pix), parity, toPacked(r));
             }

@@ -878,6 +878,18 @@ public final class CausticaConfig {
             public static final FloatSetting TEMPORAL =
                     clampedFloat("caustica.rt.restir.temporal", "restir.temporal", 0.0f, 0.0f, 1.0f);
 
+            /**
+             * Screen-space neighbour taps per pixel, 0 for temporal-only. Helps exactly where temporal
+             * reuse cannot: disoccluded edges and the frame after a camera cut, which is where the eye
+             * is. Capped at 8 in the shader.
+             */
+            public static final IntSetting SPATIAL_TAPS =
+                    intAtLeast("caustica.rt.restir.spatialTaps", "restir.spatial-taps", 3, 0);
+            /** Spatial tap radius in render pixels. Wider borrows more but mismatches more often. */
+            public static final FloatSetting SPATIAL_RADIUS =
+                    clampedFloat("caustica.rt.restir.spatialRadius", "restir.spatial-radius",
+                            8.0f, 1.0f, 64.0f);
+
             private Restir() {
             }
         }
