@@ -93,6 +93,23 @@ public float fogOpticalDepth(FogParams f, float3 ro, float3 rd, float t) {
 // sun slice plus the moon slice, then the isotropic airglow floor so night fog settles at the same
 // luminance the night sky does instead of going black. sky.slang works in linear BT.709; the path
 // integral is ACEScg, so this crosses the same seam the miss shader does, in the same place.
+// Vanilla's FOG_COLOR for wherever the camera is, and how hard to pull scattering toward it. In the
+// Overworld this is a light tint over the physically computed sky, so a swamp reads green-grey without
+// losing the atmosphere's time-of-day behaviour. In the Nether and the End there is no atmosphere worth
+// sampling, so the caller sends full strength and this becomes the entire fog colour.
+public float3 fogTint(FogParams f, float3 inscatter, WorldPush push) {
+    float strength = clamp(push.dimFog.w, 0.0, 1.0);
+    if (strength <= 0.0) {
+        return inscatter;
+    }
+    // Tint by hue, not by replacement: preserve the scattering's own luminance so a dark fog colour
+    // cannot black out a bright sunlit haze, and a bright one cannot light up a night scene.
+    float3 tint = bt709ToAcesCg(max(push.dimFog.rgb, float3(0.0)));
+    float tintLuma = max(dot(tint, ACESCG_LUMA), 1.0e-4);
+    float3 normalizedTint = tint / tintLuma;
+    return lerp(inscatter, inscatter * normalizedTint, strength);
+}
+
 public float3 fogInscatter(FogParams f, float3 rd, SkyState state) {
     float2 sunUv = skyViewLutUv(state.viewerRadiusKm, rd.y,
             lightViewCosine(rd, state.sunDir), SKY_VIEW_BODY_SUN);
@@ -107,7 +124,7 @@ public float3 fogInscatter(FogParams f, float3 rd, SkyState state) {
 // Fold one travelled segment into the path. Call once per segment, BEFORE the segment's endpoint
 // contributes anything to L, so that the in-scatter enters at this segment's throughput and everything
 // beyond it is attenuated by this segment's transmittance.
-public void applyFogSegment(FogParams f, SkyState state, Medium medium,
+public void applyFogSegment(FogParams f, SkyState state, Medium medium, WorldPush push,
                             float3 ro, float3 rd, float t,
                             inout float3 L, inout float3 throughput) {
     if (!fogActive(f) || !fogAppliesTo(medium)) {
@@ -118,6 +135,6 @@ public void applyFogSegment(FogParams f, SkyState state, Medium medium,
         return;
     }
     float transmittance = exp(-tau);
-    L += throughput * fogInscatter(f, rd, state) * (1.0 - transmittance);
+    L += throughput * fogTint(f, fogInscatter(f, rd, state), push) * (1.0 - transmittance);
     throughput *= transmittance;
 }

@@ -39,6 +39,10 @@ float hash13(float3 p3) {
     return frac((p3.x + p3.y) * p3.z);
 }
 
+// How much of the Overworld starfield the End keeps. Dimmer than a clear night: the End's own sky
+// colour already lifts the black floor, and full-strength stars over it read as an Overworld night.
+static const float END_STAR_STRENGTH = 0.35;
+
 // Rotate v about a unit axis by angle (Rodrigues). Used to wheel the starfield about the celestial pole.
 float3 rotateAxis(float3 v, float3 axis, float ang) {
     float c = cos(ang), s = sin(ang);
@@ -152,6 +156,26 @@ void main(inout Payload payload) {
         // zero below the horizon, matching the NEE visibility test.
     }
 
+    // Non-Overworld dimensions. The atmosphere LUTs model an Earth sky: Rayleigh, Mie, ozone, a planet
+    // radius, a sun. None of that exists in the Nether or the End, and running it there produces a blue
+    // daytime sky in a place that should have neither. Vanilla classifies this itself via
+    // DimensionType.skybox(), which is what the mode here mirrors — so custom dimensions declaring one of
+    // those skyboxes get the right treatment too, without a hardcoded dimension-name list.
+    uint skyboxMode = uint(worldPush.dimSky.w + 0.5);
+    if (skyboxMode != SKYBOX_OVERWORLD) {
+        // Both non-Overworld skies are flat-lit from vanilla's own SKY_COLOR for the camera's position,
+        // so a crimson forest and a soul sand valley differ here exactly as they do in vanilla.
+        float3 flat709 = max(worldPush.dimSky.rgb, float3(0.0));
+        float3 flatSky = bt709ToAcesCg(flat709);
+        if (skyboxMode == SKYBOX_END) {
+            // The End keeps a starfield — it is the one thing that reads as "sky" rather than "ceiling"
+            // there — but no sun, no moon, no horizon gradient.
+            flatSky += bt709ToAcesCg(stars(dir, state, float3(1.0))) * END_STAR_STRENGTH;
+        }
+        packSky(payload, flatSky);
+        return;
+    }
+
     // Cloud deck, composited over everything above. It sits at a few hundred blocks while the sky LUT
     // models 100 km, so the deck is treated as a thin layer in front of the whole atmosphere: attenuate
     // what is behind it, add what it scatters. Stars and the sun/moon discs are correctly occluded by
@@ -163,7 +187,8 @@ void main(inout Payload payload) {
     if (showCelestial) {
         CloudParams cloudParams = makeCloudParams(worldPush);
         if (cloudsActive(cloudParams)) {
-            CloudResult deck = marchClouds(cloudParams, state, WorldRayOrigin(), dir);
+            CloudResult deck = marchClouds(cloudParams, state, WorldRayOrigin(), dir,
+                                           worldPush.dimCloud.rgb, worldPush.dimCloud.w);
             color = color * deck.transmittance + deck.scattering;
         }
     }

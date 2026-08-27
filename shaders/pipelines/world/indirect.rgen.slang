@@ -93,7 +93,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         float3 fromEye = ro - worldPush.camOffset;
         float prefix = length(fromEye);
         if (prefix > 1.0e-3) {
-            applyFogSegment(fog, fogSky, airMedium(), worldPush.camOffset, fromEye / prefix, prefix,
+            applyFogSegment(fog, fogSky, airMedium(), worldPush, worldPush.camOffset, fromEye / prefix, prefix,
                             L, throughput);
         }
     }
@@ -128,7 +128,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             // attenuated by that column and the column's own in-scatter is added in front of it. At the
             // horizon the two converge on the same sky-view texel, which is why a fogged horizon fades
             // INTO the sky instead of forming a visible band against it.
-            applyFogSegment(fog, fogSky, medium.current, ro, rd, FOG_MAX_DISTANCE, L, throughput);
+            applyFogSegment(fog, fogSky, medium.current, worldPush, ro, rd, FOG_MAX_DISTANCE, L, throughput);
             float3 sky = payloadSky();
             L += throughput * sky; // escaped to sky
             break;
@@ -143,7 +143,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         }
         // Air only — applyFogSegment gates on the medium itself, so a segment inside water or glass is a
         // no-op here and its own extinction above remains the complete answer.
-        applyFogSegment(fog, fogSky, medium.current, ro, rd, payload.hitT, L, throughput);
+        applyFogSegment(fog, fogSky, medium.current, worldPush, ro, rd, payload.hitT, L, throughput);
 
         float3 n = payloadNormal(); // oriented toward the incoming ray by the closest-hit
         float3 hitPos = ro + rd * payload.hitT;

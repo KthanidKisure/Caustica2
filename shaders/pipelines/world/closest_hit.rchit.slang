@@ -101,6 +101,129 @@ float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float
     return nm;
 }
 
+// ---- Parallax occlusion mapping -------------------------------------------------------------------
+//
+// Packs such as Patrix author most of their apparent depth into the LabPBR height channel (_n alpha)
+// rather than into geometry. Caustica already ingests that channel -- RtBlockMaterials writes it to
+// normalAo.a and RtMaterialTextureData carries it correctly down the mip chain -- but nothing has ever
+// read it. This does.
+//
+// WHAT THIS IS AND IS NOT. This shifts the texture coordinate along the view ray through the height
+// field, so surfaces gain real depth parallax: mortar lines sink, stones stand proud, and the whole
+// thing shifts correctly as you move. It does NOT displace geometry, so SILHOUETTES STAY FLAT -- a
+// block edge viewed side-on is still a straight line. Actual displacement in a path tracer needs the
+// height field to exist as geometry the rays can hit, either tessellated into the BLAS or handled by a
+// custom intersection shader, which is a different and much larger feature. Every real-time POM
+// implementation makes this same trade.
+//
+// The offset is applied ONCE, before the albedo fetch, so albedo, roughness, F0 and the normal map all
+// land on the same shifted coordinate. Offsetting only the material channels would slide them out of
+// register with the colour and look worse than no POM at all.
+//
+// LabPBR height: 1.0 is the surface, 0.0 the deepest point, so depth = 1 - height.
+
+static const int POM_MAX_STEPS = 64;
+static const int POM_REFINE_STEPS = 5;
+
+// Tangent frame for the hit triangle. Duplicated from perturbNormal rather than shared, because that
+// function consumes it immediately and threading it out would change a signature every shading path
+// depends on. Same maths; if one changes, change both.
+bool hitTangentFrame(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
+                     out float3 T, out float3 B) {
+    T = float3(1.0, 0.0, 0.0);
+    B = float3(0.0, 1.0, 0.0);
+    float2 g1 = t1 - t0;
+    float2 g2 = t2 - t0;
+    float det = g1.x * g2.y - g1.y * g2.x;
+    if (abs(det) <= 1.0e-12) {
+        return false;
+    }
+    float r = 1.0 / det;
+    float3 traw = ((p1 - p0) * g2.y - (p2 - p0) * g1.y) * r;
+    T = normalize(traw - n * dot(n, traw));
+    B = cross(n, T) * (det < 0.0 ? -1.0 : 1.0);
+    return true;
+}
+
+float pomHeightAt(MaterialHeader header, float2 localUv, float lod) {
+    float2 pageUv = header.materialUv.xy + clamp(localUv, float2(0.0), float2(1.0)) * header.materialUv.zw;
+    return samplePageNormalAo(header.texturePage, pageUv, lod).a;
+}
+
+// Returns the parallax-shifted ATLAS uv. `pomParams`: x depth in sprite-widths (0 disables), y step
+// count scale, z LOD at which POM has faded out entirely.
+float2 parallaxOffsetUv(MaterialHeader header, float2 atlasUv, float lod, float3 n,
+                        float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
+                        float3 vdir, float3 pomParams) {
+    float depthScale = pomParams.x;
+    if (depthScale <= 0.0 || (header.features & MATERIAL_FEATURE_NORMAL) == 0u) {
+        return atlasUv;
+    }
+    // Distance fade. POM's cost is per-hit and its benefit vanishes once a sprite covers a few pixels,
+    // so it is faded out by ray-cone LOD rather than switched off at a hard distance -- a hard cutoff
+    // would pop a visible seam across the ground as you walk.
+    float fade = 1.0 - smoothstep(pomParams.z - 1.0, pomParams.z, lod);
+    if (fade <= 0.0) {
+        return atlasUv;
+    }
+    float3 T;
+    float3 B;
+    if (!hitTangentFrame(n, p0, p1, p2, t0, t1, t2, T, B)) {
+        return atlasUv;
+    }
+    // View direction in tangent space. At grazing angles vz goes to zero and the offset would explode,
+    // so it is floored -- the classic POM stretching artifact is worse than the lost parallax.
+    float3 viewT = float3(dot(vdir, T), dot(vdir, B), dot(vdir, n));
+    float vz = max(abs(viewT.z), 0.35);
+
+    float2 localUv = clamp((atlasUv - header.albedoUv.xy) * header.albedoUv.zw,
+            float2(0.0), float2(1.0));
+    // Total UV travel for a ray descending the full height range.
+    float2 maxOffset = (viewT.xy / vz) * depthScale * fade;
+
+    // Steps scale with view angle: a steep view crosses little of the height field and needs few
+    // samples, a grazing one crosses a lot and needs many.
+    int steps = int(clamp(lerp(float(POM_MAX_STEPS), 8.0, abs(viewT.z)) * max(pomParams.y, 0.1),
+            4.0, float(POM_MAX_STEPS)));
+    float stepDepth = 1.0 / float(steps);
+    float2 stepOffset = maxOffset * stepDepth;
+
+    // Linear search for the first step where the ray has sunk below the height field.
+    float rayDepth = 0.0;
+    float2 current = localUv;
+    float height = pomHeightAt(header, current, lod);
+    float surfaceDepth = 1.0 - height;
+    for (int i = 0; i < steps; ++i) {
+        if (rayDepth >= surfaceDepth) {
+            break;
+        }
+        current -= stepOffset;
+        rayDepth += stepDepth;
+        surfaceDepth = 1.0 - pomHeightAt(header, current, lod);
+    }
+
+    // Binary refinement of the crossing. Cheaper and more stable than the usual linear interpolation
+    // between the last two samples when the height field has hard steps, which block textures are
+    // almost entirely made of.
+    float2 lo = current;
+    float2 hi = current + stepOffset;
+    for (int i = 0; i < POM_REFINE_STEPS; ++i) {
+        float2 mid = (lo + hi) * 0.5;
+        float midRayDepth = rayDepth - stepDepth * 0.5;
+        if (1.0 - pomHeightAt(header, mid, lod) > midRayDepth) {
+            hi = mid;
+        } else {
+            lo = mid;
+            rayDepth = midRayDepth;
+        }
+        stepDepth *= 0.5;
+    }
+    float2 shifted = clamp((lo + hi) * 0.5, float2(0.0), float2(1.0));
+    // Back to atlas space. Clamping happened in local space, so this can never bleed into a
+    // neighbouring sprite -- the single most common way POM goes wrong on an atlas.
+    return header.albedoUv.xy + shifted / max(header.albedoUv.zw, float2(1.0e-8));
+}
+
 struct Surface {
     float3 normal;
     float3 f0;
@@ -401,6 +524,11 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses textured albedo.
     float3 tint709 = srgbToLinear(tint);
+    // Parallax BEFORE the albedo fetch, so every channel sampled below shares one shifted coordinate.
+    // One indirect load for the POM parameters, taken only on the terrain path that uses them rather
+    // than at shader entry, matching how the entity path above reaches WorldPush.
+    uv = parallaxOffsetUv(materialHeader, uv, blockLod, n, tp0, tp1, tp2, uv0, uv1, uv2, vdir,
+                          ConstPtr<WorldPush>(pc.worldPushAddr)[0].pom.xyz);
     float3 albedo709 = srgbToLinear(blockAlbedoAtlas.SampleLevel(uv, blockLod).rgb) * tint709;
     packAlbedo(payload, bt709ToAcesCg(
             materialHeader.model == MATERIAL_WATER ? tint709 : albedo709));
