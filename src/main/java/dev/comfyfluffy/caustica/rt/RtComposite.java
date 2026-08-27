@@ -38,6 +38,8 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkClearColorValue;
+import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.lwjgl.vulkan.VkBufferImageCopy;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDependencyInfo;
@@ -1003,6 +1005,21 @@ public final class RtComposite {
                 "ReSTIR reservoir B " + renderW + "x" + renderH);
         reservoirHistoryValid = false;
         reservoirParity = 0;
+        // Zero both images at creation. The history-valid flag guards the frame AFTER a reallocation,
+        // but it is a whole-frame switch and reservoir writes are per-pixel: a pixel the raygen never
+        // reaches — sky, or any pixel whose primary ray found no emitter-lit surface — is never written,
+        // so once the flag flips on, that pixel's neighbours read whatever the allocator left in memory.
+        // packedValid() rejects M<=0, and zeroed memory gives exactly that; undefined memory does not.
+        ctx.submitSync(cmd -> {
+            try (MemoryStack clearStack = MemoryStack.stackPush()) {
+                VkClearColorValue zero = VkClearColorValue.calloc(clearStack);
+                VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, clearStack);
+                range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+                VK10.vkCmdClearColorImage(cmd, reservoirA.image, VK10.VK_IMAGE_LAYOUT_GENERAL, zero, range);
+                VK10.vkCmdClearColorImage(cmd, reservoirB.image, VK10.VK_IMAGE_LAYOUT_GENERAL, zero, range);
+            }
+        });
         // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
