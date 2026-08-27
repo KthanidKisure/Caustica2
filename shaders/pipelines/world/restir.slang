@@ -173,6 +173,37 @@ public PackedReservoir toPacked(Reservoir r) {
     return p;
 }
 
+// ---- Spatial reuse -----------------------------------------------------------------------------------
+//
+// Temporal reuse alone cannot help a pixel that has no usable history: the frame after a camera cut, a
+// disoccluded edge, a surface that just came round a corner. Those are exactly the pixels a player is
+// looking at, and they stay at single-frame noise while everything around them has converged. Spatial
+// reuse borrows from screen-space neighbours, which have no such gap.
+//
+// Neighbours are read from the HISTORY image, not from this frame's output. Reading what the current
+// dispatch is concurrently writing would be a race — reservoir writes are unordered across a dispatch,
+// so a neighbour might be last frame's value, this frame's, or a torn mix, varying run to run. Sampling
+// last frame's completed buffer makes this spatiotemporal reuse with a one-frame lag, which is both
+// well-defined and what the lag already is for the temporal path.
+//
+// HONESTY ABOUT BIAS. This is the practical variant, not the unbiased one. Correct spatial ReSTIR needs
+// per-neighbour MIS weights that account for each neighbour's own sampling domain; that costs a
+// visibility ray per tap and roughly doubles the maths. What this does instead — re-evaluating p-hat at
+// the receiving surface, rejecting geometric mismatches, and capping M — bounds the error to a slight
+// over-smoothing near contact shadows rather than a visible energy shift. It is the trade almost every
+// shipping ReSTIR implementation makes, but it IS a trade.
+
+public static const int RESTIR_MAX_SPATIAL_TAPS = 8;
+static const float RESTIR_TWO_PI = 6.28318530718;
+
+// A disc sample around the pixel. Uniform in area rather than in radius, so taps do not bunch at the
+// centre where they duplicate information the pixel already has.
+public int2 spatialTapOffset(float radius, inout uint seed) {
+    float angle = rndf(seed) * RESTIR_TWO_PI;
+    float r = radius * sqrt(rndf(seed));
+    return int2(int(round(cos(angle) * r)), int(round(sin(angle) * r)));
+}
+
 // ---- Temporal combine --------------------------------------------------------------------------------
 
 // Was the reprojected pixel the same surface? Both tests are needed: depth alone accepts a wall seen

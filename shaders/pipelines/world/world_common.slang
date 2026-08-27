@@ -115,8 +115,8 @@ public struct WorldPush {
     // purely by the atmosphere).
     public float4   dimCloud;
     // ---- ReSTIR. x temporal reuse strength (0 disables it and both image accesses), y frame parity
-    // selecting which reservoir image is history this frame, z render-resolution width in pixels
-    // (the reservoir images are addressed in render pixels, not display pixels), w unused.
+    // selecting which reservoir image is history this frame, z spatial neighbour taps per pixel
+    // (0 = temporal only), w spatial tap radius in render pixels.
     public float4   restir;
 };
 

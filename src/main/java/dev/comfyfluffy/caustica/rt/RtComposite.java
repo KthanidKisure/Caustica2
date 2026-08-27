@@ -1322,8 +1322,8 @@ public final class RtComposite {
             Float4 restir = new Float4(
                     reservoirHistoryValid ? restirStrength : 0f,
                     reservoirParity,
-                    renderW,
-                    0f);
+                    CausticaConfig.Rt.Restir.SPATIAL_TAPS.value(),
+                    CausticaConfig.Rt.Restir.SPATIAL_RADIUS.value());
             // Valid from the frame after the first one that wrote anything: the destination image this
             // frame becomes history next frame.
             if (restirStrength > 0f) {
