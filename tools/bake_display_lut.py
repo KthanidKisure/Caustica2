@@ -50,6 +50,39 @@ LOOK_PACKAGE_DIR = (
 # ACES 2.0's built-in BT.2020 transforms use these fixed HDR mastering targets.
 HDR_REC2020_NITS = [500, 1000, 2000, 4000]
 
+# sobotka/AgX, the config the "Ultra Realism Tonemapper for UE5" guide installs into Unreal via OCIO.
+# Baked here as an alternative SDR view transform so the same look is available without a second
+# runtime dependency: the guide's Unreal setup and this LUT resolve to the same image transform.
+#
+# SDR ONLY, and not an oversight. Every view in this config terminates in a display encoding for a
+# ~100 nit SDR device (sRGB, BT.1886, Display P3); AgX has no HDR output transform, so there is
+# nothing to bake for the PQ path. The HDR LUTs stay ACES 2.0 whatever this is set to.
+AGX_CONFIG_URL = "https://github.com/sobotka/AgX"  # clone and pass --agx-config <path>/config.ocio
+
+# ACEScg (AP1/D60) -> linear BT.709 (D65). This is the exact inverse of BT709_TO_ACESCG_* in
+# world_common.slang rather than a matrix from a table: the renderer converts sRGB assets INTO ACEScg
+# with that matrix, and the AgX config's input space is Linear BT.709, so inverting the renderer's own
+# matrix makes the round trip exact instead of leaving a small residual tint on neutrals.
+ACESCG_TO_BT709 = [
+    [1.70505091, -0.62179208, -0.08325886],
+    [-0.13025641, 1.14080473, -0.01054832],
+    [-0.02400335, -0.12896898, 1.15297234],
+]
+
+AGX_LUTS = [
+    dict(
+        name="sdr_agx_punchy_rec709",
+        agx_space="Appearance Punchy sRGB",
+        note="SDR output, AgX Punchy appearance, sRGB-encoded BT.709. The guide's default choice; "
+             "less aggressive desaturation than AgX Base.",
+    ),
+    dict(
+        name="sdr_agx_base_rec709",
+        agx_space="AgX Base",
+        note="SDR output, AgX Base, sRGB-encoded BT.709. Stronger highlight desaturation than Punchy.",
+    ),
+]
+
 LUTS = [
     dict(
         name="sdr_aces2_rec709",
@@ -83,7 +116,22 @@ def shaper_axis(size: int) -> np.ndarray:
     return np.exp2(stops)
 
 
+def make_agx_processor(agx_cfg: "OCIO.Config", spec: dict):
+    """ACEScg -> linear BT.709 -> the requested AgX appearance, as one processor."""
+    matrix = [0.0] * 16
+    for row in range(3):
+        for col in range(3):
+            matrix[row * 4 + col] = ACESCG_TO_BT709[row][col]
+    matrix[15] = 1.0
+    grp = OCIO.GroupTransform()
+    grp.appendTransform(OCIO.MatrixTransform(matrix))
+    grp.appendTransform(OCIO.ColorSpaceTransform(src="Linear BT.709", dst=spec["agx_space"]))
+    return agx_cfg.getProcessor(grp).getDefaultCPUProcessor()
+
+
 def make_processor(cfg: "OCIO.Config", spec: dict):
+    if "agx_space" in spec:
+        return make_agx_processor(cfg, spec)
     if "display_view" in spec:
         display, view = spec["display_view"]
         return cfg.getProcessor(SOURCE_SPACE, display, view, OCIO.TRANSFORM_DIR_FORWARD).getDefaultCPUProcessor()
@@ -199,7 +247,24 @@ def main() -> None:
         metavar="PATH",
         help="replace the default look package's LMT from a normalized log-shaper .cube, then exit",
     )
+    parser.add_argument(
+        "--agx-config",
+        type=Path,
+        metavar="PATH",
+        help=f"bake the AgX SDR view transforms from a sobotka/AgX config.ocio ({AGX_CONFIG_URL}), "
+             "then exit. The ACES 2.0 LUTs are left untouched.",
+    )
     args = parser.parse_args()
+
+    if args.agx_config is not None:
+        agx_cfg = OCIO.Config.CreateFromFile(str(args.agx_config))
+        digest = hashlib.sha256(Path(args.agx_config).read_bytes()).hexdigest()
+        print(f"baking AgX view transforms from {args.agx_config}; config SHA-256={digest}")
+        for spec in AGX_LUTS:
+            print(f"baking {spec['name']}: {spec['note']}")
+            rgb = bake_one(agx_cfg, spec, LUT_SIZE)
+            write_lut(OUT_DIR / f"{spec['name']}.bin", LUT_SIZE, rgb)
+        return
 
     if args.import_lmt is not None:
         source_path = args.import_lmt
