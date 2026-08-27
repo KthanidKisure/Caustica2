@@ -88,6 +88,21 @@ public struct WorldPush {
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
     // exactly and this cannot change the image. 1.0 disables it.
     public float    preExposure;
+    // ---- Height fog. x extinction per block at the reference height (0 disables), y 1/scale-height,
+    // z reference world Y in REBASED coordinates (Java subtracts the terrain origin, so this stays a
+    // small number as the player moves), w single-scattering albedo. Integrated analytically in
+    // fog.slang; the in-scatter colour comes from the sky view LUT, so nothing about the fog's colour
+    // lives here.
+    public float4   fog;
+    // ---- Cloud deck. cloud0: x coverage 0..1 (0 disables), y extinction per block at full density,
+    // z deck base as REBASED world Y, w deck thickness in blocks. cloud1: xy wind domain offset in
+    // blocks (advanced on the CPU so it is frame-rate independent and world-stable across a rebase),
+    // z detail erosion 0..1, w ambient multiple-scattering fraction.
+    public float4   cloud0;
+    public float4   cloud1;
+    // cloud2: x ground-shadow strength (0 disables shadowing without disabling the deck), y the
+    // multiple-scattering floor the shadow cannot darken past, z rain wetness 0..1, w unused.
+    public float4   cloud2;
 };
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the

@@ -31,6 +31,8 @@ import trace_ser;
 import lighting;
 import sky;
 import bindings;
+import fog;
+import clouds;
 
 // Atmospheric transmittance LUT (RtSkyLut), also bound to world.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
@@ -61,6 +63,14 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // (so the first ray already carries the right relative index and absorption); for a segment split off
     // a dielectric it is whatever the parent was travelling through.
     MediumStack medium = seg.medium;
+    FogParams fog = makeFogParams(worldPush);
+    SkyState fogSky = skyState(worldPush);
+    // Cloud shadowing runs on shadow rays, which every bounce casts, so unlike the view march it is
+    // affordable here — a coarse 8-step march of a 2-octave field, and only when a deck exists at all.
+    CloudParams shadowClouds = makeCloudParams(worldPush);
+    float cloudShadowStrength = worldPush.cloud2.x;
+    float cloudShadowFloor = worldPush.cloud2.y;
+    float wetness = worldPush.cloud2.z;
     bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
     // Sky-disc gate (see world.rmiss): the sun/moon disc is shown to the primary ray and to rays spawned
     // by a specular/dielectric bounce (mirror reflections + refractions of the sun/moon), but hidden from
@@ -73,6 +83,20 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // remains active with its full configured candidate count at every hit. Pass A's primary/interface
     // prefix is outside this SSS quality budget.
     int indirectDepth = 0;
+    // Pass A consumed the camera -> first-dielectric prefix, so Pass B never walks it and would leave the
+    // fog off anything seen through water or glass. Re-integrate that prefix here as a straight segment
+    // from the eye to this record's origin. Refraction bent the real path, but fog is a smooth function
+    // of position over tens of blocks and the bend is sub-block, so the straight-line approximation is
+    // below the noise floor. Both Fresnel branches get it, each weighted by its own throughput, and those
+    // two throughputs sum to one — so the in-scatter is added once, not twice.
+    if (seg.bounce > 0 && fogActive(fog)) {
+        float3 fromEye = ro - worldPush.camOffset;
+        float prefix = length(fromEye);
+        if (prefix > 1.0e-3) {
+            applyFogSegment(fog, fogSky, airMedium(), worldPush.camOffset, fromEye / prefix, prefix,
+                            L, throughput);
+        }
+    }
     for (int bounce = seg.bounce; bounce <= maxBounces; bounce++) {
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
@@ -100,6 +124,11 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into the payload's
             // surface words as a full float3, so this is absolute scene units with nothing to undo. The
             // packed show-celestial flag decides whether this path segment may see the bright disc.
+            // Fog first: the escaping ray still crossed the whole fogged column, so the sky it reveals is
+            // attenuated by that column and the column's own in-scatter is added in front of it. At the
+            // horizon the two converge on the same sky-view texel, which is why a fogged horizon fades
+            // INTO the sky instead of forming a visible band against it.
+            applyFogSegment(fog, fogSky, medium.current, ro, rd, FOG_MAX_DISTANCE, L, throughput);
             float3 sky = payloadSky();
             L += throughput * sky; // escaped to sky
             break;
@@ -112,6 +141,9 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         if (any(medium.current.extinction > 0.0)) {
             throughput *= exp(-medium.current.extinction * payload.hitT);
         }
+        // Air only — applyFogSegment gates on the medium itself, so a segment inside water or glass is a
+        // no-op here and its own extinction above remains the complete answer.
+        applyFogSegment(fog, fogSky, medium.current, ro, rd, payload.hitT, L, throughput);
 
         float3 n = payloadNormal(); // oriented toward the incoming ray by the closest-hit
         float3 hitPos = ro + rd * payload.hitT;
@@ -212,6 +244,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             if (ndl > 0.0) {
                 float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
                 float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
+                vis *= cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
+                                                cloudShadowStrength, cloudShadowFloor);
                 if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                     L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
                 }
@@ -253,6 +287,15 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // reflection sharp instead of accumulating it as a glossy lobe.
         bool exactSpecular = isDeltaAlpha(rough);
         rough = exactSpecular ? 0.0 : rough;
+        // Rain wetness. The upward visibility test is an extra ray per shaded vertex, so it is gated on
+        // there being rain at all: in clear weather this costs one comparison. The ray is short — 320
+        // blocks clears any plausible build without paying for a full-height trace — and only its
+        // luminance is used, so a surface under stained glass is treated as partly exposed, which is
+        // closer to right than a binary test.
+        if (wetness > 0.0 && n.y > 0.0) {
+            float skyExposure = luminance(visibility(p, float3(0.0, 1.0, 0.0), 320.0).transmittance);
+            applyWetness(wetness, skyExposure, n, albedo, rough);
+        }
         float3 diffAlb = albedo * (1.0 - metal);
         float3 F0 = payload.f0;
 
@@ -287,7 +330,12 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
             VisibilityResult shadow = visibility(p, lightDir, 10000.0);
-            float3 vis = shadow.transmittance;
+            // The deck attenuates the light before it ever reaches the geometry, so it multiplies the
+            // shadow ray's visibility rather than the illuminance: same term, and it stays correct when
+            // the caustic factor below scales the whole NEE contribution.
+            float3 vis = shadow.transmittance
+                    * cloudShadowTransmittance(shadowClouds, p, lightDir,
+                                               cloudShadowStrength, cloudShadowFloor);
             // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
             // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
             // so it applies to the whole NEE term (diffuse + specular).
@@ -337,6 +385,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                     visB *= waterCaustic(hitPos + lightDir * shadowBack.waterHitT,
                                          lightDir, shadowBack.waterHitT);
                 }
+                visB *= cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
+                                                 cloudShadowStrength, cloudShadowFloor);
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
                     L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * celestialLight.illuminance * visB;

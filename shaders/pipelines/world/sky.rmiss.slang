@@ -14,6 +14,7 @@
 import world_common;
 import sky;
 import bindings;
+import clouds;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit LOD
 // (a miss shader has no derivatives). Keeping the real sprites means a resource pack's sun and moon still
@@ -149,6 +150,22 @@ void main(inout Payload payload) {
         }
         // No separate horizon gate on either body. A set sun or moon goes dark because its extinction is
         // zero below the horizon, matching the NEE visibility test.
+    }
+
+    // Cloud deck, composited over everything above. It sits at a few hundred blocks while the sky LUT
+    // models 100 km, so the deck is treated as a thin layer in front of the whole atmosphere: attenuate
+    // what is behind it, add what it scatters. Stars and the sun/moon discs are correctly occluded by
+    // this because they were accumulated into `color` above.
+    //
+    // Gated on showCelestial, which is exactly the set of rays that already pay for disc sprites: the
+    // primary ray and specular/dielectric continuations. A diffuse bounce's miss skips the march
+    // entirely and sees clear sky — see the cost note in clouds.slang.
+    if (showCelestial) {
+        CloudParams cloudParams = makeCloudParams(worldPush);
+        if (cloudsActive(cloudParams)) {
+            CloudResult deck = marchClouds(cloudParams, state, WorldRayOrigin(), dir);
+            color = color * deck.transmittance + deck.scattering;
+        }
     }
 
     // The sky goes out in absolute scene units at full fp32 — packSky writes the payload's three surface

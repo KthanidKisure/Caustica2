@@ -604,7 +604,10 @@ public final class RtComposite {
                 debugPresentPipeline = RtDebugPresentPipeline.create(ctx);
             }
             if (sdrToneLut == null) {
-                sdrToneLut = RtToneLut.load(ctx, "sdr_aces2_rec709.bin");
+                // SDR view transform is selectable: ACES 2.0 (the renderer's default) or either AgX
+                // appearance baked from sobotka/AgX. Only the SDR path branches — AgX has no HDR output
+                // transform, so the PQ path below stays ACES 2.0 regardless of this setting.
+                sdrToneLut = RtToneLut.load(ctx, CausticaConfig.Rt.Tonemap.sdrLutResource());
             }
             // The mastering target is live, so track it each frame.
             int wantedHdrNits = CausticaConfig.Rt.Hdr.PEAK_NITS.value();
@@ -1121,6 +1124,85 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush();
+            // Height fog. The reference plane is authored in world Y but the shader works in rebased
+            // coordinates, so the terrain origin is subtracted here rather than pushing the origin into
+            // the shader: it keeps the value small enough for fp32 no matter how far the player walks.
+            // falloff is 1/scale-height; the clamp only guards a hand-edited config, since the setting
+            // itself is already bounded away from zero.
+            // Weather and biome climate. Both are read once per frame from the camera's position: fog and
+            // a cloud deck are whole-sky properties, so sampling them per-pixel would buy nothing but a
+            // seam where two biomes meet.
+            //
+            // Vanilla interpolates rain and thunder over ~½ second, and getRainLevel already returns the
+            // smoothed value, so weather ramps in and out without any easing of ours. Thunder is layered
+            // on top of rain rather than replacing it — vanilla raises both during a storm.
+            float rainLevel = 0f;
+            float thunderLevel = 0f;
+            // Biome climate stands in for the per-biome sky colours that 26.2 no longer carries:
+            // BiomeSpecialEffects was reduced to water and foliage tints, so temperature and whether the
+            // biome has precipitation are the only atmosphere-relevant signals vanilla still exposes.
+            // Cold and wet reads as hazy, hot and dry as clear — the mapping a desert-vs-taiga eye test
+            // would produce anyway.
+            float biomeHaze = 1f;
+            float wetness = 0f;
+            if (level != null) {
+                rainLevel = Mth.clamp(level.getRainLevel(1.0f), 0f, 1f);
+                thunderLevel = Mth.clamp(level.getThunderLevel(1.0f), 0f, 1f);
+                var biome = level.getBiome(cameraBlockPos).value();
+                // getBaseTemperature is roughly 0 (snowy) to 2 (desert/nether) in vanilla data.
+                float temperature = Mth.clamp(biome.getBaseTemperature(), 0f, 2f);
+                float climate = (1f - temperature * 0.5f) * (biome.hasPrecipitation() ? 1f : 0.35f);
+                float biomeResponse = CausticaConfig.Rt.Fog.BIOME_RESPONSE.value();
+                biomeHaze = Mth.lerp(biomeResponse, 1f, 0.4f + climate * 1.2f);
+                // Wetness needs actual liquid water falling. A biome with no precipitation (desert) gets
+                // nothing, and one cold enough for snow gets nothing either — snow accumulates, it does
+                // not soak in, and a glossy snowfield would be plainly wrong. The 0.15 cutoff is where
+                // vanilla's own precipitation type flips.
+                boolean rainsHere = biome.hasPrecipitation() && biome.getBaseTemperature() > 0.15f;
+                wetness = rainsHere ? rainLevel * CausticaConfig.Rt.Clouds.WETNESS.value() : 0f;
+            }
+            // Rain multiplies fog density rather than adding to it, so a configured density of 0 stays
+            // 0 in a downpour. Weather driving a feature the user switched off would be a surprise.
+            float fogWeather = 1f + rainLevel * CausticaConfig.Rt.Fog.WEATHER_RESPONSE.value();
+            float fogScaleHeight = Math.max(CausticaConfig.Rt.Fog.SCALE_HEIGHT.value(), 1.0e-2f);
+            Float4 fog = new Float4(
+                    CausticaConfig.Rt.Fog.DENSITY.value() * fogWeather * biomeHaze,
+                    1.0f / fogScaleHeight,
+                    CausticaConfig.Rt.Fog.HEIGHT.value() - terrain.blockY,
+                    CausticaConfig.Rt.Fog.ALBEDO.value());
+
+            // Cloud deck. The wind offset is accumulated on the CPU from wall time rather than derived
+            // in the shader from frameIndex, so the deck drifts at a fixed blocks-per-second regardless
+            // of frame rate. Folding the terrain origin (mod 4096, same trick as the water wave anchor)
+            // into the offset keeps the noise domain pinned to the world across a terrain rebase — without
+            // it the whole sky would visibly slide sideways every time the player crossed a rebase
+            // boundary. The mask keeps the value small enough that fp32 still resolves the detail octave.
+            float cloudWind = CausticaConfig.Rt.Clouds.WIND_SPEED.value() * waterWaveTime;
+            // Storm response. Coverage closes the remaining gap toward overcast rather than adding a
+            // fixed amount, so a sky that is already at 0.8 does not overshoot past 1 and clip flat.
+            // Density rises and ambient falls together: that pairing — thicker and less sky bouncing
+            // around inside — is what makes a storm deck read as heavy rather than merely large.
+            float cloudWeather = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value()
+                    * Math.min(rainLevel + thunderLevel * 0.5f, 1f);
+            float cloudCoverage = CausticaConfig.Rt.Clouds.COVERAGE.value();
+            cloudCoverage += (1f - cloudCoverage) * cloudWeather * 0.85f;
+            Float4 cloud0 = new Float4(
+                    cloudCoverage,
+                    CausticaConfig.Rt.Clouds.DENSITY.value() * (1f + cloudWeather * 1.5f),
+                    CausticaConfig.Rt.Clouds.ALTITUDE.value() - terrain.blockY,
+                    CausticaConfig.Rt.Clouds.THICKNESS.value());
+            Float4 cloud1 = new Float4(
+                    (terrain.blockX & WATER_ANCHOR_MASK) + cloudWind * 0.8f,
+                    (terrain.blockZ & WATER_ANCHOR_MASK) + cloudWind * 0.6f,
+                    CausticaConfig.Rt.Clouds.DETAIL.value(),
+                    CausticaConfig.Rt.Clouds.AMBIENT.value() * (1f - cloudWeather * 0.55f));
+            // Ground shadowing. The floor is lowered as the storm builds: a heavier deck really does pass
+            // less diffuse light, and holding the clear-sky floor through a thunderstorm is what makes an
+            // overcast world read as merely dimmed rather than actually overcast.
+            Float4 cloud2 = new Float4(
+                    CausticaConfig.Rt.Clouds.SHADOW_STRENGTH.value(),
+                    CausticaConfig.Rt.Clouds.SHADOW_FLOOR.value() * (1f - cloudWeather * 0.5f),
+                    wetness, 0f);
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1156,7 +1238,11 @@ public final class RtComposite {
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
                     // Must be the SAME value the exposure resolve divides out this frame (it reads it
                     // from the same RtExposure accessor), or the two stop cancelling.
-                    exposure.preExposure()
+                    exposure.preExposure(),
+                    fog,
+                    cloud0,
+                    cloud1,
+                    cloud2
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
@@ -1262,7 +1348,15 @@ public final class RtComposite {
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
                 displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                         sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
-                        true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length);
+                        true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length,
+                        CausticaConfig.Rt.Grade.ENABLED.value(),
+                        CausticaConfig.Rt.Grade.SATURATION.value(),
+                        CausticaConfig.Rt.Grade.CONTRAST.value(),
+                        CausticaConfig.Rt.Grade.GAIN.value(),
+                        CausticaConfig.Rt.Grade.HIGHLIGHT_SATURATION.value(),
+                        CausticaConfig.Rt.Grade.HIGHLIGHT_GAIN.value(),
+                        CausticaConfig.Rt.Grade.HIGHLIGHTS_MIN.value(),
+                        CausticaConfig.Rt.Grade.SHARPNESS.value());
             }
             hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite
