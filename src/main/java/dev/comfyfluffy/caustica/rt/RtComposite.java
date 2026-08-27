@@ -245,6 +245,18 @@ public final class RtComposite {
     private RtImage gMotion;
     private RtImage gSpecAlbedo;
     private RtImage gSpecMotion;
+    /**
+     * ReSTIR temporal reservoirs. Two images, both bound for the pipeline's lifetime, swapping the
+     * roles of history and destination each frame via a push constant rather than by rewriting
+     * descriptors — see {@link RtPipeline#setReservoirImages}. Double-width: two texels per pixel.
+     */
+    private RtImage reservoirA;
+    private RtImage reservoirB;
+    /** Flips each frame; 0 means A is history. */
+    private int reservoirParity;
+    /** Set whenever history becomes meaningless — first frame, resize, dimension change. */
+    private boolean reservoirHistoryValid;
+    private Object reservoirDimension;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -861,6 +873,7 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(3, gMotion.view);
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecMotion.view);
+        worldPipeline.setReservoirImages(reservoirA.view, reservoirB.view);
     }
 
     private void destroyGuideImages() {
@@ -887,6 +900,14 @@ public final class RtComposite {
         if (gSpecMotion != null) {
             gSpecMotion.destroy();
             gSpecMotion = null;
+        }
+        if (reservoirA != null) {
+            reservoirA.destroy();
+            reservoirA = null;
+        }
+        if (reservoirB != null) {
+            reservoirB.destroy();
+            reservoirB = null;
         }
         if (rrOutput != null) {
             rrOutput.destroy();
@@ -972,6 +993,16 @@ public final class RtComposite {
         gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
         gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
         gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
+        // ReSTIR reservoirs, at RENDER resolution and double width (two texels per pixel). rgba32f
+        // because the stored emitter position is a rebased world coordinate: a half there quantises
+        // light positions into visible banding across a large room. Recreated with the guides, so a
+        // resolution or DLSS-quality change reallocates them and invalidates history along with it.
+        reservoirA = ctx.createStorageImage(renderW * 2, renderH, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
+                "ReSTIR reservoir A " + renderW + "x" + renderH);
+        reservoirB = ctx.createStorageImage(renderW * 2, renderH, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
+                "ReSTIR reservoir B " + renderW + "x" + renderH);
+        reservoirHistoryValid = false;
+        reservoirParity = 0;
         // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
@@ -1260,6 +1291,29 @@ public final class RtComposite {
             }
             Float4 dimSky = new Float4(skyR, skyG, skyB, skyboxMode);
             Float4 dimFog = new Float4(fogR, fogG, fogB, fogTintStrength);
+            // ReSTIR temporal reuse. History is only meaningful if it describes this world in this
+            // rebased space: a dimension change reuses the same images with positions from a different
+            // world entirely, which would light the Nether with the Overworld's torches until the
+            // reservoirs churned over. A resize already clears the flag when the images are recreated.
+            Object currentDimension = level == null ? null : level.dimension();
+            if (!java.util.Objects.equals(currentDimension, reservoirDimension)) {
+                reservoirDimension = currentDimension;
+                reservoirHistoryValid = false;
+            }
+            reservoirParity ^= 1;
+            float restirStrength = CausticaConfig.Rt.Restir.TEMPORAL.value();
+            Float4 restir = new Float4(
+                    reservoirHistoryValid ? restirStrength : 0f,
+                    reservoirParity,
+                    renderW,
+                    0f);
+            // Valid from the frame after the first one that wrote anything: the destination image this
+            // frame becomes history next frame.
+            if (restirStrength > 0f) {
+                reservoirHistoryValid = true;
+            } else {
+                reservoirHistoryValid = false;
+            }
             Float4 pom = new Float4(
                     CausticaConfig.Rt.Pom.DEPTH.value(),
                     CausticaConfig.Rt.Pom.QUALITY.value(),
@@ -1308,7 +1362,8 @@ public final class RtComposite {
                     pom,
                     dimSky,
                     dimFog,
-                    dimCloud
+                    dimCloud,
+                    restir
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.

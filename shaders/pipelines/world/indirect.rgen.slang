@@ -33,6 +33,7 @@ import sky;
 import bindings;
 import fog;
 import clouds;
+import restir;
 
 // Atmospheric transmittance LUT (RtSkyLut), also bound to world.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
@@ -356,15 +357,49 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             }
         }
 
-        // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
+        // RIS direct lighting from block emitters, with optional ReSTIR temporal reuse at the primary
+        // hit (restir.slang).
         // Front lobe + SSS backlighting are resampled together and share ONE shadow ray — a light can
         // only be in front of n or behind it, never both, so combining them into one target function is
         // exact, not an approximation. The SSS term is gated off past MAX_SSS_INDIRECT_DEPTH by passing
         // sss=0 there (falls back to plain front-only RIS).
         if (risOn) {
             float activeSss = hitDepth <= MAX_SSS_INDIRECT_DEPTH ? sss : 0.0;
+            // ReSTIR temporal reuse, primary hit only. A secondary bounce has no stable screen-space
+            // identity to reproject through, so reusing history there would combine unrelated surfaces.
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, false, activeSss,
                                      seed, proposalSeed);
+            // Primary hit only, and only for the camera's own path: bounce > 0 and the queued
+            // dielectric leaves have no stable screen-space identity to reproject through, so reusing
+            // history there would be combining unrelated surfaces into one pixel's reservoir.
+            float restirStrength = worldPush.restir.x;
+            bool restirPixel = restirStrength > 0.0 && bounce == 0 && seg.bounce == 0;
+            if (restirPixel) {
+                uint parity = uint(worldPush.restir.y + 0.5);
+                // Reprojection through the surface motion vector the guides already produce for DLSS,
+                // so history follows a moving surface rather than a fixed screen position.
+                float2 motion = gMotion[int2(pix)];
+                int2 prevPix = int2(floor(float2(pix) + 0.5 - motion));
+                uint reservoirW;
+                uint reservoirH;
+                reservoirA.GetDimensions(reservoirW, reservoirH);
+                // The images are double-width, so the addressable pixel count is half the texel width.
+                int renderWidth = int(reservoirW) / 2;
+                if (all(prevPix >= int2(0, 0)) && prevPix.x < renderWidth
+                        && prevPix.y < int(reservoirH)) {
+                    PackedReservoir history = loadReservoir(prevPix, parity);
+                    // Geometric rejection: same depth and normal, or the sample belonged to another
+                    // surface that merely happened to land on this pixel last frame.
+                    float currentDepth = payload.hitT;
+                    float historyDepth = gDepth[prevPix];
+                    float3 historyNormal = gNormal[prevPix].xyz;
+                    if (temporalSurfaceMatches(currentDepth, historyDepth, n, historyNormal)) {
+                        r = temporalCombine(r, history, hitPos, n, v, rd, diffAlb, F0, rough,
+                                            false, activeSss, seed);
+                    }
+                }
+                storeReservoir(int2(pix), parity, toPacked(r));
+            }
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, false,
                                              activeSss);
         }
