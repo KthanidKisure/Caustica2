@@ -58,7 +58,7 @@ public final class CausticaConfig {
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
-            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
+            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Restir.TEMPORAL, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -861,6 +861,24 @@ public final class CausticaConfig {
                     clampedFloat("caustica.rt.pom.fadeLod", "pom.fade-lod", 4.0f, 0.0f, 12.0f);
 
             private Pom() {
+            }
+        }
+
+        /**
+         * ReSTIR temporal reuse for the block-emitter reservoirs. Off by default. Reuses last frame's
+         * chosen emitter where the surface is unchanged, so a pixel accumulates far more effective
+         * candidates than one frame's budget allows — the difference shows up in caves and at night,
+         * where the light sampling is the noise floor.
+         */
+        public static final class Restir {
+            /**
+             * Strength of temporal reuse, 0 disables it and both reservoir image accesses. 1 is full
+             * reuse up to the shader's M cap; lower values shorten the effective history.
+             */
+            public static final FloatSetting TEMPORAL =
+                    clampedFloat("caustica.rt.restir.temporal", "restir.temporal", 0.0f, 0.0f, 1.0f);
+
+            private Restir() {
             }
         }
 
