@@ -52,6 +52,7 @@ public struct CloudParams {
     public float thickness;    // deck depth in blocks
     public float2 wind;        // domain offset in blocks, advanced on the CPU so it is frame-rate independent
     public float detail;       // 0..1 erosion strength
+    public float featureSize;  // blocks per noise period; smaller means more, tighter cloud masses
     public float ambient;      // fraction of zenith sky scattered in as multiple-scattering stand-in
 };
 
@@ -64,6 +65,7 @@ public CloudParams makeCloudParams(WorldPush push) {
     c.wind = push.cloud1.xy;
     c.detail = clamp(push.cloud1.z, 0.0, 1.0);
     c.ambient = max(push.cloud1.w, 0.0);
+    c.featureSize = max(push.cloud2.w, 1.0);
     return c;
 }
 
@@ -134,10 +136,18 @@ public float cloudDensity(CloudParams c, float3 position) {
         return 0.0;
     }
 
-    // Base shape. The horizontal scale is deliberately far coarser than the vertical one: cumulus fields
-    // are wide and shallow, and isotropic noise at this scale reads as fog banks rather than as clouds.
+    // Base shape. Horizontal scale is coarser than vertical: cumulus fields are wide and shallow, and
+    // isotropic noise reads as fog banks rather than clouds.
+    //
+    // FEATURE SIZE IS CONFIGURABLE, and the original hardcoded 0.0012 was badly wrong: one noise period
+    // spanned ~830 blocks, so an entire render distance held two or three cloud masses, and wind at
+    // 1.5 blocks/second moved the field 0.2% of a feature width per second — visually frozen. "Almost
+    // no clouds" and "clouds do not move" were one mistake, not two.
+    float baseFrequency = 1.0 / max(c.featureSize, 1.0);
     float3 domain = float3(position.x + c.wind.x, position.y, position.z + c.wind.y);
-    float3 baseCoord = float3(domain.x * 0.0012, domain.y * 0.0035, domain.z * 0.0012);
+    float3 baseCoord = float3(domain.x * baseFrequency,
+                              domain.y * baseFrequency * 2.9,
+                              domain.z * baseFrequency);
     float shape = cloudFbm(baseCoord, 4);
 
     // Coverage as a threshold remap, not a multiply. Multiplying would raise a flat haze everywhere as
@@ -153,7 +163,12 @@ public float cloudDensity(CloudParams c, float3 position) {
     // Erosion, applied as an inward carve whose strength falls off with density. Eroding the core as hard
     // as the edge would punch holes through the middle of every cloud.
     if (c.detail > 0.0) {
-        float3 detailCoord = float3(domain.x * 0.012, domain.y * 0.020, domain.z * 0.012);
+        // Detail rides at 10x the base frequency so it scales with feature size rather than staying
+        // fixed while the base changes underneath it.
+        float detailFrequency = baseFrequency * 10.0;
+        float3 detailCoord = float3(domain.x * detailFrequency,
+                                    domain.y * detailFrequency * 1.7,
+                                    domain.z * detailFrequency);
         float erosion = 1.0 - cloudFbm(detailCoord, 3);
         float strength = c.detail * (1.0 - shaped);
         shaped = saturate(shaped - erosion * erosion * strength);

@@ -58,7 +58,8 @@ public final class CausticaConfig {
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
-            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Restir.TEMPORAL, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
+            Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Restir.TEMPORAL,
+            Rt.Weather.RAIN_OVERRIDE, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -757,9 +758,20 @@ public final class CausticaConfig {
             /** Deck depth in blocks. Thin decks read as stratus, thick ones as cumulus. */
             public static final FloatSetting THICKNESS =
                     clampedFloat("caustica.rt.clouds.thickness", "clouds.thickness", 90.0f, 1.0f, 2048.0f);
-            /** Domain drift in blocks per second. 0 freezes the deck. */
+            /**
+             * Blocks per noise period — roughly the width of one cloud mass. Smaller gives more, tighter
+             * clouds. 220 puts several masses inside a normal render distance; the original hardcoded
+             * value behaved like ~830, which is why the sky looked almost empty.
+             */
+            public static final FloatSetting FEATURE_SIZE =
+                    clampedFloat("caustica.rt.clouds.featureSize", "clouds.feature-size",
+                            160.0f, 16.0f, 4096.0f);
+            /**
+             * Domain drift in blocks per second. 0 freezes the deck. Judge this against feature-size:
+             * drift only reads as motion when it covers a noticeable fraction of a cloud per second.
+             */
             public static final FloatSetting WIND_SPEED =
-                    clampedFloat("caustica.rt.clouds.windSpeed", "clouds.wind-speed", 1.5f, 0.0f, 256.0f);
+                    clampedFloat("caustica.rt.clouds.windSpeed", "clouds.wind-speed", 12.0f, 0.0f, 256.0f);
             /** High-frequency edge erosion. 0 gives smooth blobs, 1 gives wispy, broken silhouettes. */
             public static final FloatSetting DETAIL =
                     clampedFloat("caustica.rt.clouds.detail", "clouds.detail", 0.45f, 0.0f, 1.0f);
@@ -870,6 +882,32 @@ public final class CausticaConfig {
          * candidates than one frame's budget allows — the difference shows up in caves and at night,
          * where the light sampling is the noise floor.
          */
+        /**
+         * Manual weather override for the renderer's fog, cloud and wetness response.
+         *
+         * <p>This exists because servers frequently never send rain packets — Wynncraft being the
+         * case in point — so {@code level.getRainLevel()} sits at zero forever and none of the storm
+         * visuals can be seen or tuned. Client-side weather mods solve this properly by driving
+         * vanilla's own rain state; this is the fallback for when no such mod is available for your
+         * Minecraft version.
+         *
+         * <p>It overrides only what the RENDERER reads. It does not make it rain: no particles, no
+         * sound, no gameplay effect. Vanilla's own weather is untouched.
+         */
+        public static final class Weather {
+            /** Rain level 0..1, or -1 to use whatever the world reports. */
+            public static final FloatSetting RAIN_OVERRIDE =
+                    clampedFloat("caustica.rt.weather.rainOverride", "weather.rain-override",
+                            -1.0f, -1.0f, 1.0f);
+            /** Thunder level 0..1, or -1 to use the world's. Layers on top of rain, as vanilla does. */
+            public static final FloatSetting THUNDER_OVERRIDE =
+                    clampedFloat("caustica.rt.weather.thunderOverride", "weather.thunder-override",
+                            -1.0f, -1.0f, 1.0f);
+
+            private Weather() {
+            }
+        }
+
         public static final class Restir {
             /**
              * Strength of temporal reuse, 0 disables it and both reservoir image accesses. 1 is full
@@ -1046,6 +1084,23 @@ public final class CausticaConfig {
                     return "agx-base";
                 }
                 return "aces2";
+            }
+
+            /**
+             * HDR view transform resource. {@code agx-punchy} maps to the AgX HDR bake; everything
+             * else, including {@code agx-base}, stays on ACES 2.0 at the requested peak.
+             *
+             * <p>The AgX HDR bake is a construction, not an upstream transform: AgX has no HDR output
+             * transform, so this is AgX's tone curve and look presented through PQ with diffuse white
+             * at BT.2408's 203 nits. You get the AgX image on an HDR display. You do NOT get AgX with
+             * HDR highlight range — its sigmoid still rolls off to its own white point. Pick ACES 2.0
+             * if highlight range is what you are after.
+             */
+            public static String hdrLutResource(int peakNits) {
+                if ("agx-punchy".equals(VIEW_TRANSFORM.get())) {
+                    return "hdr_agx_punchy_rec2020.bin";
+                }
+                return "hdr_aces2_rec2020_" + peakNits + "nit.bin";
             }
 
             /** Resource name under {@code /caustica/color/luts/} for the selected SDR view transform. */

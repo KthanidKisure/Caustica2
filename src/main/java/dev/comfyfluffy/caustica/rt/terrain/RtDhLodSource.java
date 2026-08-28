@@ -60,6 +60,7 @@ public final class RtDhLodSource {
     private static Object worldProxy;
     private static Method getAllTerrainDataAtDetailLevelAndPos;
     private static Method getSinglePlayerLevel;
+    private static Method getAllLoadedLevelWrappers;
     private static Field resultPayload;
     private static Field resultSuccess;
     private static Field resultMessage;
@@ -120,14 +121,14 @@ public final class RtDhLodSource {
                     "getAllTerrainDataAtDetailLevelAndPos",
                     levelWrapper, byte.class, int.class, int.class, cacheInterface);
 
-            // getSinglePlayerLevel, not a "current level" accessor: DH has no notion of one. On a
-            // multiplayer server this throws IllegalStateException and distant terrain is simply
-            // absent — correct behaviour, since picking an arbitrary entry from
-            // getAllLoadedLevelWrappers() would happily hand back the Nether's terrain while you
-            // stand in the Overworld.
+            // Two accessors, because they cover different worlds. getSinglePlayerLevel throws on a
+            // multiplayer server, which would have ruled out exactly the case that matters here:
+            // Wynncraft with WynnLODGrabber, where DH's database is populated for a SERVER world.
+            // getAllLoadedLevelWrappers covers that, at the cost of having to pick — see levelWrapper().
             Class<?> worldProxyInterface = Class.forName(
                     "com.seibel.distanthorizons.api.interfaces.world.IDhApiWorldProxy");
             getSinglePlayerLevel = worldProxyInterface.getMethod("getSinglePlayerLevel");
+            getAllLoadedLevelWrappers = worldProxyInterface.getMethod("getAllLoadedLevelWrappers");
 
             // DhApiResult exposes success/message/payload as public FIELDS, not getters.
             Class<?> resultClass = Class.forName("com.seibel.distanthorizons.api.objects.DhApiResult");
@@ -181,9 +182,9 @@ public final class RtDhLodSource {
             }
         }
         try {
-            Object levelWrapper = getSinglePlayerLevel.invoke(worldProxy);
+            Object levelWrapper = levelWrapper();
             if (levelWrapper == null) {
-                return List.of(); // between worlds
+                return List.of(); // between worlds, or nothing loaded yet
             }
             Object result = getAllTerrainDataAtDetailLevelAndPos.invoke(
                     terrainRepo, levelWrapper, detailLevel, posX, posZ, null);
@@ -267,6 +268,41 @@ public final class RtDhLodSource {
             }
         }
         return boxes;
+    }
+
+    /**
+     * The level to query. Single-player has exactly one and DH says so directly. On a server —
+     * Wynncraft being the case this exists for — that call throws, so this falls back to the loaded
+     * set.
+     *
+     * <p>Taking the first loaded wrapper is a real limitation, not a tidy default: with more than one
+     * level loaded it can return the wrong dimension's terrain. It is acceptable here because the
+     * situation this serves is a server world where DH has one level populated by WynnLODGrabber. If
+     * distant terrain ever appears from the wrong dimension, this is the line to fix, by matching the
+     * wrapper's dimension against the client's.
+     */
+    private static Object levelWrapper() throws ReflectiveOperationException {
+        try {
+            Object single = getSinglePlayerLevel.invoke(worldProxy);
+            if (single != null) {
+                return single;
+            }
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            // IllegalStateException on a server. Expected; fall through.
+        }
+        // Iterable, NOT Collection. Verified against DistantHorizons-3.2.0-b-26.2: the signature is
+        // getAllLoadedLevelWrappers()Ljava/lang/Iterable;. A Collection check here compiles and runs
+        // fine, silently matches nothing, and disables distant terrain on every server — which is
+        // exactly the case this fallback exists for.
+        Object loaded = getAllLoadedLevelWrappers.invoke(worldProxy);
+        if (loaded instanceof Iterable<?> iterable) {
+            for (Object wrapper : iterable) {
+                if (wrapper != null) {
+                    return wrapper;
+                }
+            }
+        }
+        return null;
     }
 
     /** Forgets the resolved API. Call on world unload so a DH reload is picked up. */
