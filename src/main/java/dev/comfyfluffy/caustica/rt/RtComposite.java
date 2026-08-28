@@ -627,7 +627,12 @@ public final class RtComposite {
             // The mastering target is live, so track it each frame.
             int wantedHdrNits = CausticaConfig.Rt.Hdr.PEAK_NITS.value();
             if (hdrToneLut == null || loadedHdrLutNits != wantedHdrNits) {
-                RtToneLut newHdrLut = RtToneLut.load(ctx, "hdr_aces2_rec2020_" + wantedHdrNits + "nit.bin");
+                // The AgX HDR LUT has no per-peak variants: its tone curve rolls off to its own white
+                // point rather than to the display's, so a 4000 nit bake would be identical to a 500
+                // nit one. That is the honest consequence of AgX having no HDR output transform — this
+                // is the AgX look in a PQ container, not AgX extended to HDR range.
+                String hdrLutName = CausticaConfig.Rt.Tonemap.hdrLutResource(wantedHdrNits);
+                RtToneLut newHdrLut = RtToneLut.load(ctx, hdrLutName);
                 if (newHdrLut.size != sdrToneLut.size) {
                     // display.comp's lutSize push constant is shared by both LUT samples (see
                     // lutTexCoord()); bake_display_lut.py currently always sizes both the same, but
@@ -1197,6 +1202,16 @@ public final class RtComposite {
             if (level != null) {
                 rainLevel = Mth.clamp(level.getRainLevel(1.0f), 0f, 1f);
                 thunderLevel = Mth.clamp(level.getThunderLevel(1.0f), 0f, 1f);
+                // A negative override means "use the world". Applied after reading rather than instead
+                // of it, so turning the override off returns to live weather without a reload.
+                float rainOverride = CausticaConfig.Rt.Weather.RAIN_OVERRIDE.value();
+                if (rainOverride >= 0f) {
+                    rainLevel = rainOverride;
+                }
+                float thunderOverride = CausticaConfig.Rt.Weather.THUNDER_OVERRIDE.value();
+                if (thunderOverride >= 0f) {
+                    thunderLevel = thunderOverride;
+                }
                 var biome = level.getBiome(cameraBlockPos).value();
                 // getBaseTemperature is roughly 0 (snowy) to 2 (desert/nether) in vanilla data.
                 float temperature = Mth.clamp(biome.getBaseTemperature(), 0f, 2f);
@@ -1272,7 +1287,8 @@ public final class RtComposite {
             Float4 cloud2 = new Float4(
                     CausticaConfig.Rt.Clouds.SHADOW_STRENGTH.value(),
                     CausticaConfig.Rt.Clouds.SHADOW_FLOOR.value() * (1f - cloudWeather * 0.5f),
-                    wetness, 0f);
+                    wetness,
+                    CausticaConfig.Rt.Clouds.FEATURE_SIZE.value());
             // Vanilla environment colours. 26.2 moved per-biome and per-dimension colour out of
             // BiomeSpecialEffects into the EnvironmentAttributes system, which samples and interpolates
             // across biome boundaries itself — so this is vanilla's own blended value at the camera,

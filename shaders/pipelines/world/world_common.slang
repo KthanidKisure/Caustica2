@@ -101,7 +101,8 @@ public struct WorldPush {
     public float4   cloud0;
     public float4   cloud1;
     // cloud2: x ground-shadow strength (0 disables shadowing without disabling the deck), y the
-    // multiple-scattering floor the shadow cannot darken past, z rain wetness 0..1, w unused.
+    // multiple-scattering floor the shadow cannot darken past, z rain wetness 0..1,
+    // w cloud feature size in blocks (one noise period).
     public float4   cloud2;
     // ---- Parallax occlusion mapping. x depth in sprite-widths (0 disables it entirely), y step-count
     // scale, z ray-cone LOD at which it has faded out, w unused.
