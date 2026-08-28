@@ -513,7 +513,9 @@ public final class RtTerrain {
             }
         }
 
-        streamLod(ctx, level, pbx, pby, pbz);
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.lodDispatch")) {
+            streamLod(ctx, level, pbx, pby, pbz);
+        }
 
         // Publish only a fully uploaded hierarchy. Newer section changes supersede stale worker/upload
         // results, while the previous complete generation remains active until this atomic swap.
