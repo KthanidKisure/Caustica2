@@ -182,6 +182,9 @@ public final class RtTerrain {
     /** Regions DH had no geometry for. If this climbs while published stays 0, the database is the problem. */
     private final java.util.concurrent.atomic.AtomicInteger lodEmptyRegions =
             new java.util.concurrent.atomic.AtomicInteger();
+    /** Total boxes DH handed back. Non-zero with zero published means meshing is the problem, not DH. */
+    private final java.util.concurrent.atomic.AtomicInteger lodBoxesSeen =
+            new java.util.concurrent.atomic.AtomicInteger();
     // Worker/build bookkeeping. `inFlight` maps a dispatched section key to a monotonic token; a completed
     // task whose token no longer matches is discarded. The active-task barrier spans worker + GPU lifetime.
     private final Long2LongOpenHashMap inFlight = new Long2LongOpenHashMap();
@@ -1477,8 +1480,9 @@ public final class RtTerrain {
         }
         int empties = lodEmptyRegions.get();
         if (empties >= 64 && empties % 64 == 0 && lodResident.isEmpty()) {
-            CausticaMod.LOGGER.info("LOD: {} regions queried, all empty — DH has no data at detail {} here",
-                    empties, CausticaConfig.Rt.Lod.DETAIL.value());
+            CausticaMod.LOGGER.info(
+                    "LOD: {} regions queried, {} boxes returned by DH, none published (detail {})",
+                    empties, lodBoxesSeen.get(), CausticaConfig.Rt.Lod.DETAIL.value());
         }
         if (!lodLoggedState) {
             lodLoggedState = true;
@@ -1537,11 +1541,15 @@ public final class RtTerrain {
         try {
             RtWorkerPool.INSTANCE.submit(() -> {
                 try {
-                    // DH covers one LOD section with (scale)^2 of its own detail-level columns; one query
-                    // per section keeps the database hit count proportional to sections, not blocks.
+                    // One query covering the section's whole footprint. DH's detailLevel is the size of
+                    // the queried AREA, not the data resolution, so the footprint is what it needs —
+                    // asking for "detail 3" got an 8x8-block area per 128-block section, which is why
+                    // sections came back empty.
                     RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
-                    region.fill(RtDhLodSource.fetchRegion((byte) detail,
-                            Math.floorDiv(originX, scale), Math.floorDiv(originZ, scale)));
+                    java.util.List<RtDhLodSource.LodBox> boxes =
+                            RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
+                    region.fill(boxes);
+                    lodBoxesSeen.addAndGet(boxes.size());
                     if (region.isEmpty()) {
                         // Empty means DH returned no solid blocks here — either the region is not in
                         // its database, or the detail level has not been generated. Counted rather
