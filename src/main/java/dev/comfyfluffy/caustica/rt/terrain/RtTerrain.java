@@ -155,6 +155,21 @@ public final class RtTerrain {
     // frames, so evicted geometry waits here until the next publish pass retires it.
     private final List<SectionGeom> removed = new ArrayList<>();
     private final List<PreparedSection> prepared = new ArrayList<>();
+    // ---- Distant LOD ---------------------------------------------------------------------------
+    // Held OUTSIDE `resident` on purpose. Residency's window sync evicts anything not in `desired`,
+    // and `desired` is derived from the vanilla chunk cache — so a LOD section, which by definition
+    // lives past that window, would be evicted the tick after it published. Keeping a separate map
+    // means the two grids never fight, at the cost of the small publish block below.
+    private final Long2ObjectOpenHashMap<SectionGeom> lodResident = new Long2ObjectOpenHashMap<>();
+    private final LongOpenHashSet lodInFlight = new LongOpenHashSet();
+    private final List<PreparedSection> lodPrepared =
+            java.util.Collections.synchronizedList(new ArrayList<>());
+    /**
+     * Keeps LOD keys clear of real section keys. The key packs scy into 12 signed bits, and legal
+     * Minecraft section Y is roughly -4..20, so offsetting by 512 per detail level cannot collide with
+     * a real section or with another detail level.
+     */
+    private static final int LOD_KEY_Y_OFFSET = 512;
     // Worker/build bookkeeping. `inFlight` maps a dispatched section key to a monotonic token; a completed
     // task whose token no longer matches is discarded. The active-task barrier spans worker + GPU lifetime.
     private final Long2LongOpenHashMap inFlight = new Long2LongOpenHashMap();
@@ -458,7 +473,9 @@ public final class RtTerrain {
                 && completedBuilds.isEmpty()
                 && !lightGrid.hasCompletions()
                 && !lightHierarchyDirty
-                && removed.isEmpty() && prepared.isEmpty()) {
+                && removed.isEmpty() && prepared.isEmpty()
+                && lodPrepared.isEmpty() && !CausticaConfig.Rt.Lod.ENABLED.value()
+                && lodResident.isEmpty()) {
             return;
         }
         int pbx = mc.player.getBlockX();
@@ -480,6 +497,8 @@ public final class RtTerrain {
                 prepared.clear();
             }
         }
+
+        streamLod(ctx, level, pbx, pby, pbz);
 
         // Publish only a fully uploaded hierarchy. Newer section changes supersede stale worker/upload
         // results, while the previous complete generation remains active until this atomic swap.
@@ -1412,6 +1431,209 @@ public final class RtTerrain {
     }
 
     /** Per-tick render-thread snapshot dependencies shared by reextract + missing dispatch. */
+
+    // ---- Distant LOD from Distant Horizons -------------------------------------------------------
+    //
+    // A second, much coarser section grid living entirely past the vanilla chunk cache. It rides the
+    // same mesh -> upload -> BLAS -> table pipeline as ordinary terrain, but is tracked separately
+    // because residency's window sync would evict it instantly (see lodResident).
+    //
+    // LOD sections are never individually evicted. They are cheap to hold (a few hundred at most), the
+    // player leaving a region is not a reason to rebuild it, and never destroying a published BLAS
+    // mid-session removes the entire use-after-free class of bug from this path. They are released
+    // wholesale on world change or when the feature is switched off.
+
+    private static long lodKey(int lx, int ly, int lz, int detail) {
+        return sectionKey(lx, ly + LOD_KEY_Y_OFFSET * detail, lz);
+    }
+
+    private void streamLod(RtContext ctx, ClientLevel level, int pbx, int pby, int pbz) {
+        if (!CausticaConfig.Rt.Lod.ENABLED.value() || !RtDhLodSource.available()) {
+            releaseLod(ctx);
+            return;
+        }
+        publishLodPrepared(ctx, pbx, pby, pbz);
+
+        int detail = CausticaConfig.Rt.Lod.DETAIL.value();
+        int scale = 1 << detail;
+        int sectionBlocks = RtDhLodRegion.SECTION_BLOCKS * scale;
+        int radius = CausticaConfig.Rt.Lod.RADIUS.value();
+        int heightSections = CausticaConfig.Rt.Lod.HEIGHT_SECTIONS.value();
+        int budget = CausticaConfig.Rt.Lod.SECTIONS_PER_FRAME.value();
+
+        int centreX = Math.floorDiv(pbx, sectionBlocks);
+        int centreZ = Math.floorDiv(pbz, sectionBlocks);
+        int centreY = Math.floorDiv(62, sectionBlocks);
+
+        // Nearest-first, so the ring the player is looking at fills before the far edge.
+        outer:
+        for (int ring = 0; ring <= radius; ring++) {
+            for (int dx = -ring; dx <= ring; dx++) {
+                for (int dz = -ring; dz <= ring; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) {
+                        continue; // only this ring's perimeter; inner rings were done already
+                    }
+                    for (int dy = 0; dy < heightSections; dy++) {
+                        if (budget <= 0) {
+                            break outer;
+                        }
+                        int lx = centreX + dx;
+                        int lz = centreZ + dz;
+                        int ly = centreY + dy;
+                        long key = lodKey(lx, ly, lz, detail);
+                        if (lodResident.containsKey(key) || lodInFlight.contains(key)) {
+                            continue;
+                        }
+                        dispatchLodSection(ctx, level, key, lx, ly, lz, detail, scale, sectionBlocks);
+                        budget--;
+                    }
+                }
+            }
+        }
+    }
+
+    private void dispatchLodSection(RtContext ctx, ClientLevel level, long key,
+                                    int lx, int ly, int lz, int detail, int scale, int sectionBlocks) {
+        DispatchContext dispatch = dispatchContext(ctx, level);
+        RtMaterialRegistry.Snapshot materialSnapshot = RtMaterialRegistry.INSTANCE.requireSnapshot();
+        int originX = lx * sectionBlocks;
+        int originY = ly * sectionBlocks;
+        int originZ = lz * sectionBlocks;
+        lodInFlight.add(key);
+        beginActiveTask();
+        try {
+            RtWorkerPool.INSTANCE.submit(() -> {
+                try {
+                    // DH covers one LOD section with (scale)^2 of its own detail-level columns; one query
+                    // per section keeps the database hit count proportional to sections, not blocks.
+                    RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
+                    region.fill(RtDhLodSource.fetchRegion((byte) detail,
+                            Math.floorDiv(originX, scale), Math.floorDiv(originZ, scale)));
+                    if (region.isEmpty()) {
+                        finishLodTask(key, null);
+                        return;
+                    }
+                    WorkerTessState ws = WORKER_TESS.get();
+                    ws.reset(dispatch.blockColors(), dispatch.blockSpriteFinder());
+                    FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
+                    // Section coords passed as 0,0,0: the region presents a virtual section at the
+                    // origin, and the world placement is carried by the instance transform instead.
+                    CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), ws.blockEmitter,
+                            ws.blockRandom, ws.capture, fluidRenderer, ws.fluidCapture, ws.mesh, ws.pos,
+                            materialSnapshot, 0, 0, 0);
+                    PackedSection packed = cpu.packed();
+                    if (packed == null) {
+                        finishLodTask(key, null);
+                        return;
+                    }
+                    PreparedSection ps = RtSectionBuilder.prepare(dispatch.ctx(), packed,
+                            cpu.opacityMicromap(), CausticaConfig.Rt.Terrain.BLAS_COMPACTION.value(),
+                            key, originX, originY, originZ);
+                    submitLodBuild(dispatch.ctx(), key, ps, scale);
+                } catch (Throwable t) {
+                    finishLodTask(key, null);
+                }
+            });
+        } catch (Throwable t) {
+            lodInFlight.remove(key);
+            finishActiveTask();
+            throw t;
+        }
+    }
+
+    private void submitLodBuild(RtContext ctx, long key, PreparedSection prepared, int scale) {
+        ctx.gpuExecutor().submit(
+                () -> false,
+                cmd -> {
+                    RtSectionBuilder.recordUpload(cmd, prepared);
+                    RtAccel.recordBlasBuilds(ctx, cmd, List.of(prepared.blas()));
+                },
+                () -> {
+                    RtAccel.freeBlasScratch(List.of(prepared.blas()));
+                    prepared.releaseUpload();
+                },
+                (build, failure) -> {
+                    if (failure != null) {
+                        destroyPreparedSection(prepared);
+                        finishLodTask(key, null);
+                        return;
+                    }
+                    prepared.releaseBuildInputs();
+                    finishLodTask(key, prepared);
+                });
+    }
+
+    private void finishLodTask(long key, PreparedSection prepared) {
+        if (prepared != null) {
+            lodPrepared.add(prepared);
+        } else {
+            lodInFlight.remove(key);
+        }
+        finishActiveTask();
+    }
+
+    /** Publishes finished LOD sections into the shared section table. */
+    private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
+        if (lodPrepared.isEmpty()) {
+            return;
+        }
+        List<PreparedSection> batch;
+        synchronized (lodPrepared) {
+            batch = new ArrayList<>(lodPrepared);
+            lodPrepared.clear();
+        }
+        int scale = 1 << CausticaConfig.Rt.Lod.DETAIL.value();
+        for (PreparedSection ps : batch) {
+            lodInFlight.remove(ps.key());
+            if (lodResident.containsKey(ps.key())) {
+                // Raced with another dispatch of the same key; keep the published one.
+                ctx.gpuExecutor().retireUnpublished(() -> destroyPreparedSection(ps));
+                continue;
+            }
+            SectionGeom g = new SectionGeom(ps.key(), ps.uvs(), ps.material(),
+                    ps.blas().accel, ps.triBase(), ps.sx(), ps.sy(), ps.sz(), ps.lights());
+            g.lodScale = scale;
+            g.slot = table.allocateSlot();
+            g.instanceIndex = table.instanceList.size();
+            table.slots.set(g.slot, g);
+            table.write(g);
+            table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
+            lodResident.put(ps.key(), g);
+        }
+        table.flushWrites();
+        table.instances = table.instanceList;
+    }
+
+    /**
+     * Drops every LOD section. Used when the feature is switched off and on world teardown. The
+     * instance list is rebuilt from scratch rather than patched: instanceIndex values are positions in
+     * that list, so removing entries in place would invalidate every later section's index.
+     */
+    private void releaseLod(RtContext ctx) {
+        if (lodResident.isEmpty()) {
+            return;
+        }
+        List<SectionGeom> doomed = new ArrayList<>(lodResident.values());
+        lodResident.clear();
+        for (SectionGeom g : doomed) {
+            if (g.slot >= 0 && g.slot < table.slots.size()) {
+                table.slots.set(g.slot, null);
+            }
+            g.slot = -1;
+            g.instanceIndex = -1;
+        }
+        table.instanceList.clear();
+        for (int i = 0; i < table.slots.size(); i++) {
+            SectionGeom g = table.slots.get(i);
+            if (g != null) {
+                g.instanceIndex = table.instanceList.size();
+                table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
+            }
+        }
+        table.instances = table.instanceList;
+        retire(ctx, ctx.gpuExecutor().latestGraphicsUse(), doomed);
+    }
+
     private record DispatchContext(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
                                    FluidStateModelSet fluidModelSet, BlockColors blockColors,
                                    SpriteFinder blockSpriteFinder) {
