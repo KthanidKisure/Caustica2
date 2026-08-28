@@ -161,9 +161,18 @@ public final class RtTerrain {
     // lives past that window, would be evicted the tick after it published. Keeping a separate map
     // means the two grids never fight, at the cost of the small publish block below.
     private final Long2ObjectOpenHashMap<SectionGeom> lodResident = new Long2ObjectOpenHashMap<>();
+    /**
+     * Keys with a dispatch in progress. RENDER THREAD ONLY — fastutil hash sets are not thread-safe,
+     * and a worker removing a key while the render thread inserts one corrupts the table (it surfaces
+     * as an ArrayIndexOutOfBounds inside rehash, not as anything that looks like a race). Workers
+     * report completion through the two synchronized lists below; this set is only ever mutated in
+     * dispatchLodSection and publishLodPrepared, both of which run on the render thread.
+     */
     private final LongOpenHashSet lodInFlight = new LongOpenHashSet();
     private final List<PreparedSection> lodPrepared =
             java.util.Collections.synchronizedList(new ArrayList<>());
+    /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
+    private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
     /**
      * Keeps LOD keys clear of real section keys. The key packs scy into 12 signed bits, and legal
      * Minecraft section Y is roughly -4..20, so offsetting by 512 per detail level cannot collide with
@@ -1535,6 +1544,8 @@ public final class RtTerrain {
                 }
             });
         } catch (Throwable t) {
+            // Submit itself failed, so no worker will ever report: clear the key here. Still the
+            // render thread at this point, so touching the set directly is safe.
             lodInFlight.remove(key);
             finishActiveTask();
             throw t;
@@ -1563,17 +1574,33 @@ public final class RtTerrain {
                 });
     }
 
+    /**
+     * Worker/GPU-callback side of a dispatch. Only ever appends to a synchronized list; the in-flight
+     * set is cleared later, on the render thread, in publishLodPrepared.
+     */
     private void finishLodTask(long key, PreparedSection prepared) {
         if (prepared != null) {
             lodPrepared.add(prepared);
         } else {
-            lodInFlight.remove(key);
+            lodFailed.add(key);
         }
         finishActiveTask();
     }
 
     /** Publishes finished LOD sections into the shared section table. */
     private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
+        // Retire failed keys first so they become eligible for redispatch. Done here, on the render
+        // thread, because lodInFlight is not thread-safe.
+        if (!lodFailed.isEmpty()) {
+            List<Long> failed;
+            synchronized (lodFailed) {
+                failed = new ArrayList<>(lodFailed);
+                lodFailed.clear();
+            }
+            for (Long key : failed) {
+                lodInFlight.remove(key.longValue());
+            }
+        }
         if (lodPrepared.isEmpty()) {
             return;
         }
@@ -1585,8 +1612,9 @@ public final class RtTerrain {
         int scale = 1 << CausticaConfig.Rt.Lod.DETAIL.value();
         for (PreparedSection ps : batch) {
             lodInFlight.remove(ps.key());
-            if (lodResident.containsKey(ps.key())) {
-                // Raced with another dispatch of the same key; keep the published one.
+            if (lodResident.containsKey(ps.key()) || !CausticaConfig.Rt.Lod.ENABLED.value()) {
+                // Either a duplicate dispatch of the same key, or LOD was switched off while this was
+                // in flight. Retire it rather than publishing geometry nothing will ever release.
                 ctx.gpuExecutor().retireUnpublished(() -> destroyPreparedSection(ps));
                 continue;
             }
@@ -1615,6 +1643,12 @@ public final class RtTerrain {
         }
         List<SectionGeom> doomed = new ArrayList<>(lodResident.values());
         lodResident.clear();
+        lodInFlight.clear();
+        synchronized (lodFailed) {
+            lodFailed.clear();
+        }
+        // Anything still in flight will land in lodPrepared after this; publishLodPrepared drops
+        // prepared sections whose key is no longer wanted, so they are retired rather than leaked.
         for (SectionGeom g : doomed) {
             if (g.slot >= 0 && g.slot < table.slots.size()) {
                 table.slots.set(g.slot, null);
