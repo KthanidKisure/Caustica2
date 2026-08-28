@@ -59,7 +59,7 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Restir.TEMPORAL,
-            Rt.Weather.RAIN_OVERRIDE, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
+            Rt.Weather.RAIN_OVERRIDE, Rt.Lod.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -905,6 +905,48 @@ public final class CausticaConfig {
                             -1.0f, -1.0f, 1.0f);
 
             private Weather() {
+            }
+        }
+
+        /**
+         * Distant terrain from Distant Horizons' database. Off by default.
+         *
+         * <p>DH is used as a WORLD DATABASE only — its own rendering should be disabled. Caustica reads
+         * LOD terrain through DH's public API, meshes it, and puts it in the acceleration structure, so
+         * distant terrain is traced like everything else: it casts shadows, appears in reflections and
+         * contributes to global illumination, which a rasterised LOD renderer cannot do.
+         *
+         * <p>Requires Distant Horizons installed with data for the current world. On a server that means
+         * something has populated its database — on Wynncraft, the WynnLODGrabber download.
+         */
+        public static final class Lod {
+            /** Master switch. Off skips every DH query, mesh and BLAS build. */
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.lod.enabled", "lod.enabled", false);
+            /**
+             * DH detail level. Each virtual block covers 2^detail world blocks, and one LOD section
+             * therefore spans 16*2^detail blocks for the triangle cost of one ordinary section:
+             * 3 gives 128-block sections, 4 gives 256. Lower is sharper and far more expensive.
+             */
+            public static final IntSetting DETAIL =
+                    clampedInt("caustica.rt.lod.detail", "lod.detail", 3, 1, 6);
+            /** Radius in LOD sections around the player. 8 at detail 3 is roughly 1024 blocks. */
+            public static final IntSetting RADIUS =
+                    clampedInt("caustica.rt.lod.radius", "lod.radius", 8, 1, 64);
+            /**
+             * Vertical span in LOD sections, centred on sea level. Distant terrain rarely needs the
+             * full world height, and every extra layer is a full ring of sections.
+             */
+            public static final IntSetting HEIGHT_SECTIONS =
+                    clampedInt("caustica.rt.lod.heightSections", "lod.height-sections", 2, 1, 16);
+            /**
+             * LOD sections started per frame. This is the streaming throttle: each one is a DH database
+             * query plus a mesh plus a BLAS build, so a high value stutters while the world loads.
+             */
+            public static final IntSetting SECTIONS_PER_FRAME =
+                    clampedInt("caustica.rt.lod.sectionsPerFrame", "lod.sections-per-frame", 2, 1, 32);
+
+            private Lod() {
             }
         }
 
