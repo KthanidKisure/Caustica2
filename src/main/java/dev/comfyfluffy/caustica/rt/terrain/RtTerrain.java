@@ -179,6 +179,9 @@ public final class RtTerrain {
      * a real section or with another detail level.
      */
     private static final int LOD_KEY_Y_OFFSET = 512;
+    /** Regions DH had no geometry for. If this climbs while published stays 0, the database is the problem. */
+    private final java.util.concurrent.atomic.AtomicInteger lodEmptyRegions =
+            new java.util.concurrent.atomic.AtomicInteger();
     // Worker/build bookkeeping. `inFlight` maps a dispatched section key to a monotonic token; a completed
     // task whose token no longer matches is discarded. The active-task barrier spans worker + GPU lifetime.
     private final Long2LongOpenHashMap inFlight = new Long2LongOpenHashMap();
@@ -1456,10 +1459,31 @@ public final class RtTerrain {
         return sectionKey(lx, ly + LOD_KEY_Y_OFFSET * detail, lz);
     }
 
+    /** One-shot diagnostics so a silent LOD failure is distinguishable from a working one. */
+    private boolean lodLoggedState;
+    private int lodLoggedPublished = -1;
+
     private void streamLod(RtContext ctx, ClientLevel level, int pbx, int pby, int pbz) {
-        if (!CausticaConfig.Rt.Lod.ENABLED.value() || !RtDhLodSource.available()) {
+        boolean enabled = CausticaConfig.Rt.Lod.ENABLED.value();
+        if (!enabled || !RtDhLodSource.available()) {
+            if (enabled && !lodLoggedState) {
+                // The single most useful line: says plainly whether DH's API resolved at all, which
+                // separates "Caustica is not asking" from "DH has no data".
+                lodLoggedState = true;
+                CausticaMod.LOGGER.info("LOD enabled but the Distant Horizons API is unavailable; no distant terrain");
+            }
             releaseLod(ctx);
             return;
+        }
+        int empties = lodEmptyRegions.get();
+        if (empties >= 64 && empties % 64 == 0 && lodResident.isEmpty()) {
+            CausticaMod.LOGGER.info("LOD: {} regions queried, all empty — DH has no data at detail {} here",
+                    empties, CausticaConfig.Rt.Lod.DETAIL.value());
+        }
+        if (!lodLoggedState) {
+            lodLoggedState = true;
+            CausticaMod.LOGGER.info("LOD active: detail={}, radius={}, DH source available",
+                    CausticaConfig.Rt.Lod.DETAIL.value(), CausticaConfig.Rt.Lod.RADIUS.value());
         }
         publishLodPrepared(ctx, pbx, pby, pbz);
 
@@ -1519,6 +1543,10 @@ public final class RtTerrain {
                     region.fill(RtDhLodSource.fetchRegion((byte) detail,
                             Math.floorDiv(originX, scale), Math.floorDiv(originZ, scale)));
                     if (region.isEmpty()) {
+                        // Empty means DH returned no solid blocks here — either the region is not in
+                        // its database, or the detail level has not been generated. Counted rather
+                        // than logged per section, which would be thousands of lines.
+                        lodEmptyRegions.incrementAndGet();
                         finishLodTask(key, null);
                         return;
                     }
@@ -1627,6 +1655,13 @@ public final class RtTerrain {
             table.write(g);
             table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
             lodResident.put(ps.key(), g);
+        }
+        // Logged at a few thresholds rather than per section: enough to tell "nothing is publishing"
+        // from "sections are arriving", without a line per frame while the ring fills.
+        int count = lodResident.size();
+        if (count != lodLoggedPublished && (count == 1 || count == 8 || count == 32 || count == 128)) {
+            lodLoggedPublished = count;
+            CausticaMod.LOGGER.info("LOD sections published: {}", count);
         }
         table.flushWrites();
         table.instances = table.instanceList;
