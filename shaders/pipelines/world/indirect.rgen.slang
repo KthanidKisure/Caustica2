@@ -245,8 +245,12 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             if (ndl > 0.0) {
                 float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
                 float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
-                vis *= cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
-                                                cloudShadowStrength, cloudShadowFloor);
+                // Particles get their own evaluation: this branch returns before the terrain shading
+                // vertex below, so there is no shared value to hoist here. Same bounce cap.
+                if (bounce <= 1) {
+                    vis *= cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
+                                                    cloudShadowStrength, cloudShadowFloor);
+                }
                 if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                     L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
                 }
@@ -328,15 +332,25 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         if (lightHalfAngle > 0.0) {
             lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
         }
+        // Cloud shadow, computed ONCE per shading vertex. It was previously evaluated at each of the
+        // three NEE sites below, all of which use the same shading point and the same light direction —
+        // so two thirds of the work was recomputing an identical number. Each evaluation is an 8-step
+        // march of a 2-octave field, so this is the single cheapest large saving available here.
+        //
+        // Also capped by bounce: the deck's shadow on a second-order bounce is a small correction to an
+        // already-dim contribution, and skipping it there costs nothing visible while removing the
+        // march from the majority of rays in a deep path.
+        float cloudShadow = bounce <= 1
+                ? cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
+                                           cloudShadowStrength, cloudShadowFloor)
+                : 1.0;
         float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
             VisibilityResult shadow = visibility(p, lightDir, 10000.0);
             // The deck attenuates the light before it ever reaches the geometry, so it multiplies the
             // shadow ray's visibility rather than the illuminance: same term, and it stays correct when
             // the caustic factor below scales the whole NEE contribution.
-            float3 vis = shadow.transmittance
-                    * cloudShadowTransmittance(shadowClouds, p, lightDir,
-                                               cloudShadowStrength, cloudShadowFloor);
+            float3 vis = shadow.transmittance * cloudShadow;
             // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
             // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
             // so it applies to the whole NEE term (diffuse + specular).
@@ -441,8 +455,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                     visB *= waterCaustic(hitPos + lightDir * shadowBack.waterHitT,
                                          lightDir, shadowBack.waterHitT);
                 }
-                visB *= cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
-                                                 cloudShadowStrength, cloudShadowFloor);
+                visB *= cloudShadow;
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
                     L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * celestialLight.illuminance * visB;

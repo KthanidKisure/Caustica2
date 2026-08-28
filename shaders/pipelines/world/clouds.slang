@@ -32,6 +32,10 @@ import world_common;
 import sky;
 import bindings;
 
+// Base step counts, scaled at runtime by the quality setting. 64/6 is the reference quality; halving
+// the view steps is close to free visually on a moving camera because the deck is smooth and the
+// denoiser sees it as low-frequency, while halving the light steps costs more than it saves — the
+// light march is what produces the shading gradient across a cloud.
 public static const int CLOUD_VIEW_STEPS  = 64;
 public static const int CLOUD_LIGHT_STEPS = 6;
 // Marching past this is wasted work: at the deck's grazing angles the transmittance cutoff below always
@@ -54,6 +58,7 @@ public struct CloudParams {
     public float detail;       // 0..1 erosion strength
     public float featureSize;  // blocks per noise period; smaller means more, tighter cloud masses
     public float ambient;      // fraction of zenith sky scattered in as multiple-scattering stand-in
+    public float quality;      // scales the march step counts; 1 is reference, 0.5 is half the samples
 };
 
 public CloudParams makeCloudParams(WorldPush push) {
@@ -66,6 +71,7 @@ public CloudParams makeCloudParams(WorldPush push) {
     c.detail = clamp(push.cloud1.z, 0.0, 1.0);
     c.ambient = max(push.cloud1.w, 0.0);
     c.featureSize = max(push.cloud2.w, 1.0);
+    c.quality = clamp(push.cloud3.x, 0.1, 1.0);
     return c;
 }
 
@@ -295,7 +301,8 @@ float cloudLightOpticalDepth(CloudParams c, float3 position, float3 lightDir) {
     float opticalDepth = 0.0;
     float step = max(c.thickness * 0.08, 1.0);
     float travelled = 0.0;
-    for (int i = 0; i < CLOUD_LIGHT_STEPS; ++i) {
+    int lightSteps = int(max(float(CLOUD_LIGHT_STEPS) * c.quality, 3.0));
+    for (int i = 0; i < lightSteps; ++i) {
         travelled += step;
         opticalDepth += cloudDensity(c, position + lightDir * travelled) * step;
         step *= 1.5;
@@ -390,10 +397,11 @@ public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, flo
     float3 ambient = skyViewLut.SampleLevel(zenithUv, 0.0).rgb * c.ambient;
 
     float phase = cloudPhase(dot(direction, lightDir));
-    float stepSize = (tFar - tNear) / float(CLOUD_VIEW_STEPS);
+    int viewSteps = int(max(float(CLOUD_VIEW_STEPS) * c.quality, 8.0));
+    float stepSize = (tFar - tNear) / float(viewSteps);
     float t = tNear + stepSize * 0.5;
 
-    for (int i = 0; i < CLOUD_VIEW_STEPS; ++i) {
+    for (int i = 0; i < viewSteps; ++i) {
         float3 position = origin + direction * t;
         float density = cloudDensity(c, position);
         if (density > 0.0) {

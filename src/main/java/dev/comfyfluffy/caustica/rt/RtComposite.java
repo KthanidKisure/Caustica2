@@ -1262,6 +1262,7 @@ public final class RtComposite {
             }
             Float4 dimCloud = new Float4(cloudR, cloudG, cloudB,
                     CausticaConfig.Rt.Clouds.VANILLA_TINT.value());
+            Float4 cloud3 = new Float4(CausticaConfig.Rt.Clouds.QUALITY.value(), 0f, 0f, 0f);
             // Vanilla's cloud height wins when enabled and actually reported — a dimension with no cloud
             // layer leaves the attribute absent, in which case the configured altitude is the only
             // sensible answer rather than dropping the deck to zero.
@@ -1396,6 +1397,7 @@ public final class RtComposite {
                     dimSky,
                     dimFog,
                     dimCloud,
+                    cloud3,
                     restir
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
