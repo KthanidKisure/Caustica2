@@ -105,7 +105,14 @@ public float3 fogTint(FogParams f, float3 inscatter, WorldPush push) {
     // Tint by hue, not by replacement: preserve the scattering's own luminance so a dark fog colour
     // cannot black out a bright sunlit haze, and a bright one cannot light up a night scene.
     float3 tint = bt709ToAcesCg(max(push.dimFog.rgb, float3(0.0)));
-    float tintLuma = max(dot(tint, ACESCG_LUMA), 1.0e-4);
+    float tintLuma = dot(tint, ACESCG_LUMA);
+    // A BLACK tint means "no colour information", not "no light". Clamping the divisor was not enough:
+    // dividing a black tint by a tiny epsilon still yields zero, so the multiply below wiped the fog
+    // out and every distant surface went to black. A server or dimension that reports no FOG_COLOR is
+    // exactly this case, and the correct response is to leave the atmosphere's own colour alone.
+    if (tintLuma <= 1.0e-3) {
+        return inscatter;
+    }
     float3 normalizedTint = tint / tintLuma;
     return lerp(inscatter, inscatter * normalizedTint, strength);
 }

@@ -352,7 +352,12 @@ float3 tintCloud(float3 scattering, float3 tint709, float strength) {
         return scattering;
     }
     float3 tint = bt709ToAcesCg(max(tint709, float3(0.0)));
-    float tintLuma = max(dot(tint, ACESCG_LUMA), 1.0e-4);
+    float tintLuma = dot(tint, ACESCG_LUMA);
+    // Same trap as the fog tint: a black CLOUD_COLOR is missing data, not an instruction to render
+    // black clouds. Leave the deck lit by the atmosphere when there is no usable tint.
+    if (tintLuma <= 1.0e-3) {
+        return scattering;
+    }
     return lerp(scattering, scattering * (tint / tintLuma), clamped);
 }
 
