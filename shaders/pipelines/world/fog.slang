@@ -118,9 +118,23 @@ public float3 fogTint(FogParams f, float3 inscatter, WorldPush push) {
 }
 
 public float3 fogInscatter(FogParams f, float3 rd, SkyState state) {
-    float2 sunUv = skyViewLutUv(state.viewerRadiusKm, rd.y,
+    // THE SKY-VIEW LUT HAS NO DATA BELOW THE HORIZON, and this is where that bites.
+    //
+    // sky.rmiss only ever samples it for rays that escaped to space, which are above the horizon by
+    // construction. Fog is different: most fogged rays point slightly DOWN, at distant terrain. Sampling
+    // the LUT there returns black, so every long ray toward the ground accumulated black in-scatter and
+    // the horizon went to pitch black — worse the denser the fog, because denser fog means more of that
+    // black and less of the surface behind it.
+    //
+    // Physically the fix is not a clamp for its own sake: light scattered into a downward ray comes from
+    // the sky above the scattering point, and near the horizon that is the horizon sky. So the lookup
+    // direction is folded up to just above the horizon while the LIGHT-relative angle keeps the true
+    // direction, which is what preserves the orange-toward-the-sun behaviour.
+    float horizonCos = horizonZenithCos(state.viewerRadiusKm);
+    float lookupZenithCos = max(rd.y, horizonCos + 1.0e-3);
+    float2 sunUv = skyViewLutUv(state.viewerRadiusKm, lookupZenithCos,
             lightViewCosine(rd, state.sunDir), SKY_VIEW_BODY_SUN);
-    float2 moonUv = skyViewLutUv(state.viewerRadiusKm, rd.y,
+    float2 moonUv = skyViewLutUv(state.viewerRadiusKm, lookupZenithCos,
             lightViewCosine(rd, state.moonDir), SKY_VIEW_BODY_MOON);
     float3 sky709 = skyViewLut.SampleLevel(sunUv, 0.0).rgb
             + skyViewLut.SampleLevel(moonUv, 0.0).rgb
