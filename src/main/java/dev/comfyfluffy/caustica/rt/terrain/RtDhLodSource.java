@@ -162,19 +162,37 @@ public final class RtDhLodSource {
     }
 
     /**
-     * Fetches one DH region at {@code detailLevel} and flattens it into boxes.
+     * Fetches one square area of terrain and flattens it into boxes.
      *
-     * <p>{@code detailLevel} is DH's own exponent: 0 is one data point per block, 1 is one per 2x2
-     * column, and so on. The horizontal footprint of each returned box is {@code 1 << detailLevel}
-     * blocks square, which is why {@link LodBox#sizeXZ} is carried rather than assumed — a caller
-     * meshing these must scale the quad, not emit a unit cube.
+     * <p><b>DH's detailLevel is the size of the QUERIED AREA, not the resolution of the data.</b> This
+     * is the single most misreadable thing in the API and getting it wrong produces silence rather
+     * than an error. From DH's own javadoc: 0 = block, 2 = 4x4 blocks, 4 = chunk, 9 = region. So
+     * {@code detailLevel} 4 asks for one chunk's worth of columns at position (posX, posZ) measured in
+     * chunks — it does NOT ask for chunk-resolution data.
      *
-     * <p><b>Call this off the render thread.</b> DH may hit disk. It is a database query, not a
-     * memory read.
+     * <p>Because of that, the caller passes the FOOTPRINT it wants covered and this derives everything
+     * else. The returned grid's own dimensions then tell us the resolution DH actually had, which is
+     * read from the array rather than assumed: DH may return a coarser grid than the footprint implies
+     * if that is all its database holds, and silently treating a 4x4 grid as 16x16 would scatter
+     * terrain across the section with holes between.
      *
-     * @return the boxes, or an empty list if DH is unavailable or has nothing at this position.
+     * <p><b>Call this off the render thread.</b> DH may hit disk. It is a database query, not a memory
+     * read.
+     *
+     * @param footprintBlocks width of the square area to cover, in blocks; must be a power of two
+     * @param originBlockX    world X of the area's corner, a multiple of footprintBlocks
+     * @param originBlockZ    world Z of the area's corner
+     * @return the boxes, or an empty list if DH is unavailable or has nothing here
      */
-    public static List<LodBox> fetchRegion(byte detailLevel, int posX, int posZ) {
+    public static List<LodBox> fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
+        byte detailLevel = (byte) Integer.numberOfTrailingZeros(Math.max(footprintBlocks, 1));
+        int posX = Math.floorDiv(originBlockX, Math.max(footprintBlocks, 1));
+        int posZ = Math.floorDiv(originBlockZ, Math.max(footprintBlocks, 1));
+        return fetchRegion(detailLevel, posX, posZ, footprintBlocks, originBlockX, originBlockZ);
+    }
+
+    private static List<LodBox> fetchRegion(byte detailLevel, int posX, int posZ,
+                                            int footprintBlocks, int originBlockX, int originBlockZ) {
         synchronized (RtDhLodSource.class) {
             resolve();
             if (state != State.READY) {
@@ -199,7 +217,7 @@ public final class RtDhLodSource {
             if (grid == null) {
                 return List.of();
             }
-            return flatten(grid, detailLevel, posX, posZ);
+            return flatten(grid, footprintBlocks, originBlockX, originBlockZ);
         } catch (ReflectiveOperationException | RuntimeException e) {
             LOGGER.debug("DH region fetch failed at detail {} ({}, {}): {}",
                     detailLevel, posX, posZ, e.toString());
@@ -212,16 +230,16 @@ public final class RtDhLodSource {
      * type lives in DH's classloader-visible API and casting it here would reintroduce the hard
      * dependency this class exists to avoid.
      */
-    private static List<LodBox> flatten(Object grid, byte detailLevel, int posX, int posZ)
+    private static List<LodBox> flatten(Object grid, int footprintBlocks, int originX, int originZ)
             throws ReflectiveOperationException {
-        int sizeXZ = 1 << detailLevel;
-        // DH positions are in detail-level units; the world origin of this region is the position
-        // scaled by the level's block footprint.
-        int originX = posX * sizeXZ;
-        int originZ = posZ * sizeXZ;
-
         List<LodBox> boxes = new ArrayList<>();
         int lenX = Array.getLength(grid);
+        if (lenX <= 0) {
+            return boxes;
+        }
+        // Resolution derived from what DH actually returned, not from what was asked for. A 128-block
+        // footprint answered with a 16x16 grid means each cell stands for 8 blocks.
+        int sizeXZ = Math.max(footprintBlocks / lenX, 1);
         for (int ix = 0; ix < lenX; ix++) {
             Object column = Array.get(grid, ix);
             if (column == null) {
