@@ -801,6 +801,14 @@ public final class CausticaConfig {
              */
             public static final FloatSetting WETNESS =
                     clampedFloat("caustica.rt.clouds.wetness", "clouds.wetness", 1.0f, 0.0f, 1.0f);
+            /**
+             * Scales the cloud march's step counts. 1.0 is reference quality; 0.5 halves the samples
+             * and is close to invisible on a moving camera, because the deck is smooth and Ray
+             * Reconstruction treats it as low-frequency detail. This is the main FPS dial for clouds —
+             * reach for it before dropping coverage, which changes how the sky looks.
+             */
+            public static final FloatSetting QUALITY =
+                    clampedFloat("caustica.rt.clouds.quality", "clouds.quality", 1.0f, 0.1f, 1.0f);
             /** Stand-in for in-cloud multiple scattering, as a fraction of zenith sky radiance. */
             public static final FloatSetting AMBIENT =
                     clampedFloat("caustica.rt.clouds.ambient", "clouds.ambient", 0.35f, 0.0f, 4.0f);
