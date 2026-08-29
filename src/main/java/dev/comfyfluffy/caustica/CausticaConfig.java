@@ -719,6 +719,13 @@ public final class CausticaConfig {
              */
             public static final FloatSetting BIOME_RESPONSE =
                     clampedFloat("caustica.rt.fog.biomeResponse", "fog.biome-response", 0.6f, 0.0f, 1.0f);
+            /**
+             * Diagnostic. 1 replaces the whole image with the fog's in-scatter colour, so you can see
+             * directly whether that colour is black. Black screen means the sky lookup is failing;
+             * a coloured screen means the lookup is fine and the composition is at fault. 0 = off.
+             */
+            public static final IntSetting DEBUG =
+                    clampedInt("caustica.rt.fog.debug", "fog.debug", 0, 0, 1);
             /** Single-scattering albedo. 1 scatters everything; lower values also absorb, darkening distance. */
             public static final FloatSetting ALBEDO =
                     clampedFloat("caustica.rt.fog.albedo", "fog.albedo", 0.92f, 0.0f, 1.0f);

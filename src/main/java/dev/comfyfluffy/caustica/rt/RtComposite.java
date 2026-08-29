@@ -72,6 +72,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtSdrPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtExposure;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtToneLut;
+import dev.comfyfluffy.caustica.rt.terrain.RtCloudNoise;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 
 import java.nio.ByteBuffer;
@@ -252,6 +253,12 @@ public final class RtComposite {
      * roles of history and destination each frame via a push constant rather than by rewriting
      * descriptors — see {@link RtPipeline#setReservoirImages}. Double-width: two texels per pixel.
      */
+    /**
+     * Precomputed cloud shape field. Created once and never rewritten — the wind offset moves the
+     * sampling domain rather than the data, so nothing here changes after upload.
+     */
+    private RtImage cloudNoise;
+    private long cloudNoiseSampler;
     private RtImage reservoirA;
     private RtImage reservoirB;
     /** Flips each frame; 0 means A is history. */
@@ -1010,6 +1017,9 @@ public final class RtComposite {
                 "ReSTIR reservoir B " + renderW + "x" + renderH);
         reservoirHistoryValid = false;
         reservoirParity = 0;
+        // Created alongside the other RT resources because this is where ctx is in scope; the method
+        // itself is idempotent, so a resize re-binds the existing texture rather than regenerating it.
+        ensureCloudNoise(ctx);
         // Zero both images at creation. The history-valid flag guards the frame AFTER a reallocation,
         // but it is a whole-frame switch and reservoir writes are per-pixel: a pixel the raygen never
         // reaches — sky, or any pixel whose primary ray found no emitter-lit surface — is never written,
@@ -1263,6 +1273,7 @@ public final class RtComposite {
             Float4 dimCloud = new Float4(cloudR, cloudG, cloudB,
                     CausticaConfig.Rt.Clouds.VANILLA_TINT.value());
             Float4 cloud3 = new Float4(CausticaConfig.Rt.Clouds.QUALITY.value(), 0f, 0f, 0f);
+            Float4 fog2 = new Float4(CausticaConfig.Rt.Fog.DEBUG.value(), 0f, 0f, 0f);
             // Vanilla's cloud height wins when enabled and actually reported — a dimension with no cloud
             // layer leaves the attribute absent, in which case the configured altitude is the only
             // sensible answer rather than dropping the deck to zero.
@@ -1398,6 +1409,7 @@ public final class RtComposite {
                     dimFog,
                     dimCloud,
                     cloud3,
+                    fog2,
                     restir
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
@@ -1833,6 +1845,41 @@ public final class RtComposite {
             }
             atlasSampler = 0L;
         }
+    }
+
+    /**
+     * Creates and binds the cloud shape texture, once. LINEAR filtering with REPEAT addressing in all
+     * three axes: the field is generated to tile, so the hardware's wrap does the domain folding and
+     * the shader needs no fract() on its coordinate.
+     */
+    private void ensureCloudNoise(RtContext ctx) {
+        if (cloudNoise != null) {
+            worldPipeline.setCloudNoise(cloudNoise.view, cloudNoiseSampler);
+            return;
+        }
+        java.nio.ByteBuffer data = RtCloudNoise.generate();
+        try {
+            cloudNoise = ctx.createSampled3dImage(RtCloudNoise.SIZE, RtCloudNoise.SIZE, RtCloudNoise.SIZE,
+                    VK10.VK_FORMAT_R8G8_UNORM, RtCloudNoise.BYTES_PER_TEXEL, data, "cloud noise 128^3");
+        } finally {
+            org.lwjgl.system.MemoryUtil.memFree(data);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                    .magFilter(VK10.VK_FILTER_LINEAR).minFilter(VK10.VK_FILTER_LINEAR)
+                    .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                    .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .minLod(0f).maxLod(0f);
+            LongBuffer p = stack.mallocLong(1);
+            if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {
+                throw new IllegalStateException("vkCreateSampler(cloud noise) failed");
+            }
+            cloudNoiseSampler = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SAMPLER, cloudNoiseSampler, "cloud noise sampler");
+        }
+        worldPipeline.setCloudNoise(cloudNoise.view, cloudNoiseSampler);
     }
 
     private long atlasSampler(RtContext ctx) {
