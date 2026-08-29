@@ -145,9 +145,26 @@ public float3 fogInscatter(FogParams f, float3 rd, SkyState state) {
 // Fold one travelled segment into the path. Call once per segment, BEFORE the segment's endpoint
 // contributes anything to L, so that the in-scatter enters at this segment's throughput and everything
 // beyond it is attenuated by this segment's transmittance.
+// Debug: replace the path's radiance with the raw fog in-scatter colour, so the value can be SEEN
+// rather than inferred. Three fog fixes have now been attempted from reasoning alone and all three
+// were wrong about the cause; this is the cheapest way to find out whether the in-scatter is black
+// (a lookup problem) or bright (a composition problem), which need opposite fixes.
+public bool fogDebugInscatter(FogParams f, WorldPush push, float3 rd, SkyState state,
+                              inout float3 L, inout float3 throughput) {
+    if (push.fog2.x < 0.5) {
+        return false;
+    }
+    L = fogTint(f, fogInscatter(f, rd, state), push);
+    throughput = float3(0.0);
+    return true;
+}
+
 public void applyFogSegment(FogParams f, SkyState state, Medium medium, WorldPush push,
                             float3 ro, float3 rd, float t,
                             inout float3 L, inout float3 throughput) {
+    if (fogDebugInscatter(f, push, rd, state, L, throughput)) {
+        return;
+    }
     if (!fogActive(f) || !fogAppliesTo(medium)) {
         return;
     }

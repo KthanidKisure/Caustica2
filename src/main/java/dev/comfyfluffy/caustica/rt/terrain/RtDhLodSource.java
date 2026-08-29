@@ -70,6 +70,12 @@ public final class RtDhLodSource {
     private static Field pointSkyLight;
     private static Field pointBlockState;
     private static Method wrapperGetMcObject;
+    private static final java.util.concurrent.atomic.AtomicBoolean loggedQueryFailure =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.concurrent.atomic.AtomicBoolean loggedQuerySuccess =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.concurrent.atomic.AtomicBoolean loggedNoLevel =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     private RtDhLodSource() {
     }
@@ -202,16 +208,30 @@ public final class RtDhLodSource {
         try {
             Object levelWrapper = levelWrapper();
             if (levelWrapper == null) {
-                return List.of(); // between worlds, or nothing loaded yet
+                // The most likely single cause of "DH returns nothing": DH has no level loaded at all,
+                // which is not the same as a level with no terrain in it.
+                if (loggedNoLevel.compareAndSet(false, true)) {
+                    LOGGER.info("DH has no loaded level — it may be disabled for this world, or its "
+                            + "level lifecycle may require its renderer to be enabled");
+                }
+                return List.of();
             }
             Object result = getAllTerrainDataAtDetailLevelAndPos.invoke(
                     terrainRepo, levelWrapper, detailLevel, posX, posZ, null);
             if (result == null || !resultSuccess.getBoolean(result)) {
-                // A failed query is routine — the region may simply not be generated yet — so this is
-                // debug, not a warning, and the message is DH's own explanation.
-                LOGGER.debug("DH region {} {} unavailable at detail {}: {}", posX, posZ, detailLevel,
-                        result == null ? "null result" : resultMessage.get(result));
+                // DH's own explanation, surfaced ONCE at info. It was debug-only, which meant that when
+                // every query failed the log showed a count of zeroes and no reason — the one piece of
+                // information that would have identified the cause was being swallowed. Once, because
+                // a failing setup fails on every query and would otherwise flood the log.
+                if (loggedQueryFailure.compareAndSet(false, true)) {
+                    LOGGER.info("DH query failed at detail {} pos {},{}: {}", detailLevel, posX, posZ,
+                            result == null ? "null result" : resultMessage.get(result));
+                }
                 return List.of();
+            }
+            // A successful but empty answer is a different diagnosis from a failed one, so say so.
+            if (loggedQuerySuccess.compareAndSet(false, true)) {
+                LOGGER.info("DH query succeeded at detail {} pos {},{}", detailLevel, posX, posZ);
             }
             Object grid = resultPayload.get(result);
             if (grid == null) {
