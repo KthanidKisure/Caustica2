@@ -83,43 +83,8 @@ public bool cloudsActive(CloudParams c) {
 // Value noise on a hashed integer lattice. Chosen over gradient noise because clouds want the blobby,
 // isotropic character value noise already has, and it is roughly half the ALU.
 
-float cloudHash(float3 cell) {
-    float3 p = frac(cell * float3(0.1031, 0.1030, 0.0973));
-    p += dot(p, p.yxz + 33.33);
-    return frac((p.x + p.y) * p.z);
-}
-
-float cloudValueNoise(float3 p) {
-    float3 i = floor(p);
-    float3 f = frac(p);
-    // Quintic smoothstep: C2 continuous, so fBm sums do not show lattice creases where octaves align.
-    float3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    float n000 = cloudHash(i + float3(0.0, 0.0, 0.0));
-    float n100 = cloudHash(i + float3(1.0, 0.0, 0.0));
-    float n010 = cloudHash(i + float3(0.0, 1.0, 0.0));
-    float n110 = cloudHash(i + float3(1.0, 1.0, 0.0));
-    float n001 = cloudHash(i + float3(0.0, 0.0, 1.0));
-    float n101 = cloudHash(i + float3(1.0, 0.0, 1.0));
-    float n011 = cloudHash(i + float3(0.0, 1.0, 1.0));
-    float n111 = cloudHash(i + float3(1.0, 1.0, 1.0));
-    return lerp(lerp(lerp(n000, n100, u.x), lerp(n010, n110, u.x), u.y),
-                lerp(lerp(n001, n101, u.x), lerp(n011, n111, u.x), u.y), u.z);
-}
-
-// Lacunarity 2.02 rather than 2.0: an exact doubling makes octaves share lattice planes and produces
-// faint axis-aligned grid structure in the result.
-float cloudFbm(float3 p, int octaves) {
-    float sum = 0.0;
-    float amplitude = 0.5;
-    float normalization = 0.0;
-    for (int i = 0; i < octaves; ++i) {
-        sum += amplitude * cloudValueNoise(p);
-        normalization += amplitude;
-        p *= 2.02;
-        amplitude *= 0.5;
-    }
-    return sum / max(normalization, 1.0e-6);
-}
+// Value-noise helpers removed: the base and detail fields are now baked into cloudNoiseTex
+// (RtCloudNoise), so nothing evaluates them at runtime any more.
 
 // ---- Density -----------------------------------------------------------------------------------------
 
@@ -154,7 +119,10 @@ public float cloudDensity(CloudParams c, float3 position) {
     float3 baseCoord = float3(domain.x * baseFrequency,
                               domain.y * baseFrequency * 2.9,
                               domain.z * baseFrequency);
-    float shape = cloudFbm(baseCoord, 4);
+    // One filtered fetch instead of four octaves of hashed value noise. The texture tiles, so the
+    // repeat address mode does the domain wrapping for free and the coordinate needs no fract().
+    float4 noise = cloudNoiseTex.SampleLevel(baseCoord, 0.0);
+    float shape = noise.x;
 
     // Coverage as a threshold remap, not a multiply. Multiplying would raise a flat haze everywhere as
     // coverage rises; subtracting a threshold and renormalizing grows the clouds that exist outward from
@@ -170,12 +138,13 @@ public float cloudDensity(CloudParams c, float3 position) {
     // as the edge would punch holes through the middle of every cloud.
     if (c.detail > 0.0) {
         // Detail rides at 10x the base frequency so it scales with feature size rather than staying
-        // fixed while the base changes underneath it.
+        // fixed while the base changes underneath it. Second fetch rather than reusing the first
+        // texel's G: the two fields are sampled at different frequencies, which is the point.
         float detailFrequency = baseFrequency * 10.0;
         float3 detailCoord = float3(domain.x * detailFrequency,
                                     domain.y * detailFrequency * 1.7,
                                     domain.z * detailFrequency);
-        float erosion = 1.0 - cloudFbm(detailCoord, 3);
+        float erosion = 1.0 - cloudNoiseTex.SampleLevel(detailCoord, 0.0).y;
         float strength = c.detail * (1.0 - shaped);
         shaped = saturate(shaped - erosion * erosion * strength);
     }
@@ -208,7 +177,10 @@ float cloudDensityCoarse(CloudParams c, float3 position) {
         return 0.0;
     }
     float3 domain = float3(position.x + c.wind.x, position.y, position.z + c.wind.y);
-    float shape = cloudFbm(float3(domain.x * 0.0012, domain.y * 0.0035, domain.z * 0.0012), 2);
+    float baseFrequency = 1.0 / max(c.featureSize, 1.0);
+    float shape = cloudNoiseTex.SampleLevel(float3(domain.x * baseFrequency,
+                                                  domain.y * baseFrequency * 2.9,
+                                                  domain.z * baseFrequency), 0.0).x;
     float threshold = 1.0 - c.coverage;
     return saturate((shape - threshold) / max(1.0 - threshold, 1.0e-3))
             * cloudHeightProfile(relativeHeight) * c.density;
