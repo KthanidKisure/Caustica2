@@ -59,8 +59,16 @@ public final class RtDhLodSource {
     private static Object terrainRepo;
     private static Object worldProxy;
     private static Method getAllTerrainDataAtDetailLevelAndPos;
+    private static Method createSoftCache;
     private static Method getSinglePlayerLevel;
     private static Method getAllLoadedLevelWrappers;
+    /**
+     * A soft cache DH's own API creates and owns. Passing null for this parameter is not "no cache" —
+     * DH treats it as a hard failure and every query returns unsuccessful with the message "Missing
+     * [IDhApiTerrainDataCache]". That single null was the actual cause of every LOD query failing;
+     * the footprint-vs-area fix and the diagnostics were correct but never got to matter.
+     */
+    private static Object softCache;
     private static Field resultPayload;
     private static Field resultSuccess;
     private static Field resultMessage;
@@ -126,6 +134,7 @@ public final class RtDhLodSource {
             getAllTerrainDataAtDetailLevelAndPos = repoInterface.getMethod(
                     "getAllTerrainDataAtDetailLevelAndPos",
                     levelWrapper, byte.class, int.class, int.class, cacheInterface);
+            createSoftCache = repoInterface.getMethod("createSoftCache");
 
             // Two accessors, because they cover different worlds. getSinglePlayerLevel throws on a
             // multiplayer server, which would have ruled out exactly the case that matters here:
@@ -154,6 +163,7 @@ public final class RtDhLodSource {
                     "com.seibel.distanthorizons.api.interfaces.IDhApiUnsafeWrapper");
             wrapperGetMcObject = unsafeWrapper.getMethod("getWrappedMcObject");
 
+            softCache = createSoftCache.invoke(terrainRepo);
             state = State.READY;
             LOGGER.info("Distant Horizons LOD source resolved ({})", dhApi.getName());
         } catch (ReflectiveOperationException | RuntimeException e) {
@@ -217,7 +227,7 @@ public final class RtDhLodSource {
                 return List.of();
             }
             Object result = getAllTerrainDataAtDetailLevelAndPos.invoke(
-                    terrainRepo, levelWrapper, detailLevel, posX, posZ, null);
+                    terrainRepo, levelWrapper, detailLevel, posX, posZ, softCache);
             if (result == null || !resultSuccess.getBoolean(result)) {
                 // DH's own explanation, surfaced ONCE at info. It was debug-only, which meant that when
                 // every query failed the log showed a count of zeroes and no reason — the one piece of
@@ -349,6 +359,17 @@ public final class RtDhLodSource {
             state = State.UNRESOLVED;
             terrainRepo = null;
             worldProxy = null;
+            // The cache holds soft references into DH's data sources for a world that is going away;
+            // clear() is the documented way to release them rather than just dropping the reference.
+            if (softCache instanceof AutoCloseable closeable) {
+                try {
+                    closeable.close();
+                } catch (Exception ignored) {
+                    // AutoCloseable#close is declared checked; DH's own override is not, so this is
+                    // unreachable in practice and kept only to satisfy the compiler.
+                }
+            }
+            softCache = null;
         }
     }
 }
