@@ -64,6 +64,16 @@ public final class RtDhLodSource {
     }
 
     /**
+ * Result of one DH terrain request. Successful queries may legitimately contain zero boxes;
+ * failed/lifecycle queries are retryable and must never be cached as empty terrain.
+ */
+public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
+    public FetchResult {
+        boxes = List.copyOf(boxes);
+    }
+}
+
+    /**
      * True only when the reflected API is present AND DH says its world is actually loaded.
      *
      * <p>This worldLoaded gate is important on multiplayer. Caustica can finish its expensive RT/material
@@ -168,19 +178,19 @@ public final class RtDhLodSource {
      * Fetches one square footprint and flattens DH's run-length terrain columns into boxes.
      * DH's API detailLevel is the size of the queried AREA: 0=1 block, 4=16 blocks, 6=64 blocks, etc.
      */
-    public static List<LodBox> fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
+    public static FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
         byte detailLevel = (byte) Integer.numberOfTrailingZeros(Math.max(footprintBlocks, 1));
         int posX = Math.floorDiv(originBlockX, Math.max(footprintBlocks, 1));
         int posZ = Math.floorDiv(originBlockZ, Math.max(footprintBlocks, 1));
         return fetchRegion(detailLevel, posX, posZ, footprintBlocks, originBlockX, originBlockZ);
     }
 
-    private static List<LodBox> fetchRegion(byte detailLevel, int posX, int posZ,
+    private static FetchResult fetchRegion(byte detailLevel, int posX, int posZ,
                                             int footprintBlocks, int originBlockX, int originBlockZ) {
         synchronized (RtDhLodSource.class) {
             resolve();
             if (state != State.READY || !worldReady()) {
-                return List.of();
+                return new FetchResult(List.of(), false);
             }
         }
 
@@ -190,7 +200,7 @@ public final class RtDhLodSource {
                 if (loggedNoLevel.compareAndSet(false, true)) {
                     LOGGER.info("DH reports a loaded world but exposes no loaded level wrapper yet; delaying LOD queries");
                 }
-                return List.of();
+                return new FetchResult(List.of(), false);
             }
             loggedNoLevel.set(false);
             if (wrappers.size() > 1 && loggedMultipleLevels.compareAndSet(false, true)) {
@@ -223,7 +233,7 @@ public final class RtDhLodSource {
                                 detailLevel, posX, posZ, boxes.size());
                     }
                     loggedQueryFailure.set(false);
-                    return boxes;
+                    return new FetchResult(boxes, true);
                 }
                 successfulEmpty = boxes;
             }
@@ -234,7 +244,7 @@ public final class RtDhLodSource {
                             detailLevel, posX, posZ);
                 }
                 loggedQueryFailure.set(false);
-                return successfulEmpty;
+                return new FetchResult(successfulEmpty, true);
             }
 
             if (loggedQueryFailure.compareAndSet(false, true)) {
@@ -242,11 +252,11 @@ public final class RtDhLodSource {
                         detailLevel, posX, posZ, wrappers.size(),
                         firstFailureMessage == null ? "no successful result" : firstFailureMessage);
             }
-            return List.of();
+            return new FetchResult(List.of(), false);
         } catch (ReflectiveOperationException | RuntimeException e) {
             LOGGER.debug("DH region fetch failed at detail {} ({}, {}): {}",
                     detailLevel, posX, posZ, e.toString());
-            return List.of();
+            return new FetchResult(List.of(), false);
         }
     }
 

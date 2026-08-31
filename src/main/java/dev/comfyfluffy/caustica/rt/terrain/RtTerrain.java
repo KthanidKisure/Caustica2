@@ -173,9 +173,13 @@ public final class RtTerrain {
             java.util.Collections.synchronizedList(new ArrayList<>());
     /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
     private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
+    /** Failed DH API/lifecycle queries: retry soon; never poison the long empty-region cache. */
+    private final List<Long> lodRetrySoon = java.util.Collections.synchronizedList(new ArrayList<>());
     /** Render-frame deadline before an empty/failed DH region may be queried again. Render-thread only. */
     private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
     private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
+    private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;
+    private long lodSourceRetryAfterNanos;
     /**
      * Keeps LOD keys clear of real section keys. The key packs scy into 12 signed bits, and legal
      * Minecraft section Y is roughly -4..20, so offsetting by 512 per detail level cannot collide with
@@ -1494,6 +1498,9 @@ public final class RtTerrain {
                     CausticaConfig.Rt.Lod.DETAIL.value(), CausticaConfig.Rt.Lod.RADIUS.value());
         }
         publishLodPrepared(ctx, pbx, pby, pbz);
+        if (System.nanoTime() < lodSourceRetryAfterNanos) {
+            return;
+        }
 
         int detail = CausticaConfig.Rt.Lod.DETAIL.value();
         int scale = 1 << detail;
@@ -1557,8 +1564,12 @@ public final class RtTerrain {
                     // asking for "detail 3" got an 8x8-block area per 128-block section, which is why
                     // sections came back empty.
                     RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
-                    java.util.List<RtDhLodSource.LodBox> boxes =
-                            RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
+                    RtDhLodSource.FetchResult fetched = RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
+        if (!fetched.querySucceeded()) {
+            finishLodRetrySoon(key);
+            return;
+        }
+        java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();
                     region.fill(boxes);
                     lodBoxesSeen.addAndGet(boxes.size());
                     if (region.isEmpty()) {
@@ -1634,8 +1645,29 @@ public final class RtTerrain {
         finishActiveTask();
     }
 
+    private void finishLodRetrySoon(long key) {
+    lodRetrySoon.add(key);
+    finishActiveTask();
+}
+
     /** Publishes finished LOD sections into the shared section table. */
     private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
+    // A rejected DH call is a source lifecycle problem, not an empty terrain result.
+    if (!lodRetrySoon.isEmpty()) {
+        List<Long> retrySoon;
+        synchronized (lodRetrySoon) {
+            retrySoon = new ArrayList<>(lodRetrySoon);
+            lodRetrySoon.clear();
+        }
+        for (Long key : retrySoon) {
+            lodInFlight.remove(key.longValue());
+        }
+        lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
+        CausticaMod.LOGGER.info(
+                "LOD: DH source not query-ready; retrying in 1 second ({} regions deferred)",
+                retrySoon.size());
+    }
+
         // Retire failed keys first so they become eligible for redispatch. Done here, on the render
         // thread, because lodInFlight is not thread-safe.
         if (!lodFailed.isEmpty()) {
