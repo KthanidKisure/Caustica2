@@ -20,8 +20,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply focused RtComposite fix
-        shell: python
+        shell: bash
         run: |
+          python - <<'PY'
           from pathlib import Path
 
           path = Path("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
@@ -30,20 +31,20 @@ jobs:
           premature = '''        // Created alongside the other RT resources because this is where ctx is in scope; the method
           // itself is idempotent, so a resize re-binds the existing texture rather than regenerating it.
           ensureCloudNoise(ctx);
-'''
+          '''
           if source.count(premature) != 1:
               raise SystemExit(f"expected exactly one premature cloud-noise call, found {source.count(premature)}")
           source = source.replace(premature, "", 1)
 
           pipeline_create = '''                    WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);
           // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
-'''
+          '''
           pipeline_replacement = '''                    WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);
           // Cloud noise is a descriptor owned by the world pipeline. Create/bind it only after the pipeline
           // exists; recreating the pipeline simply rebinds the device-lifetime texture and sampler.
           ensureCloudNoise(ctx);
           // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
-'''
+          '''
           if source.count(pipeline_create) != 1:
               raise SystemExit(f"expected exactly one world-pipeline creation seam, found {source.count(pipeline_create)}")
           source = source.replace(pipeline_create, pipeline_replacement, 1)
@@ -53,7 +54,7 @@ jobs:
               worldPipeline = null;
           }
           bindlessTextureCapacity = 0;
-'''
+          '''
           destroy_replacement = '''        if (worldPipeline != null) {
               worldPipeline.destroy();
               worldPipeline = null;
@@ -70,7 +71,7 @@ jobs:
               cloudNoiseSampler = 0L;
           }
           bindlessTextureCapacity = 0;
-'''
+          '''
           if source.count(destroy_pipeline) != 1:
               raise SystemExit(f"expected exactly one world-pipeline teardown seam, found {source.count(destroy_pipeline)}")
           source = source.replace(destroy_pipeline, destroy_replacement, 1)
@@ -79,6 +80,7 @@ jobs:
               raise SystemExit("cloud noise must be initialized from exactly one world-pipeline-owned seam")
 
           path.write_text(source, encoding="utf-8")
+          PY
 
       - name: Commit source fix and remove one-shot workflow
         run: |
