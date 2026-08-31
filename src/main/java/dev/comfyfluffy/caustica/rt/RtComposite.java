@@ -1209,6 +1209,8 @@ public final class RtComposite {
             // would produce anyway.
             float biomeHaze = 1f;
             float wetness = 0f;
+            float biomeTemperature = 0.8f;
+            boolean biomeHasPrecipitation = true;
             if (level != null) {
                 rainLevel = Mth.clamp(level.getRainLevel(1.0f), 0f, 1f);
                 thunderLevel = Mth.clamp(level.getThunderLevel(1.0f), 0f, 1f);
@@ -1224,23 +1226,36 @@ public final class RtComposite {
                 }
                 var biome = level.getBiome(cameraBlockPos).value();
                 // getBaseTemperature is roughly 0 (snowy) to 2 (desert/nether) in vanilla data.
-                float temperature = Mth.clamp(biome.getBaseTemperature(), 0f, 2f);
-                float climate = (1f - temperature * 0.5f) * (biome.hasPrecipitation() ? 1f : 0.35f);
+                biomeTemperature = Mth.clamp(biome.getBaseTemperature(), 0f, 2f);
+                biomeHasPrecipitation = biome.hasPrecipitation();
+                float climate = (1f - biomeTemperature * 0.5f) * (biomeHasPrecipitation ? 1f : 0.35f);
                 float biomeResponse = CausticaConfig.Rt.Fog.BIOME_RESPONSE.value();
                 biomeHaze = Mth.lerp(biomeResponse, 1f, 0.4f + climate * 1.2f);
                 // Wetness needs actual liquid water falling. A biome with no precipitation (desert) gets
                 // nothing, and one cold enough for snow gets nothing either — snow accumulates, it does
                 // not soak in, and a glossy snowfield would be plainly wrong. The 0.15 cutoff is where
                 // vanilla's own precipitation type flips.
-                boolean rainsHere = biome.hasPrecipitation() && biome.getBaseTemperature() > 0.15f;
+                boolean rainsHere = biomeHasPrecipitation && biomeTemperature > 0.15f;
                 wetness = rainsHere ? rainLevel * CausticaConfig.Rt.Clouds.WETNESS.value() : 0f;
             }
-            // Rain multiplies fog density rather than adding to it, so a configured density of 0 stays
-            // 0 in a downpour. Weather driving a feature the user switched off would be a surprise.
+            float weatherIntensity = Math.min(rainLevel + thunderLevel * 0.5f, 1f);
+            // 0 = rain/ordinary atmosphere, 1 = snowstorm, 2 = dry hot-biome dust/sandstorm. The
+            // classification is camera-biome based so crossing into a snowy or desert biome changes
+            // precipitation without a per-pixel biome lookup in the path tracer.
+            int weatherType = 0;
+            if (weatherIntensity > 0.01f) {
+                if (biomeHasPrecipitation && biomeTemperature <= 0.15f) {
+                    weatherType = 1;
+                } else if (!biomeHasPrecipitation && biomeTemperature >= 1.2f) {
+                    weatherType = 2;
+                }
+            }
             float fogWeather = 1f + rainLevel * CausticaConfig.Rt.Fog.WEATHER_RESPONSE.value();
             float fogScaleHeight = Math.max(CausticaConfig.Rt.Fog.SCALE_HEIGHT.value(), 1.0e-2f);
+            float precipitationFog = weatherType == 1 ? weatherIntensity * 0.010f
+                    : weatherType == 2 ? weatherIntensity * 0.020f : 0f;
             Float4 fog = new Float4(
-                    CausticaConfig.Rt.Fog.DENSITY.value() * fogWeather * biomeHaze,
+                    CausticaConfig.Rt.Fog.DENSITY.value() * fogWeather * biomeHaze + precipitationFog,
                     1.0f / fogScaleHeight,
                     CausticaConfig.Rt.Fog.HEIGHT.value() - terrain.blockY,
                     CausticaConfig.Rt.Fog.ALBEDO.value());
@@ -1256,8 +1271,12 @@ public final class RtComposite {
             // fixed amount, so a sky that is already at 0.8 does not overshoot past 1 and clip flat.
             // Density rises and ambient falls together: that pairing — thicker and less sky bouncing
             // around inside — is what makes a storm deck read as heavy rather than merely large.
-            float cloudWeather = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value()
-                    * Math.min(rainLevel + thunderLevel * 0.5f, 1f);
+            float cloudWeather = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value() * weatherIntensity;
+            // Dry-biome storms are carried mainly by the dust volume; retaining a little cloud response
+            // keeps the sky coherent without turning a desert storm into a tropical overcast.
+            if (weatherType == 2) {
+                cloudWeather *= 0.30f;
+            }
             // Cloud colour and height come from the same attribute system. CLOUD_HEIGHT is a world Y,
             // so it is rebased alongside everything else below.
             float cloudR = 1f, cloudG = 1f, cloudB = 1f;
@@ -1272,8 +1291,7 @@ public final class RtComposite {
             }
             Float4 dimCloud = new Float4(cloudR, cloudG, cloudB,
                     CausticaConfig.Rt.Clouds.VANILLA_TINT.value());
-            Float4 cloud3 = new Float4(CausticaConfig.Rt.Clouds.QUALITY.value(), 0f, 0f, 0f);
-            Float4 fog2 = new Float4(CausticaConfig.Rt.Fog.DEBUG.value(), 0f, 0f, 0f);
+            Float4 fog2 = new Float4(CausticaConfig.Rt.Fog.DEBUG.value(), weatherType, weatherIntensity, 0f);
             // Vanilla's cloud height wins when enabled and actually reported — a dimension with no cloud
             // layer leaves the attribute absent, in which case the configured altitude is the only
             // sensible answer rather than dropping the deck to zero.
@@ -1283,6 +1301,13 @@ public final class RtComposite {
                     : CausticaConfig.Rt.Clouds.ALTITUDE.value();
             float cloudCoverage = CausticaConfig.Rt.Clouds.COVERAGE.value();
             cloudCoverage += (1f - cloudCoverage) * cloudWeather * 0.85f;
+            float secondaryCoverage = Math.clamp(cloudCoverage * 0.36f
+                    + (weatherType == 1 ? weatherIntensity * 0.18f : 0f), 0f, 0.68f);
+            if (weatherType == 2) {
+                secondaryCoverage *= 0.20f;
+            }
+            Float4 cloud3 = new Float4(CausticaConfig.Rt.Clouds.QUALITY.value(),
+                    weatherType, weatherIntensity, secondaryCoverage);
             Float4 cloud0 = new Float4(
                     cloudCoverage,
                     CausticaConfig.Rt.Clouds.DENSITY.value() * (1f + cloudWeather * 1.5f),
@@ -1516,7 +1541,8 @@ public final class RtComposite {
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
                 displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                         sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
-                        true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length,
+                        true, CausticaConfig.Rt.Tonemap.punchyHdrLook(), lookLut.size,
+                        LOOK.bloom().strength() / bloomLevels.length,
                         CausticaConfig.Rt.Grade.ENABLED.value(),
                         CausticaConfig.Rt.Grade.SATURATION.value(),
                         CausticaConfig.Rt.Grade.CONTRAST.value(),

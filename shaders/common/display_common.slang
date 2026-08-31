@@ -72,6 +72,7 @@ public struct DisplayPush {
     public float gamma;         // post-display artistic gamma; below 1 brightens midtones
     public float hdrPeakNits;   // mastering peak baked into the currently bound HDR ACES LUT
     public int lookEnabled;     // 0 = identity, 1 = apply the scene-referred ACES look LUT
+    public int punchyHdrLook;   // scene-referred Punchy appearance; ACES 2.0 still owns the output transform
     public float lookLutSize;   // lookLut texels per axis (independent of the output-transform LUT size)
     // Scene-referred blurred highlight signal added before the LMT. The bloom pyramid's level 0 holds the
     // SUM of every band, so RtComposite folds the 1/levelCount normalisation into this value: the authored

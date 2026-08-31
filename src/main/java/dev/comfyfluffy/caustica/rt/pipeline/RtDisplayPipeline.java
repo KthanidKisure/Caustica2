@@ -203,7 +203,7 @@ public final class RtDisplayPipeline {
      * {@code CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS}), selected host-side by which LUT resource is bound.
      */
     public void dispatch(VkCommandBuffer cmd, int width, int height, boolean hdrEnabled, int lutSize,
-                         float gamma, float hdrPeakNits, boolean lookEnabled, int lookLutSize,
+                         float gamma, float hdrPeakNits, boolean lookEnabled, boolean punchyHdrLook, int lookLutSize,
                          float bloomStrength, boolean gradeEnabled, float saturation, float contrast,
                          float gain, float highlightSaturation, float highlightGain,
                          float highlightsMin, float sharpness) {
@@ -212,7 +212,7 @@ public final class RtDisplayPipeline {
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
             ByteBuffer push = stack.malloc(DisplayPushData.BYTE_SIZE);
             new DisplayPushData(hdrEnabled ? 1 : 0, (float) lutSize, gamma, hdrPeakNits,
-                    lookEnabled ? 1 : 0, (float) lookLutSize, bloomStrength,
+                    lookEnabled ? 1 : 0, punchyHdrLook ? 1 : 0, (float) lookLutSize, bloomStrength,
                     gradeEnabled ? 1 : 0, saturation, contrast, gain,
                     highlightSaturation, highlightGain, highlightsMin, sharpness).write(push);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);

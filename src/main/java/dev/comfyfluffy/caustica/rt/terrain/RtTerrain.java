@@ -173,6 +173,9 @@ public final class RtTerrain {
             java.util.Collections.synchronizedList(new ArrayList<>());
     /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
     private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
+    /** Render-frame deadline before an empty/failed DH region may be queried again. Render-thread only. */
+    private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
+    private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
     /**
      * Keeps LOD keys clear of real section keys. The key packs scy into 12 signed bits, and legal
      * Minecraft section Y is roughly -4..20, so offsetting by 512 per detail level cannot collide with
@@ -230,6 +233,7 @@ public final class RtTerrain {
         queuedDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
         inFlight.defaultReturnValue(NO_TESS_TOKEN);
         inFlightDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
+        lodRetryAfterFrame.defaultReturnValue(0L);
     }
 
     /**
@@ -1455,10 +1459,8 @@ public final class RtTerrain {
     // same mesh -> upload -> BLAS -> table pipeline as ordinary terrain, but is tracked separately
     // because residency's window sync would evict it instantly (see lodResident).
     //
-    // LOD sections are never individually evicted. They are cheap to hold (a few hundred at most), the
-    // player leaving a region is not a reason to rebuild it, and never destroying a published BLAS
-    // mid-session removes the entire use-after-free class of bug from this path. They are released
-    // wholesale on world change or when the feature is switched off.
+    // LOD residency follows a padded ring around the player. Geometry beyond that ring is retired against
+    // the graphics timeline, bounding memory on long-distance travel while the padding avoids churn at the edge.
 
     private static long lodKey(int lx, int ly, int lz, int detail) {
         return sectionKey(lx, ly + LOD_KEY_Y_OFFSET * detail, lz);
@@ -1503,6 +1505,8 @@ public final class RtTerrain {
         int centreX = Math.floorDiv(pbx, sectionBlocks);
         int centreZ = Math.floorDiv(pbz, sectionBlocks);
         int centreY = Math.floorDiv(62, sectionBlocks);
+        evictLodOutside(ctx, centreX, centreZ, sectionBlocks, radius + 2);
+        long frame = RtComposite.frameCounter();
 
         // Nearest-first, so the ring the player is looking at fills before the far edge.
         outer:
@@ -1523,6 +1527,11 @@ public final class RtTerrain {
                         if (lodResident.containsKey(key) || lodInFlight.contains(key)) {
                             continue;
                         }
+                        long retryAfter = lodRetryAfterFrame.get(key);
+                        if (retryAfter > frame) {
+                            continue;
+                        }
+                        lodRetryAfterFrame.remove(key);
                         dispatchLodSection(ctx, level, key, lx, ly, lz, detail, scale, sectionBlocks);
                         budget--;
                     }
@@ -1635,8 +1644,11 @@ public final class RtTerrain {
                 failed = new ArrayList<>(lodFailed);
                 lodFailed.clear();
             }
+            long retryAfter = RtComposite.frameCounter() + LOD_RETRY_COOLDOWN_FRAMES;
             for (Long key : failed) {
-                lodInFlight.remove(key.longValue());
+                long primitiveKey = key.longValue();
+                lodInFlight.remove(primitiveKey);
+                lodRetryAfterFrame.put(primitiveKey, retryAfter);
             }
         }
         if (lodPrepared.isEmpty()) {
@@ -1650,6 +1662,7 @@ public final class RtTerrain {
         int scale = 1 << CausticaConfig.Rt.Lod.DETAIL.value();
         for (PreparedSection ps : batch) {
             lodInFlight.remove(ps.key());
+            lodRetryAfterFrame.remove(ps.key());
             if (lodResident.containsKey(ps.key()) || !CausticaConfig.Rt.Lod.ENABLED.value()) {
                 // Either a duplicate dispatch of the same key, or LOD was switched off while this was
                 // in flight. Retire it rather than publishing geometry nothing will ever release.
@@ -1677,6 +1690,46 @@ public final class RtTerrain {
         table.instances = table.instanceList;
     }
 
+    private void evictLodOutside(RtContext ctx, int centreX, int centreZ,
+                                 int sectionBlocks, int retainRadius) {
+        if (lodResident.isEmpty()) {
+            return;
+        }
+        List<SectionGeom> doomed = new ArrayList<>();
+        var iterator = lodResident.long2ObjectEntrySet().fastIterator();
+        while (iterator.hasNext()) {
+            var entry = iterator.next();
+            SectionGeom g = entry.getValue();
+            int lx = Math.floorDiv(g.sx, sectionBlocks);
+            int lz = Math.floorDiv(g.sz, sectionBlocks);
+            if (Math.max(Math.abs(lx - centreX), Math.abs(lz - centreZ)) <= retainRadius) {
+                continue;
+            }
+            iterator.remove();
+            lodRetryAfterFrame.remove(g.key);
+            if (g.slot >= 0 && g.slot < table.slots.size()) {
+                table.slots.set(g.slot, null);
+                table.freeSlots.add(g.slot);
+            }
+            g.slot = -1;
+            g.instanceIndex = -1;
+            doomed.add(g);
+        }
+        if (doomed.isEmpty()) {
+            return;
+        }
+        table.instanceList.clear();
+        for (int i = 0; i < table.slots.size(); i++) {
+            SectionGeom g = table.slots.get(i);
+            if (g != null) {
+                g.instanceIndex = table.instanceList.size();
+                table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
+            }
+        }
+        table.instances = table.instanceList;
+        retire(ctx, ctx.gpuExecutor().latestGraphicsUse(), doomed);
+    }
+
     /**
      * Drops every LOD section. Used when the feature is switched off and on world teardown. The
      * instance list is rebuilt from scratch rather than patched: instanceIndex values are positions in
@@ -1689,6 +1742,7 @@ public final class RtTerrain {
         List<SectionGeom> doomed = new ArrayList<>(lodResident.values());
         lodResident.clear();
         lodInFlight.clear();
+        lodRetryAfterFrame.clear();
         synchronized (lodFailed) {
             lodFailed.clear();
         }
@@ -1697,6 +1751,7 @@ public final class RtTerrain {
         for (SectionGeom g : doomed) {
             if (g.slot >= 0 && g.slot < table.slots.size()) {
                 table.slots.set(g.slot, null);
+                table.freeSlots.add(g.slot);
             }
             g.slot = -1;
             g.instanceIndex = -1;

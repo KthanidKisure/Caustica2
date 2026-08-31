@@ -11,10 +11,10 @@
     "resource": "lmt.bin"
   },
   "bloom": {
-    "strength": 0.02,
-    "thresholdSceneLinear": 2.0,
-    "softKneeFraction": 0.25,
-    "radius": 1.0,
+    "strength": 0.032,
+    "thresholdSceneLinear": 1.6,
+    "softKneeFraction": 0.35,
+    "radius": 1.08,
     "levels": 6
   },
   "lighting": {
