@@ -1,0 +1,276 @@
+name: LOD transient hotfix
+
+on:
+  push:
+    branches:
+      - codex/claude-pass
+    paths:
+      - ".github/workflows/lod-transient-hotfix.yml"
+      - "src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtDhLodSource.java"
+      - "src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtTerrain.java"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+
+      - name: Apply transient DH query fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          source = Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtDhLodSource.java")
+          s = source.read_text(encoding="utf-8")
+
+          s = replace_once(s,
+          '''    /** One vertical run of one block state. topY is exclusive, matching DH. */
+              public record LodBox(int blockX, int bottomY, int topY, int blockZ, int sizeXZ,
+                                   BlockState blockState, int blockLight, int skyLight) {
+                  public int heightBlocks() {
+                      return topY - bottomY;
+                  }
+              }
+          ''',
+          '''    /** One vertical run of one block state. topY is exclusive, matching DH. */
+              public record LodBox(int blockX, int bottomY, int topY, int blockZ, int sizeXZ,
+                                   BlockState blockState, int blockLight, int skyLight) {
+                  public int heightBlocks() {
+                      return topY - bottomY;
+                  }
+              }
+
+              /**
+               * Result of one DH terrain query. A successful query may legitimately contain zero boxes;
+               * an unsuccessful query is retryable and must never be cached as an empty world region.
+               */
+              public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
+                  public FetchResult {
+                      boxes = List.copyOf(boxes);
+                  }
+              }
+          ''', "add FetchResult")
+
+          s = replace_once(s,
+          '''    public static List<LodBox> fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
+                  byte detailLevel = (byte) Integer.numberOfTrailingZeros(Math.max(footprintBlocks, 1));
+                  int posX = Math.floorDiv(originBlockX, Math.max(footprintBlocks, 1));
+                  int posZ = Math.floorDiv(originBlockZ, Math.max(footprintBlocks, 1));
+                  return fetchRegion(detailLevel, posX, posZ, footprintBlocks, originBlockX, originBlockZ);
+              }
+
+              private static List<LodBox> fetchRegion(byte detailLevel, int posX, int posZ,
+                                                      int footprintBlocks, int originBlockX, int originBlockZ) {
+          ''',
+          '''    public static FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
+                  byte detailLevel = (byte) Integer.numberOfTrailingZeros(Math.max(footprintBlocks, 1));
+                  int posX = Math.floorDiv(originBlockX, Math.max(footprintBlocks, 1));
+                  int posZ = Math.floorDiv(originBlockZ, Math.max(footprintBlocks, 1));
+                  return fetchRegion(detailLevel, posX, posZ, footprintBlocks, originBlockX, originBlockZ);
+              }
+
+              private static FetchResult fetchRegion(byte detailLevel, int posX, int posZ,
+                                                      int footprintBlocks, int originBlockX, int originBlockZ) {
+          ''', "change fetch signatures")
+
+          s = replace_once(s,
+          '''            if (state != State.READY || !worldReady()) {
+                          return List.of();
+                      }
+          ''',
+          '''            if (state != State.READY || !worldReady()) {
+                          return new FetchResult(List.of(), false);
+                      }
+          ''', "state-not-ready result")
+
+          s = replace_once(s,
+          '''                return List.of();
+                      }
+                      loggedNoLevel.set(false);
+                      if (wrappers.size() > 1 && loggedMultipleLevels.compareAndSet(false, true)) {
+          ''',
+          '''                return new FetchResult(List.of(), false);
+                      }
+                      loggedNoLevel.set(false);
+                      if (wrappers.size() > 1 && loggedMultipleLevels.compareAndSet(false, true)) {
+          ''', "no-wrapper result")
+
+          s = replace_once(s,
+          '''                    loggedQueryFailure.set(false);
+                          return boxes;
+                      }
+                      successfulEmpty = boxes;
+          ''',
+          '''                    loggedQueryFailure.set(false);
+                          return new FetchResult(boxes, true);
+                      }
+                      successfulEmpty = boxes;
+          ''', "successful boxes result")
+
+          s = replace_once(s,
+          '''                loggedQueryFailure.set(false);
+                      return successfulEmpty;
+                  }
+          ''',
+          '''                loggedQueryFailure.set(false);
+                      return new FetchResult(successfulEmpty, true);
+                  }
+          ''', "successful empty result")
+
+          s = replace_once(s,
+          '''            return List.of();
+                  } catch (ReflectiveOperationException | RuntimeException e) {
+                      LOGGER.debug("DH region fetch failed at detail {} ({}, {}): {}",
+                              detailLevel, posX, posZ, e.toString());
+                      return List.of();
+                  }
+          ''',
+          '''            return new FetchResult(List.of(), false);
+                  } catch (ReflectiveOperationException | RuntimeException e) {
+                      LOGGER.debug("DH region fetch failed at detail {} ({}, {}): {}",
+                              detailLevel, posX, posZ, e.toString());
+                      return new FetchResult(List.of(), false);
+                  }
+          ''', "failed query result")
+
+          source.write_text(s, encoding="utf-8")
+
+          terrain = Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtTerrain.java")
+          t = terrain.read_text(encoding="utf-8")
+
+          t = replace_once(t,
+          '''    /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
+              private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
+              /** Render-frame deadline before an empty/failed DH region may be queried again. Render-thread only. */
+              private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
+              private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
+          ''',
+          '''    /** Keys whose dispatch ended after a successful query with no geometry, or a build failure. */
+              private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
+              /**
+               * Keys whose DH API call itself did not succeed. These are NOT empty terrain and must be retried
+               * quickly after the source becomes ready instead of entering the long empty-region cooldown.
+               */
+              private final List<Long> lodRetrySoon = java.util.Collections.synchronizedList(new ArrayList<>());
+              /** Render-frame deadline before an empty/failed DH region may be queried again. Render-thread only. */
+              private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
+              private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
+              /** Global wall-clock backoff after DH rejects a query while its multiplayer world is still transitioning. */
+              private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;
+              private long lodSourceRetryAfterNanos;
+          ''', "add transient state")
+
+          t = replace_once(t,
+          '''        publishLodPrepared(ctx, pbx, pby, pbz);
+
+                  int detail = CausticaConfig.Rt.Lod.DETAIL.value();
+          ''',
+          '''        publishLodPrepared(ctx, pbx, pby, pbz);
+                  if (System.nanoTime() < lodSourceRetryAfterNanos) {
+                      return;
+                  }
+
+                  int detail = CausticaConfig.Rt.Lod.DETAIL.value();
+          ''', "pause dispatch during transient backoff")
+
+          t = replace_once(t,
+          '''                RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
+                          java.util.List<RtDhLodSource.LodBox> boxes =
+                                  RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
+                          region.fill(boxes);
+                          lodBoxesSeen.addAndGet(boxes.size());
+          ''',
+          '''                RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
+                          RtDhLodSource.FetchResult fetched =
+                                  RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
+                          if (!fetched.querySucceeded()) {
+                              finishLodRetrySoon(key);
+                              return;
+                          }
+                          java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();
+                          region.fill(boxes);
+                          lodBoxesSeen.addAndGet(boxes.size());
+          ''', "handle retryable fetch result")
+
+          t = replace_once(t,
+          '''    private void finishLodTask(long key, PreparedSection prepared) {
+                  if (prepared != null) {
+                      lodPrepared.add(prepared);
+                  } else {
+                      lodFailed.add(key);
+                  }
+                  finishActiveTask();
+              }
+
+              /** Publishes finished LOD sections into the shared section table. */
+          ''',
+          '''    private void finishLodTask(long key, PreparedSection prepared) {
+                  if (prepared != null) {
+                      lodPrepared.add(prepared);
+                  } else {
+                      lodFailed.add(key);
+                  }
+                  finishActiveTask();
+              }
+
+              private void finishLodRetrySoon(long key) {
+                  lodRetrySoon.add(key);
+                  finishActiveTask();
+              }
+
+              /** Publishes finished LOD sections into the shared section table. */
+          ''', "add retry completion path")
+
+          t = replace_once(t,
+          '''    private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
+                  // Retire failed keys first so they become eligible for redispatch. Done here, on the render
+          ''',
+          '''    private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
+                  // An unsuccessful DH API call is a source-lifecycle problem, not an empty terrain region.
+                  // Remove those keys from in-flight immediately and pause all new DH work briefly so a
+                  // HUB/INTERIM -> WORLD transition cannot poison hundreds of sections in a few frames.
+                  if (!lodRetrySoon.isEmpty()) {
+                      List<Long> retrySoon;
+                      synchronized (lodRetrySoon) {
+                          retrySoon = new ArrayList<>(lodRetrySoon);
+                          lodRetrySoon.clear();
+                      }
+                      for (Long key : retrySoon) {
+                          lodInFlight.remove(key.longValue());
+                      }
+                      lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
+                      CausticaMod.LOGGER.info("LOD: DH source not query-ready; retrying in 1 second ({} regions deferred)",
+                              retrySoon.size());
+                  }
+
+                  // Retire failed keys first so they become eligible for redispatch. Done here, on the render
+          ''', "process retryable completions")
+
+          terrain.write_text(t, encoding="utf-8")
+
+      - name: Commit hotfix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtDhLodSource.java \
+                  src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtTerrain.java
+          git commit -m "Treat DH pre-world query failures as transient"
+          git push origin HEAD:codex/claude-pass
