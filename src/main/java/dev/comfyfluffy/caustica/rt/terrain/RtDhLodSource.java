@@ -5,6 +5,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.world.level.block.state.BlockState;
@@ -15,60 +16,26 @@ import org.slf4j.LoggerFactory;
  * Reads Distant Horizons' persistent terrain database and turns it into axis-aligned boxes that can be
  * meshed and put in the ray-tracing acceleration structure.
  *
- * <h2>Why this exists</h2>
- * Caustica builds every section from {@code level.getChunk(...)}, the client chunk cache. Beyond the
- * server's view distance there is no block data in the process at all — so a Caustica-native LOD can
- * reduce detail on loaded terrain, but it can never show terrain that was never sent. DH already solves
- * that problem: it maintains a durable, generated, streamed world database far past the chunk cache.
- *
- * <h2>What this deliberately does NOT do</h2>
- * It does not touch DH's renderer, intercept its draw calls, or read its GPU buffers. DH's rendering
- * should be switched OFF when this is used. DH is a data source here and Caustica does all drawing, as
- * rays. That avoids the whole class of problems that come from two world renderers coexisting, and it
- * means this survives DH changing its rendering backend — which it has done twice recently.
- *
- * <h2>Why reflection</h2>
- * DH is optional. A hard compile-time dependency would make Caustica refuse to load without it, and
- * would pin a DH version. Everything here resolves lazily and degrades to "no LOD" if DH is absent, is
- * a version whose API moved, or has not finished loading a world. The API surface used is small and
- * documented — {@code DhApi.Delayed.terrainRepo}, {@code DhApi.Delayed.worldProxy}, and
- * {@code IDhApiTerrainDataRepo.getAllTerrainDataAtDetailLevelAndPos} — and it is a versioned public
- * API rather than internals, so it is a reasonable thing to bind to loosely.
- *
- * <h2>Data shape</h2>
- * DH returns {@code DhApiTerrainDataPoint[][][]} indexed [x][z][column entry]. Each entry is already a
- * vertical RUN — a {@code bottomYBlockPos}..{@code topYBlockPos} span of one block state, with baked
- * block and sky light. That is run-length encoding done for us: a 200-block stone column is one entry,
- * not 200. Emitting one box per entry is therefore already a large win before any greedy merging, and
- * it is why this does not need a general voxel mesher.
- *
- * <p>Crucially the entry carries a {@code blockStateWrapper} whose {@code getWrappedMcObject()} is a real
- * Minecraft {@link BlockState}. That means distant terrain can resolve to the SAME material table entries
- * as near terrain — roughness, metalness, emission, LabPBR maps — rather than the baked vertex colour a
- * renderer-interception approach would give you. Distant lava glowing correctly is downstream of this
- * one method call.
+ * <p>DH remains an optional dependency: all API access is reflected so Caustica still starts when DH is
+ * absent or moves its API. DH supplies persistent terrain data; Caustica owns the ray-traced rendering.
  */
 public final class RtDhLodSource {
     private static final Logger LOGGER = LoggerFactory.getLogger("Caustica/DhLod");
     private static final String DH_MOD_ID = "distanthorizons";
 
-    /** Resolution states. Resolved once; a failure is remembered so a broken API is not retried per frame. */
     private enum State { UNRESOLVED, READY, UNAVAILABLE }
 
     private static State state = State.UNRESOLVED;
     private static Object terrainRepo;
     private static Object worldProxy;
+    private static Object softCache;
+
     private static Method getAllTerrainDataAtDetailLevelAndPos;
     private static Method createSoftCache;
     private static Method getSinglePlayerLevel;
     private static Method getAllLoadedLevelWrappers;
-    /**
-     * A soft cache DH's own API creates and owns. Passing null for this parameter is not "no cache" —
-     * DH treats it as a hard failure and every query returns unsuccessful with the message "Missing
-     * [IDhApiTerrainDataCache]". That single null was the actual cause of every LOD query failing;
-     * the footprint-vs-area fix and the diagnostics were correct but never got to matter.
-     */
-    private static Object softCache;
+    private static Method worldLoaded;
+
     private static Field resultPayload;
     private static Field resultSuccess;
     private static Field resultMessage;
@@ -78,20 +45,17 @@ public final class RtDhLodSource {
     private static Field pointSkyLight;
     private static Field pointBlockState;
     private static Method wrapperGetMcObject;
-    private static final java.util.concurrent.atomic.AtomicBoolean loggedQueryFailure =
-            new java.util.concurrent.atomic.AtomicBoolean();
-    private static final java.util.concurrent.atomic.AtomicBoolean loggedQuerySuccess =
-            new java.util.concurrent.atomic.AtomicBoolean();
-    private static final java.util.concurrent.atomic.AtomicBoolean loggedNoLevel =
-            new java.util.concurrent.atomic.AtomicBoolean();
+
+    private static final AtomicBoolean loggedWorldNotReady = new AtomicBoolean();
+    private static final AtomicBoolean loggedQueryFailure = new AtomicBoolean();
+    private static final AtomicBoolean loggedQuerySuccess = new AtomicBoolean();
+    private static final AtomicBoolean loggedNoLevel = new AtomicBoolean();
+    private static final AtomicBoolean loggedMultipleLevels = new AtomicBoolean();
 
     private RtDhLodSource() {
     }
 
-    /**
-     * One vertical run of a single block state, in world coordinates. {@code topY} is exclusive, matching
-     * DH's convention, so an empty run is representable and callers do not need an off-by-one guard.
-     */
+    /** One vertical run of one block state. topY is exclusive, matching DH. */
     public record LodBox(int blockX, int bottomY, int topY, int blockZ, int sizeXZ,
                          BlockState blockState, int blockLight, int skyLight) {
         public int heightBlocks() {
@@ -99,9 +63,39 @@ public final class RtDhLodSource {
         }
     }
 
+    /**
+     * True only when the reflected API is present AND DH says its world is actually loaded.
+     *
+     * <p>This worldLoaded gate is important on multiplayer. Caustica can finish its expensive RT/material
+     * startup while DH is still switching from its interim/hub world to the real server level. Querying
+     * during that window returns "Unable to get terrain data before the world has loaded". Treating that
+     * temporary result as an empty LOD section poisoned the whole ring's retry cache.
+     */
     public static synchronized boolean available() {
         resolve();
-        return state == State.READY;
+        if (state != State.READY) {
+            return false;
+        }
+        if (!worldReady()) {
+            if (loggedWorldNotReady.compareAndSet(false, true)) {
+                LOGGER.info("Distant Horizons API resolved, but its world is not query-ready yet; delaying LOD streaming");
+            }
+            return false;
+        }
+        loggedWorldNotReady.set(false);
+        return true;
+    }
+
+    private static boolean worldReady() {
+        if (state != State.READY || worldProxy == null || worldLoaded == null) {
+            return false;
+        }
+        try {
+            return Boolean.TRUE.equals(worldLoaded.invoke(worldProxy));
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            LOGGER.debug("Unable to read Distant Horizons worldLoaded state: {}", e.toString());
+            return false;
+        }
     }
 
     private static void resolve() {
@@ -118,8 +112,6 @@ public final class RtDhLodSource {
             terrainRepo = delayed.getField("terrainRepo").get(null);
             worldProxy = delayed.getField("worldProxy").get(null);
             if (terrainRepo == null || worldProxy == null) {
-                // DH is present but has not finished initialising. Stay UNRESOLVED so this retries:
-                // the fields are populated after world load, not at mod init.
                 terrainRepo = null;
                 worldProxy = null;
                 return;
@@ -136,16 +128,12 @@ public final class RtDhLodSource {
                     levelWrapper, byte.class, int.class, int.class, cacheInterface);
             createSoftCache = repoInterface.getMethod("createSoftCache");
 
-            // Two accessors, because they cover different worlds. getSinglePlayerLevel throws on a
-            // multiplayer server, which would have ruled out exactly the case that matters here:
-            // Wynncraft with WynnLODGrabber, where DH's database is populated for a SERVER world.
-            // getAllLoadedLevelWrappers covers that, at the cost of having to pick — see levelWrapper().
             Class<?> worldProxyInterface = Class.forName(
                     "com.seibel.distanthorizons.api.interfaces.world.IDhApiWorldProxy");
             getSinglePlayerLevel = worldProxyInterface.getMethod("getSinglePlayerLevel");
             getAllLoadedLevelWrappers = worldProxyInterface.getMethod("getAllLoadedLevelWrappers");
+            worldLoaded = worldProxyInterface.getMethod("worldLoaded");
 
-            // DhApiResult exposes success/message/payload as public FIELDS, not getters.
             Class<?> resultClass = Class.forName("com.seibel.distanthorizons.api.objects.DhApiResult");
             resultSuccess = resultClass.getField("success");
             resultMessage = resultClass.getField("message");
@@ -167,38 +155,18 @@ public final class RtDhLodSource {
             state = State.READY;
             LOGGER.info("Distant Horizons LOD source resolved ({})", dhApi.getName());
         } catch (ReflectiveOperationException | RuntimeException e) {
-            // A moved API is expected across DH majors and is not an error worth spamming: log once and
-            // run without distant terrain, exactly as if DH were not installed.
             state = State.UNAVAILABLE;
             terrainRepo = null;
             worldProxy = null;
-            LOGGER.warn("Distant Horizons is installed but its API did not resolve; "
-                    + "distant LOD terrain disabled. {}", e.toString());
+            softCache = null;
+            LOGGER.warn("Distant Horizons is installed but its API did not resolve; distant LOD terrain disabled. {}",
+                    e.toString());
         }
     }
 
     /**
-     * Fetches one square area of terrain and flattens it into boxes.
-     *
-     * <p><b>DH's detailLevel is the size of the QUERIED AREA, not the resolution of the data.</b> This
-     * is the single most misreadable thing in the API and getting it wrong produces silence rather
-     * than an error. From DH's own javadoc: 0 = block, 2 = 4x4 blocks, 4 = chunk, 9 = region. So
-     * {@code detailLevel} 4 asks for one chunk's worth of columns at position (posX, posZ) measured in
-     * chunks — it does NOT ask for chunk-resolution data.
-     *
-     * <p>Because of that, the caller passes the FOOTPRINT it wants covered and this derives everything
-     * else. The returned grid's own dimensions then tell us the resolution DH actually had, which is
-     * read from the array rather than assumed: DH may return a coarser grid than the footprint implies
-     * if that is all its database holds, and silently treating a 4x4 grid as 16x16 would scatter
-     * terrain across the section with holes between.
-     *
-     * <p><b>Call this off the render thread.</b> DH may hit disk. It is a database query, not a memory
-     * read.
-     *
-     * @param footprintBlocks width of the square area to cover, in blocks; must be a power of two
-     * @param originBlockX    world X of the area's corner, a multiple of footprintBlocks
-     * @param originBlockZ    world Z of the area's corner
-     * @return the boxes, or an empty list if DH is unavailable or has nothing here
+     * Fetches one square footprint and flattens DH's run-length terrain columns into boxes.
+     * DH's API detailLevel is the size of the queried AREA: 0=1 block, 4=16 blocks, 6=64 blocks, etc.
      */
     public static List<LodBox> fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
         byte detailLevel = (byte) Integer.numberOfTrailingZeros(Math.max(footprintBlocks, 1));
@@ -211,43 +179,70 @@ public final class RtDhLodSource {
                                             int footprintBlocks, int originBlockX, int originBlockZ) {
         synchronized (RtDhLodSource.class) {
             resolve();
-            if (state != State.READY) {
+            if (state != State.READY || !worldReady()) {
                 return List.of();
             }
         }
+
         try {
-            Object levelWrapper = levelWrapper();
-            if (levelWrapper == null) {
-                // The most likely single cause of "DH returns nothing": DH has no level loaded at all,
-                // which is not the same as a level with no terrain in it.
+            List<Object> wrappers = levelWrappers();
+            if (wrappers.isEmpty()) {
                 if (loggedNoLevel.compareAndSet(false, true)) {
-                    LOGGER.info("DH has no loaded level — it may be disabled for this world, or its "
-                            + "level lifecycle may require its renderer to be enabled");
+                    LOGGER.info("DH reports a loaded world but exposes no loaded level wrapper yet; delaying LOD queries");
                 }
                 return List.of();
             }
-            Object result = getAllTerrainDataAtDetailLevelAndPos.invoke(
-                    terrainRepo, levelWrapper, detailLevel, posX, posZ, softCache);
-            if (result == null || !resultSuccess.getBoolean(result)) {
-                // DH's own explanation, surfaced ONCE at info. It was debug-only, which meant that when
-                // every query failed the log showed a count of zeroes and no reason — the one piece of
-                // information that would have identified the cause was being swallowed. Once, because
-                // a failing setup fails on every query and would otherwise flood the log.
-                if (loggedQueryFailure.compareAndSet(false, true)) {
-                    LOGGER.info("DH query failed at detail {} pos {},{}: {}", detailLevel, posX, posZ,
-                            result == null ? "null result" : resultMessage.get(result));
+            loggedNoLevel.set(false);
+            if (wrappers.size() > 1 && loggedMultipleLevels.compareAndSet(false, true)) {
+                LOGGER.info("DH exposes {} loaded level wrappers; Caustica will query all candidates until one answers",
+                        wrappers.size());
+            }
+
+            Object firstFailureMessage = null;
+            boolean hadSuccessfulQuery = false;
+            List<LodBox> successfulEmpty = List.of();
+
+            for (Object levelWrapper : wrappers) {
+                Object result = getAllTerrainDataAtDetailLevelAndPos.invoke(
+                        terrainRepo, levelWrapper, detailLevel, posX, posZ, softCache);
+                if (result == null || !resultSuccess.getBoolean(result)) {
+                    if (firstFailureMessage == null && result != null) {
+                        firstFailureMessage = resultMessage.get(result);
+                    }
+                    continue;
                 }
-                return List.of();
+
+                hadSuccessfulQuery = true;
+                Object grid = resultPayload.get(result);
+                List<LodBox> boxes = grid == null
+                        ? List.of()
+                        : flatten(grid, footprintBlocks, originBlockX, originBlockZ);
+                if (!boxes.isEmpty()) {
+                    if (loggedQuerySuccess.compareAndSet(false, true)) {
+                        LOGGER.info("DH query succeeded at detail {} pos {},{} with {} terrain boxes",
+                                detailLevel, posX, posZ, boxes.size());
+                    }
+                    loggedQueryFailure.set(false);
+                    return boxes;
+                }
+                successfulEmpty = boxes;
             }
-            // A successful but empty answer is a different diagnosis from a failed one, so say so.
-            if (loggedQuerySuccess.compareAndSet(false, true)) {
-                LOGGER.info("DH query succeeded at detail {} pos {},{}", detailLevel, posX, posZ);
+
+            if (hadSuccessfulQuery) {
+                if (loggedQuerySuccess.compareAndSet(false, true)) {
+                    LOGGER.info("DH query succeeded at detail {} pos {},{} but returned no solid terrain",
+                            detailLevel, posX, posZ);
+                }
+                loggedQueryFailure.set(false);
+                return successfulEmpty;
             }
-            Object grid = resultPayload.get(result);
-            if (grid == null) {
-                return List.of();
+
+            if (loggedQueryFailure.compareAndSet(false, true)) {
+                LOGGER.info("DH query failed at detail {} pos {},{} across {} loaded level wrapper(s): {}",
+                        detailLevel, posX, posZ, wrappers.size(),
+                        firstFailureMessage == null ? "no successful result" : firstFailureMessage);
             }
-            return flatten(grid, footprintBlocks, originBlockX, originBlockZ);
+            return List.of();
         } catch (ReflectiveOperationException | RuntimeException e) {
             LOGGER.debug("DH region fetch failed at detail {} ({}, {}): {}",
                     detailLevel, posX, posZ, e.toString());
@@ -255,11 +250,7 @@ public final class RtDhLodSource {
         }
     }
 
-    /**
-     * Walks the [x][z][column] array. Reflection on the array rather than a cast because the element
-     * type lives in DH's classloader-visible API and casting it here would reintroduce the hard
-     * dependency this class exists to avoid.
-     */
+    /** Walks the [x][z][column] array returned by DH. */
     private static List<LodBox> flatten(Object grid, int footprintBlocks, int originX, int originZ)
             throws ReflectiveOperationException {
         List<LodBox> boxes = new ArrayList<>();
@@ -267,8 +258,6 @@ public final class RtDhLodSource {
         if (lenX <= 0) {
             return boxes;
         }
-        // Resolution derived from what DH actually returned, not from what was asked for. A 128-block
-        // footprint answered with a 16x16 grid means each cell stands for 8 blocks.
         int sizeXZ = Math.max(footprintBlocks / lenX, 1);
         for (int ix = 0; ix < lenX; ix++) {
             Object column = Array.get(grid, ix);
@@ -298,9 +287,6 @@ public final class RtDhLodSource {
                     }
                     Object mcObject = wrapperGetMcObject.invoke(wrapper);
                     if (!(mcObject instanceof BlockState blockState) || blockState.isAir()) {
-                        // Air runs are the majority of every column and carry no geometry. Skipping
-                        // them here rather than in the mesher keeps the returned list proportional to
-                        // the terrain rather than to the world height.
                         continue;
                     }
                     boxes.add(new LodBox(
@@ -319,38 +305,43 @@ public final class RtDhLodSource {
     }
 
     /**
-     * The level to query. Single-player has exactly one and DH says so directly. On a server —
-     * Wynncraft being the case this exists for — that call throws, so this falls back to the loaded
-     * set.
-     *
-     * <p>Taking the first loaded wrapper is a real limitation, not a tidy default: with more than one
-     * level loaded it can return the wrong dimension's terrain. It is acceptable here because the
-     * situation this serves is a server world where DH has one level populated by WynnLODGrabber. If
-     * distant terrain ever appears from the wrong dimension, this is the line to fix, by matching the
-     * wrapper's dimension against the client's.
+     * Returns every currently loaded candidate wrapper instead of blindly using the first one.
+     * Multiplayer getSinglePlayerLevel() throws by design, so the iterable fallback is the normal path.
      */
-    private static Object levelWrapper() throws ReflectiveOperationException {
+    private static List<Object> levelWrappers() throws ReflectiveOperationException {
+        List<Object> wrappers = new ArrayList<>();
         try {
             Object single = getSinglePlayerLevel.invoke(worldProxy);
             if (single != null) {
-                return single;
+                wrappers.add(single);
             }
         } catch (java.lang.reflect.InvocationTargetException e) {
-            // IllegalStateException on a server. Expected; fall through.
+            // Expected on multiplayer.
         }
-        // Iterable, NOT Collection. Verified against DistantHorizons-3.2.0-b-26.2: the signature is
-        // getAllLoadedLevelWrappers()Ljava/lang/Iterable;. A Collection check here compiles and runs
-        // fine, silently matches nothing, and disables distant terrain on every server — which is
-        // exactly the case this fallback exists for.
-        Object loaded = getAllLoadedLevelWrappers.invoke(worldProxy);
+
+        Object loaded;
+        try {
+            loaded = getAllLoadedLevelWrappers.invoke(worldProxy);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            return wrappers;
+        }
         if (loaded instanceof Iterable<?> iterable) {
             for (Object wrapper : iterable) {
-                if (wrapper != null) {
-                    return wrapper;
+                if (wrapper != null && !containsIdentity(wrappers, wrapper)) {
+                    wrappers.add(wrapper);
                 }
             }
         }
-        return null;
+        return wrappers;
+    }
+
+    private static boolean containsIdentity(List<Object> values, Object candidate) {
+        for (Object value : values) {
+            if (value == candidate) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Forgets the resolved API. Call on world unload so a DH reload is picked up. */
@@ -359,17 +350,19 @@ public final class RtDhLodSource {
             state = State.UNRESOLVED;
             terrainRepo = null;
             worldProxy = null;
-            // The cache holds soft references into DH's data sources for a world that is going away;
-            // clear() is the documented way to release them rather than just dropping the reference.
             if (softCache instanceof AutoCloseable closeable) {
                 try {
                     closeable.close();
                 } catch (Exception ignored) {
-                    // AutoCloseable#close is declared checked; DH's own override is not, so this is
-                    // unreachable in practice and kept only to satisfy the compiler.
+                    // DH's cache close does not normally throw.
                 }
             }
             softCache = null;
+            loggedWorldNotReady.set(false);
+            loggedQueryFailure.set(false);
+            loggedQuerySuccess.set(false);
+            loggedNoLevel.set(false);
+            loggedMultipleLevels.set(false);
         }
     }
 }
