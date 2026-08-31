@@ -37,6 +37,94 @@ env:
   VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2
 
 jobs:
+  apply-rt-init-fix:
+    name: Apply RT initialization source fix
+    if: github.event_name == 'pull_request' && github.head_ref == 'codex/rt-pipeline-ordering-fix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+
+      - name: Patch RtComposite source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java")
+          source = path.read_text(encoding="utf-8")
+
+          premature = (
+              "        // Created alongside the other RT resources because this is where ctx is in scope; the method\n"
+              "        // itself is idempotent, so a resize re-binds the existing texture rather than regenerating it.\n"
+              "        ensureCloudNoise(ctx);\n"
+          )
+          pipeline_seam = (
+              "                    WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);\n"
+              "            // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.\n"
+          )
+          pipeline_fixed = (
+              "                    WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);\n"
+              "            // Cloud noise is a descriptor owned by the world pipeline. Create/bind it only after the pipeline\n"
+              "            // exists; recreating the pipeline simply rebinds the device-lifetime texture and sampler.\n"
+              "            ensureCloudNoise(ctx);\n"
+              "            // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.\n"
+          )
+          destroy_seam = (
+              "        if (worldPipeline != null) {\n"
+              "            worldPipeline.destroy();\n"
+              "            worldPipeline = null;\n"
+              "        }\n"
+              "        bindlessTextureCapacity = 0;\n"
+          )
+          destroy_fixed = (
+              "        if (worldPipeline != null) {\n"
+              "            worldPipeline.destroy();\n"
+              "            worldPipeline = null;\n"
+              "        }\n"
+              "        if (cloudNoise != null) {\n"
+              "            cloudNoise.destroy();\n"
+              "            cloudNoise = null;\n"
+              "        }\n"
+              "        if (cloudNoiseSampler != 0L) {\n"
+              "            RtContext ctx = RtContext.currentOrNull();\n"
+              "            if (ctx != null) {\n"
+              "                VK10.vkDestroySampler(ctx.vk(), cloudNoiseSampler, null);\n"
+              "            }\n"
+              "            cloudNoiseSampler = 0L;\n"
+              "        }\n"
+              "        bindlessTextureCapacity = 0;\n"
+          )
+
+          if premature in source:
+              if source.count(premature) != 1 or source.count(pipeline_seam) != 1 or source.count(destroy_seam) != 1:
+                  raise SystemExit("RtComposite source shape changed; refusing an ambiguous patch")
+              source = source.replace(premature, "", 1)
+              source = source.replace(pipeline_seam, pipeline_fixed, 1)
+              source = source.replace(destroy_seam, destroy_fixed, 1)
+              path.write_text(source, encoding="utf-8")
+          elif source.count("ensureCloudNoise(ctx);") != 1:
+              raise SystemExit("unexpected cloud-noise initialization state")
+          PY
+
+      - name: Commit source fix when needed
+        run: |
+          if git diff --quiet -- src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java; then
+            echo "Source fix already applied"
+            exit 0
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java
+          git commit -m "Fix cloud noise pipeline initialization"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
   native-windows:
     name: Build Windows NGX shim
     runs-on: windows-2022
