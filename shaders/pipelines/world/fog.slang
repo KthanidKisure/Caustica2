@@ -104,9 +104,9 @@ float3 applyWeatherFogTint(float3 inscatter, WorldPush push) {
 // One nearby emitter sample tints the participating medium around block lights. It intentionally casts
 // no extra visibility ray: the fog term is low-frequency, and adding a shadow query to every path segment
 // would cost more than the visual precision it buys. The light-grid lookup keeps this O(1).
-float3 fogLocalLightInscatter(float3 position) {
+float3 fogLocalLightInscatter(WorldPush push, float3 position) {
     if (pc.lightBufAddr == 0 || pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0
-            || worldPush.lightCount == 0u) {
+            || push.lightCount == 0u) {
         return float3(0.0);
     }
     LightGridCell cell;
@@ -116,11 +116,11 @@ float3 fogLocalLightInscatter(float3 position) {
     }
     LightGridSpan span = ConstPtr<LightGridSpan>(pc.lightGridSpanAddr)[cell.spanOffset];
     uint count = span.packedLightCounts & 0xffffu;
-    if (count == 0u || span.firstLight >= worldPush.lightCount) {
+    if (count == 0u || span.firstLight >= push.lightCount) {
         return float3(0.0);
     }
     Light light = ConstPtr<Light>(pc.lightBufAddr)[span.firstLight];
-    float3 lightPos = light.pos + worldPush.lightRebase.xyz;
+    float3 lightPos = light.pos + push.lightRebase.xyz;
     float3 toReceiver = position - lightPos;
     float dist2 = max(dot(toReceiver, toReceiver), 1.0);
     float3 dir = toReceiver * rsqrt(dist2);
@@ -238,7 +238,7 @@ public void applyFogSegment(FogParams f, SkyState state, Medium medium, WorldPus
     tau *= weatherFogStructure(push, midpoint);
     float transmittance = exp(-tau);
     float3 inscatter = fogTint(f, fogInscatter(f, rd, state, push), push);
-    inscatter += fogLocalLightInscatter(midpoint) * f.albedo;
+    inscatter += fogLocalLightInscatter(push, midpoint) * f.albedo;
     L += throughput * inscatter * (1.0 - transmittance);
     throughput *= transmittance;
 }
