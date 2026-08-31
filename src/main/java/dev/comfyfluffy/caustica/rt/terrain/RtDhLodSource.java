@@ -16,8 +16,22 @@ import org.slf4j.LoggerFactory;
  * Reads Distant Horizons' persistent terrain database and turns it into axis-aligned boxes that can be
  * meshed and put in the ray-tracing acceleration structure.
  *
- * <p>DH remains an optional dependency: all API access is reflected so Caustica still starts when DH is
- * absent or moves its API. DH supplies persistent terrain data; Caustica owns the ray-traced rendering.
+ * <h2>Why this exists</h2>
+ * Caustica builds every section from {@code level.getChunk(...)}, the client chunk cache. Beyond the
+ * server's view distance there is no block data in the process at all — so a Caustica-native LOD can
+ * reduce detail on loaded terrain, but it can never show terrain that was never sent. DH already solves
+ * that problem: it maintains a durable, generated, streamed world database far past the chunk cache.
+ *
+ * <h2>What this deliberately does NOT do</h2>
+ * It does not touch DH's renderer, intercept its draw calls, or read its GPU buffers. DH's rendering
+ * should be switched OFF when this is used. DH is a data source here and Caustica does all drawing, as
+ * rays. That avoids the whole class of problems that come from two world renderers coexisting, and it
+ * means this survives DH changing its rendering backend.
+ *
+ * <h2>Why reflection</h2>
+ * DH is optional. A hard compile-time dependency would make Caustica refuse to load without it, and
+ * would pin a DH version. Everything resolves lazily and degrades to "no LOD" if DH is absent or its
+ * public API moved.
  */
 public final class RtDhLodSource {
     private static final Logger LOGGER = LoggerFactory.getLogger("Caustica/DhLod");
@@ -28,14 +42,12 @@ public final class RtDhLodSource {
     private static State state = State.UNRESOLVED;
     private static Object terrainRepo;
     private static Object worldProxy;
-    private static Object softCache;
-
     private static Method getAllTerrainDataAtDetailLevelAndPos;
     private static Method createSoftCache;
     private static Method getSinglePlayerLevel;
     private static Method getAllLoadedLevelWrappers;
     private static Method worldLoaded;
-
+    private static Object softCache;
     private static Field resultPayload;
     private static Field resultSuccess;
     private static Field resultMessage;
@@ -64,14 +76,14 @@ public final class RtDhLodSource {
     }
 
     /**
- * Result of one DH terrain request. Successful queries may legitimately contain zero boxes;
- * failed/lifecycle queries are retryable and must never be cached as empty terrain.
- */
-public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
-    public FetchResult {
-        boxes = List.copyOf(boxes);
+     * Result of one DH terrain request. Successful queries may legitimately contain zero boxes;
+     * failed/lifecycle queries are retryable and must never be cached as empty terrain.
+     */
+    public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
+        public FetchResult {
+            boxes = List.copyOf(boxes);
+        }
     }
-}
 
     /**
      * True only when the reflected API is present AND DH says its world is actually loaded.
@@ -314,10 +326,6 @@ public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
         return boxes;
     }
 
-    /**
-     * Returns every currently loaded candidate wrapper instead of blindly using the first one.
-     * Multiplayer getSinglePlayerLevel() throws by design, so the iterable fallback is the normal path.
-     */
     private static List<Object> levelWrappers() throws ReflectiveOperationException {
         List<Object> wrappers = new ArrayList<>();
         try {
@@ -326,15 +334,10 @@ public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
                 wrappers.add(single);
             }
         } catch (java.lang.reflect.InvocationTargetException e) {
-            // Expected on multiplayer.
+            // IllegalStateException on multiplayer is expected; use the loaded set below.
         }
 
-        Object loaded;
-        try {
-            loaded = getAllLoadedLevelWrappers.invoke(worldProxy);
-        } catch (java.lang.reflect.InvocationTargetException e) {
-            return wrappers;
-        }
+        Object loaded = getAllLoadedLevelWrappers.invoke(worldProxy);
         if (loaded instanceof Iterable<?> iterable) {
             for (Object wrapper : iterable) {
                 if (wrapper != null && !containsIdentity(wrappers, wrapper)) {
@@ -345,16 +348,16 @@ public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
         return wrappers;
     }
 
-    private static boolean containsIdentity(List<Object> values, Object candidate) {
+    private static boolean containsIdentity(List<Object> values, Object needle) {
         for (Object value : values) {
-            if (value == candidate) {
+            if (value == needle) {
                 return true;
             }
         }
         return false;
     }
 
-    /** Forgets the resolved API. Call on world unload so a DH reload is picked up. */
+    /** Forgets the reflected API on world unload so DH can publish a fresh world/cache. */
     public static synchronized void invalidate() {
         if (state == State.READY) {
             state = State.UNRESOLVED;
@@ -364,15 +367,15 @@ public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
                 try {
                     closeable.close();
                 } catch (Exception ignored) {
-                    // DH's cache close does not normally throw.
+                    // DH's cache close is not expected to fail.
                 }
             }
             softCache = null;
-            loggedWorldNotReady.set(false);
-            loggedQueryFailure.set(false);
-            loggedQuerySuccess.set(false);
-            loggedNoLevel.set(false);
-            loggedMultipleLevels.set(false);
         }
+        loggedWorldNotReady.set(false);
+        loggedQueryFailure.set(false);
+        loggedQuerySuccess.set(false);
+        loggedNoLevel.set(false);
+        loggedMultipleLevels.set(false);
     }
 }
