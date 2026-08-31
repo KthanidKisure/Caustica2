@@ -752,6 +752,9 @@ public final class RtComposite {
                     new String[]{"sky.rmiss.spv", "guide.rmiss.spv"},
                     "closest_hit.rchit.spv", "any_hit.rahit.spv",
                     WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);
+            // Cloud noise is a descriptor owned by the world pipeline. Create/bind it only after the pipeline
+            // exists; recreating the pipeline simply rebinds the device-lifetime texture and sampler.
+            ensureCloudNoise(ctx);
             // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
             if (pushRing == null) {
                 pushRing = new PushSlot[PUSH_RING];
@@ -1017,9 +1020,6 @@ public final class RtComposite {
                 "ReSTIR reservoir B " + renderW + "x" + renderH);
         reservoirHistoryValid = false;
         reservoirParity = 0;
-        // Created alongside the other RT resources because this is where ctx is in scope; the method
-        // itself is idempotent, so a resize re-binds the existing texture rather than regenerating it.
-        ensureCloudNoise(ctx);
         // Zero both images at creation. The history-valid flag guards the frame AFTER a reallocation,
         // but it is a whole-frame switch and reservoir writes are per-pixel: a pixel the raygen never
         // reaches — sky, or any pixel whose primary ray found no emitter-lit surface — is never written,
@@ -1825,6 +1825,17 @@ public final class RtComposite {
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
+        }
+        if (cloudNoise != null) {
+            cloudNoise.destroy();
+            cloudNoise = null;
+        }
+        if (cloudNoiseSampler != 0L) {
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx != null) {
+                VK10.vkDestroySampler(ctx.vk(), cloudNoiseSampler, null);
+            }
+            cloudNoiseSampler = 0L;
         }
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
