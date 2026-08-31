@@ -25,149 +25,117 @@ jobs:
         run: |
           from pathlib import Path
 
-          def once(text, old, new, label):
+          def one(text, old, new, label):
               n = text.count(old)
               if n != 1:
                   raise SystemExit(f"{label}: expected 1 match, got {n}")
               return text.replace(old, new, 1)
 
-          # ---- RtDhLodSource: preserve the semantic difference between a failed API query
-          # and a successful query whose payload legitimately contains no solid terrain.
-          p = Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtDhLodSource.java")
-          s = p.read_text(encoding="utf-8")
+          source = Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtDhLodSource.java")
+          s = source.read_text(encoding="utf-8")
 
-          marker = '''    /**
-           * True only when the reflected API is present AND DH says its world is actually loaded.
-          '''
-          insert = '''    /**
-           * Result of one DH terrain request. Successful queries may legitimately contain zero boxes;
-           * failed/lifecycle queries are retryable and must never be cached as empty terrain.
-           */
-          public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
-              public FetchResult {
-                  boxes = List.copyOf(boxes);
-              }
-          }
-
-          '''
           if "record FetchResult" not in s:
-              s = once(s, marker, insert + marker, "insert FetchResult")
-
-          s = once(s,
-              "public static List<LodBox> fetchArea(int footprintBlocks, int originBlockX, int originBlockZ)",
-              "public static FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ)",
-              "fetchArea return type")
-          s = once(s,
-              "private static List<LodBox> fetchRegion(byte detailLevel, int posX, int posZ,",
-              "private static FetchResult fetchRegion(byte detailLevel, int posX, int posZ,",
-              "fetchRegion return type")
-
-          start = s.index("    private static FetchResult fetchRegion(")
-          end = s.index("    /** Walks the [x][z][column] array returned by DH. */", start)
-          region = s[start:end]
-          # In fetchRegion every bare List.of() return is an unsuccessful API/lifecycle result.
-          # A successful-but-empty response returns successfulEmpty instead.
-          n_empty = region.count("return List.of();")
-          if n_empty < 3:
-              raise SystemExit(f"fetchRegion failure returns: expected >=3, got {n_empty}")
-          region = region.replace("return List.of();", "return new FetchResult(List.of(), false);")
-          region = once(region, "return boxes;", "return new FetchResult(boxes, true);", "non-empty success")
-          region = once(region, "return successfulEmpty;", "return new FetchResult(successfulEmpty, true);", "empty success")
-          s = s[:start] + region + s[end:]
-          p.write_text(s, encoding="utf-8")
-
-          # ---- RtTerrain: transient source failures get their own completion queue and a short
-          # global backoff. Only successful empty queries continue to use the 600-frame region cache.
-          p = Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtTerrain.java")
-          t = p.read_text(encoding="utf-8")
-
-          old = '''    /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
-          private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
-          /** Render-frame deadline before an empty/failed DH region may be queried again. Render-thread only. */
-          private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
-          private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
-          '''
-          new = '''    /** Keys whose dispatch ended after a successful query with no geometry, or a build failure. */
-          private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
-          /** Failed DH API/lifecycle queries: retry soon; never poison the long empty-region cache. */
-          private final List<Long> lodRetrySoon = java.util.Collections.synchronizedList(new ArrayList<>());
-          /** Render-frame deadline before a genuinely empty/failed built region may be queried again. */
-          private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
-          private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
-          private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;
-          private long lodSourceRetryAfterNanos;
-          '''
-          t = once(t, old, new, "transient fields")
-
-          old = '''        publishLodPrepared(ctx, pbx, pby, pbz);
-
-          int detail = CausticaConfig.Rt.Lod.DETAIL.value();
-          '''
-          new = '''        publishLodPrepared(ctx, pbx, pby, pbz);
-          if (System.nanoTime() < lodSourceRetryAfterNanos) {
-              return;
-          }
-
-          int detail = CausticaConfig.Rt.Lod.DETAIL.value();
-          '''
-          t = once(t, old, new, "source backoff gate")
-
-          old = '''                RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
-                      java.util.List<RtDhLodSource.LodBox> boxes =
-                              RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
-                      region.fill(boxes);
-                      lodBoxesSeen.addAndGet(boxes.size());
-          '''
-          new = '''                RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
-                      RtDhLodSource.FetchResult fetched = RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
-                      if (!fetched.querySucceeded()) {
-                          finishLodRetrySoon(key);
-                          return;
-                      }
-                      java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();
-                      region.fill(boxes);
-                      lodBoxesSeen.addAndGet(boxes.size());
-          '''
-          t = once(t, old, new, "worker fetch handling")
-
-          marker = '''    /** Publishes finished LOD sections into the shared section table. */
-          private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
-          '''
-          insert = '''    private void finishLodRetrySoon(long key) {
-              lodRetrySoon.add(key);
-              finishActiveTask();
-          }
-
-          '''
-          t = once(t, marker, insert + marker, "retry-soon completion method")
-
-          old = '''    private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
-              // Retire failed keys first so they become eligible for redispatch. Done here, on the render
-          '''
-          new = '''    private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
-              // A rejected DH API call means the source/world lifecycle is not ready. Do not classify it
-              // as empty terrain: release those keys and back off globally so HUB/INTERIM cannot burn
-              // through the whole ring before Wynncraft reaches its real WORLD state.
-              if (!lodRetrySoon.isEmpty()) {
-                  List<Long> retrySoon;
-                  synchronized (lodRetrySoon) {
-                      retrySoon = new ArrayList<>(lodRetrySoon);
-                      lodRetrySoon.clear();
+              phrase = "True only when the reflected API is present AND DH says its world is actually loaded."
+              at = s.index(phrase)
+              comment = s.rfind("/**", 0, at)
+              if comment < 0:
+                  raise SystemExit("available javadoc start not found")
+              insert = """    /**
+               * Result of one DH terrain request. Successful queries may legitimately contain zero boxes;
+               * failed/lifecycle queries are retryable and must never be cached as empty terrain.
+               */
+              public record FetchResult(List<LodBox> boxes, boolean querySucceeded) {
+                  public FetchResult {
+                      boxes = List.copyOf(boxes);
                   }
-                  for (Long key : retrySoon) {
-                      lodInFlight.remove(key.longValue());
-                  }
-                  lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
-                  CausticaMod.LOGGER.info(
-                          "LOD: DH source not query-ready; retrying in 1 second ({} regions deferred)",
-                          retrySoon.size());
               }
 
-              // Retire failed keys first so they become eligible for redispatch. Done here, on the render
-          '''
-          t = once(t, old, new, "render-thread retry handling")
+          """
+              # rfind points at '/**'; preserve the existing indentation before it.
+              line_start = s.rfind("\n", 0, comment) + 1
+              s = s[:line_start] + insert + s[line_start:]
 
-          p.write_text(t, encoding="utf-8")
+          s = one(s,
+                  "public static List<LodBox> fetchArea(int footprintBlocks, int originBlockX, int originBlockZ)",
+                  "public static FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ)",
+                  "fetchArea return type")
+          s = one(s,
+                  "private static List<LodBox> fetchRegion(byte detailLevel, int posX, int posZ,",
+                  "private static FetchResult fetchRegion(byte detailLevel, int posX, int posZ,",
+                  "fetchRegion return type")
+
+          start = s.index("private static FetchResult fetchRegion(")
+          end = s.index("/** Walks the [x][z][column] array returned by DH. */", start)
+          region = s[start:end]
+          failures = region.count("return List.of();")
+          if failures < 3:
+              raise SystemExit(f"fetchRegion failure returns: expected >=3, got {failures}")
+          region = region.replace("return List.of();", "return new FetchResult(List.of(), false);")
+          region = one(region, "return boxes;", "return new FetchResult(boxes, true);", "non-empty success")
+          region = one(region, "return successfulEmpty;", "return new FetchResult(successfulEmpty, true);", "empty success")
+          s = s[:start] + region + s[end:]
+          source.write_text(s, encoding="utf-8")
+
+          terrain = Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtTerrain.java")
+          t = terrain.read_text(encoding="utf-8")
+
+          failed_line = "private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());"
+          if "lodRetrySoon" not in t:
+              at = t.index(failed_line) + len(failed_line)
+              t = t[:at] + "\n    /** Failed DH API/lifecycle queries: retry soon; never poison the long empty-region cache. */\n    private final List<Long> lodRetrySoon = java.util.Collections.synchronizedList(new ArrayList<>());" + t[at:]
+
+          cooldown = "private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;"
+          if "LOD_TRANSIENT_RETRY_NANOS" not in t:
+              at = t.index(cooldown) + len(cooldown)
+              t = t[:at] + "\n    private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;\n    private long lodSourceRetryAfterNanos;" + t[at:]
+
+          if "System.nanoTime() < lodSourceRetryAfterNanos" not in t:
+              old = "publishLodPrepared(ctx, pbx, pby, pbz);\n\n        int detail = CausticaConfig.Rt.Lod.DETAIL.value();"
+              new = "publishLodPrepared(ctx, pbx, pby, pbz);\n        if (System.nanoTime() < lodSourceRetryAfterNanos) {\n            return;\n        }\n\n        int detail = CausticaConfig.Rt.Lod.DETAIL.value();"
+              t = one(t, old, new, "source backoff gate")
+
+          if "RtDhLodSource.FetchResult fetched" not in t:
+              old = "java.util.List<RtDhLodSource.LodBox> boxes =\n                        RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);"
+              new = "RtDhLodSource.FetchResult fetched = RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);\n                if (!fetched.querySucceeded()) {\n                    finishLodRetrySoon(key);\n                    return;\n                }\n                java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();"
+              t = one(t, old, new, "worker fetch handling")
+
+          if "private void finishLodRetrySoon(long key)" not in t:
+              phrase = "/** Publishes finished LOD sections into the shared section table. */"
+              at = t.index(phrase)
+              line_start = t.rfind("\n", 0, at) + 1
+              insert = """    private void finishLodRetrySoon(long key) {
+                  lodRetrySoon.add(key);
+                  finishActiveTask();
+              }
+
+          """
+              t = t[:line_start] + insert + t[line_start:]
+
+          if "DH source not query-ready; retrying in 1 second" not in t:
+              signature = "private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {"
+              at = t.index(signature) + len(signature)
+              insert = """
+                  // A rejected DH API call means the source/world lifecycle is not ready. Do not classify it
+                  // as empty terrain: release those keys and back off globally so HUB/INTERIM cannot burn
+                  // through the whole ring before Wynncraft reaches its real WORLD state.
+                  if (!lodRetrySoon.isEmpty()) {
+                      List<Long> retrySoon;
+                      synchronized (lodRetrySoon) {
+                          retrySoon = new ArrayList<>(lodRetrySoon);
+                          lodRetrySoon.clear();
+                      }
+                      for (Long key : retrySoon) {
+                          lodInFlight.remove(key.longValue());
+                      }
+                      lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
+                      CausticaMod.LOGGER.info(
+                              "LOD: DH source not query-ready; retrying in 1 second ({} regions deferred)",
+                              retrySoon.size());
+                  }
+          """
+              t = t[:at] + insert + t[at:]
+
+          terrain.write_text(t, encoding="utf-8")
 
       - name: Commit hotfix
         shell: bash
