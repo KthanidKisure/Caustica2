@@ -429,11 +429,13 @@ public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, flo
     }
     CloudResult high = marchCloudLayer(highParams, state, origin, direction, tint709, tintStrength);
 
-    float lowNear, lowFar, highNear, highFar;
-    bool lowHit = cloudsActive(c) && cloudSlabRange(c, origin, direction, lowNear, lowFar);
-    bool highHit = cloudSlabRange(highParams, origin, direction, highNear, highFar);
-    if (!lowHit) return high;
-    if (!highHit) return low;
+    // Keep slab outputs on paths where Slang can prove they were assigned. This is equivalent to
+    // the old short-circuit form, but avoids reading an out value whose producer may have been skipped.
+    if (!cloudsActive(c)) return high;
+    float lowNear, lowFar;
+    if (!cloudSlabRange(c, origin, direction, lowNear, lowFar)) return high;
+    float highNear, highFar;
+    if (!cloudSlabRange(highParams, origin, direction, highNear, highFar)) return low;
 
     CloudResult result;
     if (lowNear <= highNear) {
