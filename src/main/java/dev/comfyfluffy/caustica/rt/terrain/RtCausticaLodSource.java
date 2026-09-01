@@ -60,7 +60,9 @@ public final class RtCausticaLodSource {
 
     private static final RtLodTileCache<SurfaceTile> MEMORY = new RtLodTileCache<>(8192);
     private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);
-    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never\n    // collide with or publish into the current session after a proxy/world transition.\n    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
+    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never
+    // collide with or publish into the current session after a proxy/world transition.
+    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
     private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "caustica-lod-io");
         thread.setDaemon(true);
