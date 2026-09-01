@@ -60,7 +60,7 @@ public final class RtCausticaLodSource {
 
     private static final RtLodTileCache<SurfaceTile> MEMORY = new RtLodTileCache<>(8192);
     private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);
-    private static final ConcurrentHashMap<Long, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
+    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never\n    // collide with or publish into the current session after a proxy/world transition.\n    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
     private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "caustica-lod-io");
         thread.setDaemon(true);
@@ -145,7 +145,8 @@ public final class RtCausticaLodSource {
                 continue;
             }
             MEMORY.put(key, tile);
-            KNOWN_ON_DISK.put(key, Boolean.TRUE);
+            // Do not claim persistence until the atomic file move succeeds. MEMORY already prevents
+            // duplicate capture while the write is queued.
             CAPTURED_TILES.incrementAndGet();
             scheduleWrite(tile);
             captured++;
@@ -244,7 +245,6 @@ public final class RtCausticaLodSource {
     public static synchronized void invalidate() {
         MEMORY.clear();
         KNOWN_ON_DISK.clear();
-        WRITE_PENDING.clear();
         sessionIdentity = "";
         sessionRoot = null;
         scanCursor = 0;
@@ -262,7 +262,6 @@ public final class RtCausticaLodSource {
 
         MEMORY.clear();
         KNOWN_ON_DISK.clear();
-        WRITE_PENDING.clear();
         sessionIdentity = identity;
         scanCursor = 0;
         sessionRoot = FabricLoader.getInstance().getGameDir()
@@ -438,27 +437,35 @@ public final class RtCausticaLodSource {
     }
 
     private static void scheduleWrite(SurfaceTile tile) {
-        long key = chunkKey(tile.chunkX, tile.chunkZ);
-        if (WRITE_PENDING.putIfAbsent(key, Boolean.TRUE) != null) {
-            return;
-        }
-        IO.execute(() -> {
-            try {
-                writeTile(tile);
-                // Once the live override is atomically visible, evict any imported copy cached by the
-                // packed source so the next distant query immediately observes the visited terrain.
-                RtCausticaLodPackedSource.invalidateTile(tile.chunkX, tile.chunkZ);
-            } finally {
-                WRITE_PENDING.remove(key);
-            }
-        });
-    }
-
-    private static void writeTile(SurfaceTile tile) {
         Path target = tilePath(tile.chunkX, tile.chunkZ);
         if (target == null) {
             return;
         }
+        Path capturedRoot = target.getParent();
+        long key = chunkKey(tile.chunkX, tile.chunkZ);
+        if (WRITE_PENDING.putIfAbsent(target, Boolean.TRUE) != null) {
+            return;
+        }
+        IO.execute(() -> {
+            try {
+                if (writeTile(tile, target)) {
+                    // The disk write belongs permanently to capturedRoot. Only mutate the hot caches if
+                    // that same session is still current (or became current again) when IO completes.
+                    Path currentRoot = sessionRoot;
+                    if (capturedRoot.equals(currentRoot)) {
+                        KNOWN_ON_DISK.put(key, Boolean.TRUE);
+                        // Once the live override is atomically visible, evict any imported copy cached by
+                        // the packed source so the next distant query observes the visited terrain.
+                        RtCausticaLodPackedSource.invalidateTile(tile.chunkX, tile.chunkZ);
+                    }
+                }
+            } finally {
+                WRITE_PENDING.remove(target);
+            }
+        });
+    }
+
+    private static boolean writeTile(SurfaceTile tile, Path target) {
         Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
         try {
             Files.createDirectories(target.getParent());
@@ -481,12 +488,14 @@ public final class RtCausticaLodSource {
             } catch (IOException atomicUnsupported) {
                 Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
             }
+            return true;
         } catch (IOException e) {
             CausticaMod.LOGGER.debug("CausticaLOD tile write failed for {},{}: {}", tile.chunkX, tile.chunkZ, e.toString());
             try {
                 Files.deleteIfExists(tmp);
             } catch (IOException ignored) {
             }
+            return false;
         }
     }
 
