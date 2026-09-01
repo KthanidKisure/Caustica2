@@ -1,0 +1,35 @@
+name: Caustica importer fix
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-import-fix.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Fix importer mapping array
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java')
+          s = p.read_text()
+          old = '''        BlockState[] states = new BlockState[maxId[0] + 1];\n        decoded.forEach((id, state) -> states[id] = state);\n        if (states.length == 0) {\n            states = new BlockState[]{Blocks.AIR.defaultBlockState()};\n        } else {\n            states[0] = Blocks.AIR.defaultBlockState();\n        }'''
+          new = '''        BlockState[] states = new BlockState[Math.max(1, maxId[0] + 1)];\n        decoded.forEach((id, state) -> states[id] = state);\n        states[0] = Blocks.AIR.defaultBlockState();'''
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java
+          git commit -m "Fix WynnLOD block mapping allocation"
+          git push origin HEAD:codex/claude-pass
