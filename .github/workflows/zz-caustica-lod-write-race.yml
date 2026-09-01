@@ -1,4 +1,4 @@
-name: CausticaLOD write race fix
+name: CausticaLOD write race fixup
 
 on:
   push:
@@ -16,39 +16,22 @@ jobs:
         with:
           ref: codex/claude-pass
           fetch-depth: 0
-      - name: Bind async LOD writes to their capture session
+      - name: Fix literal newline escape in Java source
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java')
           s = p.read_text()
-
-          s = s.replace(
-              '    private static final ConcurrentHashMap<Long, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();',
-              '    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never\\n'
-              '    // collide with or publish into the current session after a proxy/world transition.\\n'
-              '    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();', 1)
-
-          old_capture = '''            MEMORY.put(key, tile);\n            KNOWN_ON_DISK.put(key, Boolean.TRUE);\n            CAPTURED_TILES.incrementAndGet();\n            scheduleWrite(tile);'''
-          new_capture = '''            MEMORY.put(key, tile);\n            // Do not claim persistence until the atomic file move succeeds. MEMORY already prevents\n            // duplicate capture while the write is queued.\n            CAPTURED_TILES.incrementAndGet();\n            scheduleWrite(tile);'''
-          assert old_capture in s
-          s = s.replace(old_capture, new_capture, 1)
-
-          # In-flight writes are path/session-bound and should survive an in-memory session reset.
-          s = s.replace('        WRITE_PENDING.clear();\n        sessionIdentity = "";',
-                        '        sessionIdentity = "";', 1)
-          s = s.replace('        WRITE_PENDING.clear();\n        sessionIdentity = identity;',
-                        '        sessionIdentity = identity;', 1)
-
-          start = s.index('    private static void scheduleWrite(SurfaceTile tile) {')
-          end = s.index('    private static SurfaceTile readTile(', start)
-          replacement = '''    private static void scheduleWrite(SurfaceTile tile) {\n        Path target = tilePath(tile.chunkX, tile.chunkZ);\n        if (target == null) {\n            return;\n        }\n        Path capturedRoot = target.getParent();\n        long key = chunkKey(tile.chunkX, tile.chunkZ);\n        if (WRITE_PENDING.putIfAbsent(target, Boolean.TRUE) != null) {\n            return;\n        }\n        IO.execute(() -> {\n            try {\n                if (writeTile(tile, target)) {\n                    // The disk write belongs permanently to capturedRoot. Only mutate the hot caches if\n                    // that same session is still current (or became current again) when IO completes.\n                    Path currentRoot = sessionRoot;\n                    if (capturedRoot.equals(currentRoot)) {\n                        KNOWN_ON_DISK.put(key, Boolean.TRUE);\n                        // Once the live override is atomically visible, evict any imported copy cached by\n                        // the packed source so the next distant query observes the visited terrain.\n                        RtCausticaLodPackedSource.invalidateTile(tile.chunkX, tile.chunkZ);\n                    }\n                }\n            } finally {\n                WRITE_PENDING.remove(target);\n            }\n        });\n    }\n\n    private static boolean writeTile(SurfaceTile tile, Path target) {\n        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");\n        try {\n            Files.createDirectories(target.getParent());\n            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(\n                    new DeflaterOutputStream(Files.newOutputStream(tmp))))) {\n                out.writeInt(MAGIC);\n                out.writeInt(VERSION);\n                out.writeInt(tile.chunkX);\n                out.writeInt(tile.chunkZ);\n                for (int i = 0; i < TILE_COLUMNS; i++) {\n                    out.writeShort(tile.groundY[i]);\n                    out.writeShort(tile.surfaceY[i]);\n                    out.writeInt(tile.groundStateId[i]);\n                    out.writeInt(tile.bodyStateId[i]);\n                    out.writeInt(tile.surfaceStateId[i]);\n                }\n            }\n            try {\n                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);\n            } catch (IOException atomicUnsupported) {\n                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);\n            }\n            return true;\n        } catch (IOException e) {\n            CausticaMod.LOGGER.debug("CausticaLOD tile write failed for {},{}: {}", tile.chunkX, tile.chunkZ, e.toString());\n            try {\n                Files.deleteIfExists(tmp);\n            } catch (IOException ignored) {\n            }\n            return false;\n        }\n    }\n\n'''
-          s = s[:start] + replacement + s[end:]
-          p.write_text(s)
+          old = '    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never\\n    // collide with or publish into the current session after a proxy/world transition.\\n    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();'
+          new = '''    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never
+    // collide with or publish into the current session after a proxy/world transition.
+    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();'''
+          assert old in s, 'expected literal-newline write-race comment not found'
+          p.write_text(s.replace(old, new, 1))
           PY
           git config user.name "Caustica CI patch"
           git config user.email "actions@users.noreply.github.com"
           git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java
-          git commit -m "Make native LOD writes session-safe"
+          git commit -m "Fix native LOD write-race declaration"
           git push origin HEAD:codex/claude-pass
