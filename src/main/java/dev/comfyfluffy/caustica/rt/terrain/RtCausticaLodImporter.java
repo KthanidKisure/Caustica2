@@ -84,7 +84,7 @@ final class RtCausticaLodImporter {
     private static final String WYNNLOD_SHA256 =
             "2b494667869473c0133cc3de7c25b9b41b52382b1de79c7e79068139aad3f725";
 
-    private static final String ROCKS_VERSION = "10.2.1";
+    private static final String ROCKS_VERSION = "10.10.1.1";
     private static final String AIRCOMPRESSOR_VERSION = "3.6";
     private static final int VOXY_SECTION_EDGE = 32;
     private static final int VOXY_SECTION_VOLUME = VOXY_SECTION_EDGE * VOXY_SECTION_EDGE * VOXY_SECTION_EDGE;
@@ -540,10 +540,10 @@ final class RtCausticaLodImporter {
                 tools.resolve(name));
     }
 
-    /** Maven Central publishes SHA-1 sidecars; verify them before loading a downloaded converter JAR. */
+    /** Verify Maven Central SHA-256 sidecars before loading a downloaded converter JAR. */
     private static Path ensureMavenJar(String url, Path target) throws Exception {
-        String expected = downloadText(URI.create(url + ".sha1")).trim().split("\\s+")[0].toLowerCase(Locale.ROOT);
-        ensureDownload(URI.create(url), target, "SHA-1", expected);
+        String expected = downloadText(URI.create(url + ".sha256")).trim().split("\\s+")[0].toLowerCase(Locale.ROOT);
+        ensureDownload(URI.create(url), target, "SHA-256", expected);
         return target;
     }
 
