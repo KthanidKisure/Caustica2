@@ -1,4 +1,4 @@
-name: CausticaLOD write race fixup
+name: CausticaLOD generation safety
 
 on:
   push:
@@ -16,12 +16,12 @@ jobs:
         with:
           ref: codex/claude-pass
           fetch-depth: 0
-      - name: Fix literal newline escape in Java source
-        shell: bash
+      - name: Apply native LOD generation ownership patch
+        run: python3 .github/zz_patch_lod_generation.py
+      - name: Commit source patch
         run: |
-          python3 -c 'from pathlib import Path; p=Path("src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java"); s=p.read_text(); old="    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never\\n    // collide with or publish into the current session after a proxy/world transition.\\n    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();"; new="    // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never\n    // collide with or publish into the current session after a proxy/world transition.\n    private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();"; assert old in s; p.write_text(s.replace(old,new,1))'
           git config user.name "Caustica CI patch"
           git config user.email "actions@users.noreply.github.com"
-          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java
-          git commit -m "Fix native LOD write-race declaration"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtTerrain.java
+          git commit -m "Make native LOD async completions generation-safe"
           git push origin HEAD:codex/claude-pass
