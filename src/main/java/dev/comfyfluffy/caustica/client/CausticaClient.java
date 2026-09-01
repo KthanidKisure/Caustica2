@@ -9,6 +9,7 @@ import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.terrain.RtDhLevelBootstrap;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
@@ -38,6 +39,11 @@ public final class CausticaClient implements ClientModInitializer {
 				}
 				return;
 			}
+
+			// DH 3.2 can publish its world object before it creates the current IDhLevel, especially on
+			// proxy-heavy multiplayer joins. Ask DH to run its own level creation path on the client thread
+			// before any RT worker attempts persistent LOD database reads.
+			RtDhLevelBootstrap.tick();
 
 			// Bring up the RT device/context once; terrain residency + the composite follow below.
 			if (!rtInitDone && RtDeviceBringup.rtRequested()) {
@@ -73,6 +79,7 @@ public final class CausticaClient implements ClientModInitializer {
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
+			RtDhLevelBootstrap.invalidate();
 			RtComposite.INSTANCE.resetExposureHistory();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
 		});
@@ -85,6 +92,7 @@ public final class CausticaClient implements ClientModInitializer {
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
+		RtDhLevelBootstrap.invalidate();
 		if (!rtInitDone) {
 			RtWorkerPool.INSTANCE.shutdown();
 			return;
