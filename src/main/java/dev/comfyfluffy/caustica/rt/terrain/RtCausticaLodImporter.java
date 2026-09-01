@@ -310,7 +310,7 @@ final class RtCausticaLodImporter {
                     0,
                     SharedConstants.getCurrentVersion().dataVersion().version());
             try {
-                return BlockState.CODEC.parse(NbtOps.INSTANCE, updated.getValue()).getOrThrow();
+                return BlockState.CODEC.parse(NbtOps.INSTANCE, (net.minecraft.nbt.Tag) updated.getValue()).getOrThrow();
             } catch (RuntimeException failed) {
                 failed.addSuppressed(original);
                 throw failed;

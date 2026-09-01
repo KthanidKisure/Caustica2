@@ -60,6 +60,7 @@ public final class RtGpuExecutor {
     private long submittedBuildValue;
     private final Thread thread;
     private long commandPool;
+    private VkCommandBuffer commandBuffer;
     private volatile boolean closed;
     private volatile Throwable executorFailure;
 
@@ -69,6 +70,7 @@ public final class RtGpuExecutor {
         this.buildTimeline = createTimeline("RT terrain build timeline");
         this.graphicsTimeline = createTimeline("RT graphics-use timeline");
         createCommandPool();
+        this.commandBuffer = allocateCommandBuffer();
         this.thread = new Thread(this::run, "Caustica GPU executor");
         this.thread.setDaemon(true);
         this.thread.start();
@@ -222,6 +224,9 @@ public final class RtGpuExecutor {
         } catch (Throwable t) {
             failure = t;
         }
+        // The pool owns every primary CB, including any abandoned after a failed submitted batch.
+        // The executor is joined and the device is idle here, so pool destruction is sufficient.
+        commandBuffer = null;
         VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);
         commandPool = 0L;
         VK10.vkDestroySemaphore(ctx.vk(), graphicsTimeline, null);
@@ -383,7 +388,11 @@ public final class RtGpuExecutor {
     }
 
     private void execute(List<Job> batch) {
-        VkCommandBuffer cmd = null;
+        VkCommandBuffer cmd = commandBuffer;
+        if (cmd == null) {
+            cmd = allocateCommandBuffer();
+            commandBuffer = cmd;
+        }
         boolean submitted = false;
         boolean completed = false;
         long signalValue = batch.get(batch.size() - 1).build.value;
@@ -392,11 +401,7 @@ public final class RtGpuExecutor {
                 "recording builds=" + firstValue + ".." + signalValue + " batch=" + batch.size()
                         + " queued=" + jobs.size());
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
-                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
-            PointerBuffer pCmd = stack.mallocPointer(1);
-            RtContext.check(VK10.vkAllocateCommandBuffers(ctx.vk(), ai, pCmd), "vkAllocateCommandBuffers(RT GPU executor)");
-            cmd = new VkCommandBuffer(pCmd.get(0), ctx.vk());
+            RtContext.check(VK10.vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer(RT GPU executor)");
             VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
             RtContext.check(VK10.vkBeginCommandBuffer(cmd, bi), "vkBeginCommandBuffer(RT GPU executor)");
@@ -430,13 +435,10 @@ public final class RtGpuExecutor {
             completed = true;
             VulkanDiagnostics.breadcrumb("async-compute completed buildTimeline=" + signalValue);
         } finally {
-            // Never retry a failed host wait while unwinding: propagate its original error. A command
-            // buffer is safe to release here only if submission never happened or completion was observed.
-            // Otherwise the command pool owns it until shutdown waits the device idle and destroys the pool.
-            if (cmd != null && (!submitted || completed)) {
-                try (MemoryStack stack = MemoryStack.stackPush()) {
-                    VK10.vkFreeCommandBuffers(ctx.vk(), commandPool, stack.pointers(cmd));
-                }
+            // Completed batches can safely reset/reuse the same primary command buffer. If submission
+            // happened but completion was not observed, leave that CB pool-owned until idle teardown.
+            if (submitted && !completed && commandBuffer == cmd) {
+                commandBuffer = null;
             }
             if (!submitted || completed) {
                 VulkanDiagnostics.setInFlight("async-compute", null);
@@ -460,12 +462,23 @@ public final class RtGpuExecutor {
     private void createCommandPool() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandPoolCreateInfo ci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()
-                    .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)
+                    .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
                     .queueFamilyIndex(computeQueue.queueFamilyIndex());
             LongBuffer out = stack.mallocLong(1);
             RtContext.check(VK10.vkCreateCommandPool(ctx.vk(), ci, null, out), "vkCreateCommandPool(RT GPU executor)");
             commandPool = out.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "RT GPU executor command pool");
+        }
+    }
+
+    private VkCommandBuffer allocateCommandBuffer() {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
+                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
+            PointerBuffer out = stack.mallocPointer(1);
+            RtContext.check(VK10.vkAllocateCommandBuffers(ctx.vk(), ai, out),
+                    "vkAllocateCommandBuffers(RT GPU executor)");
+            return new VkCommandBuffer(out.get(0), ctx.vk());
         }
     }
 
