@@ -1,0 +1,50 @@
+name: CausticaLOD sample grid
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-lod-sample-grid.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Reuse representative surface samples per LOD page
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          base = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain')
+          for filename in ('RtCausticaLodSource.java', 'RtCausticaLodPackedSource.java'):
+              p = base / filename
+              s = p.read_text()
+              marker = '        int scale = Math.max(1, footprintBlocks / RtDhLodRegion.SECTION_BLOCKS);\n'
+              assert marker in s
+              s = s.replace(marker, marker + '        SurfaceColumn[] surfaceGrid = sampleSurfaceGrid(originBlockX, originBlockZ, scale);\n', 1)
+              old = '                SurfaceColumn column = representativeColumn(cellX, cellZ, scale);\n'
+              new = '                SurfaceColumn column = surfaceGrid[gridIndex(vx + 1, vz + 1)];\n'
+              assert old in s
+              s = s.replace(old, new, 1)
+              old = '                int skirtBottom = skirtBottom(cellX, cellZ, scale, groundY);\n'
+              new = '                int skirtBottom = skirtBottom(surfaceGrid, vx + 1, vz + 1, groundY);\n'
+              assert old in s
+              s = s.replace(old, new, 1)
+
+              start = s.index('    /**\n     * Lowest neighboring surface needed to close this cell\'s visible vertical boundary.')
+              end = s.index('    private static SurfaceColumn representativeColumn', start)
+              helper = '''    /** Pre-sample the page plus a one-cell border so cliff skirts reuse exactly the same data. */\n    private static SurfaceColumn[] sampleSurfaceGrid(int originBlockX, int originBlockZ, int scale) {\n        int edge = RtDhLodRegion.SECTION_BLOCKS + 2;\n        SurfaceColumn[] grid = new SurfaceColumn[edge * edge];\n        for (int gx = -1; gx <= RtDhLodRegion.SECTION_BLOCKS; gx++) {\n            int x = originBlockX + gx * scale;\n            for (int gz = -1; gz <= RtDhLodRegion.SECTION_BLOCKS; gz++) {\n                int z = originBlockZ + gz * scale;\n                grid[gridIndex(gx + 1, gz + 1)] = representativeColumn(x, z, scale);\n            }\n        }\n        return grid;\n    }\n\n    private static int gridIndex(int x, int z) {\n        return x * (RtDhLodRegion.SECTION_BLOCKS + 2) + z;\n    }\n\n    private static int skirtBottom(SurfaceColumn[] grid, int gx, int gz, int groundY) {\n        int bottom = groundY;\n        int[] indices = {\n                gridIndex(gx - 1, gz),\n                gridIndex(gx + 1, gz),\n                gridIndex(gx, gz - 1),\n                gridIndex(gx, gz + 1),\n        };\n        for (int index : indices) {\n            SurfaceColumn neighbor = grid[index];\n            if (neighbor != null && neighbor.groundY != NO_HEIGHT) {\n                bottom = Math.min(bottom, neighbor.groundY);\n            }\n        }\n        return bottom;\n    }\n\n'''
+              s = s[:start] + helper + s[end:]
+              p.write_text(s)
+          PY
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java
+          git commit -m "Reuse CausticaLOD surface samples per page"
+          git push origin HEAD:codex/claude-pass
