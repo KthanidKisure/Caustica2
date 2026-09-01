@@ -1,0 +1,48 @@
+name: CausticaLOD adaptive surface skirts
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-surface-skirts.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Replace filled columns with surface skirts
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for name in ['RtCausticaLodSource.java', 'RtCausticaLodPackedSource.java']:
+              p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain') / name
+              s = p.read_text()
+              if name == 'RtCausticaLodSource.java':
+                  old = '''                // A filled column body gives cliffs and mountain silhouettes without storing caves or\n                // internal blocks. Adjacent virtual cells cull the interior faces in the ordinary mesher.\n                if (groundY > worldMinY) {\n                    boxes.add(new LodBox(cellX, worldMinY, groundY, cellZ, scale, body, 0, 15));\n                }\n                boxes.add(new LodBox(cellX, groundY, groundY + 1, cellZ, scale, ground, 0, 15));'''
+                  new = '''                // Store only the exterior height-field shell. The vertical skirt reaches only as low\n                // as an adjacent sampled surface, which closes visible cliffs without inventing a solid\n                // pillar down to world minimum under every distant roof, island, hill and plateau.\n                int skirtBottom = skirtBottom(cellX, cellZ, scale, groundY);\n                if (skirtBottom < groundY) {\n                    boxes.add(new LodBox(cellX, skirtBottom, groundY, cellZ, scale, body, 0, 15));\n                }\n                boxes.add(new LodBox(cellX, groundY, groundY + 1, cellZ, scale, ground, 0, 15));'''
+              else:
+                  old = '''                if (groundY > minY) {\n                    boxes.add(new RtCausticaLodSource.LodBox(cellX, minY, groundY, cellZ, scale, body, 0, 15));\n                }\n                boxes.add(new RtCausticaLodSource.LodBox(cellX, groundY, groundY + 1, cellZ, scale, ground, 0, 15));'''
+                  new = '''                int skirtBottom = skirtBottom(cellX, cellZ, scale, groundY);\n                if (skirtBottom < groundY) {\n                    boxes.add(new RtCausticaLodSource.LodBox(\n                            cellX, skirtBottom, groundY, cellZ, scale, body, 0, 15));\n                }\n                boxes.add(new RtCausticaLodSource.LodBox(cellX, groundY, groundY + 1, cellZ, scale, ground, 0, 15));'''
+              assert old in s, f'body emission site changed in {name}'
+              s = s.replace(old, new, 1)
+
+              anchor = '''    private static SurfaceColumn representativeColumn(int cellX, int cellZ, int scale) {'''
+              helper = '''    /**\n     * Lowest neighboring surface needed to close this cell's visible vertical boundary. Higher\n     * neighbors do not increase the skirt. Unknown neighbors are ignored so partial live caches do\n     * not fabricate walls at the edge of data that has not arrived yet.\n     */\n    private static int skirtBottom(int cellX, int cellZ, int scale, int groundY) {\n        int bottom = groundY;\n        int[][] offsets = {\n                {-scale, 0},\n                {scale, 0},\n                {0, -scale},\n                {0, scale},\n        };\n        for (int[] offset : offsets) {\n            SurfaceColumn neighbor = representativeColumn(cellX + offset[0], cellZ + offset[1], scale);\n            if (neighbor != null && neighbor.groundY != NO_HEIGHT) {\n                bottom = Math.min(bottom, neighbor.groundY);\n            }\n        }\n        return bottom;\n    }\n\n'''
+              assert anchor in s
+              s = s.replace(anchor, helper + anchor, 1)
+              p.write_text(s)
+          PY
+
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java
+          git commit -m "Use adaptive surface skirts for distant terrain"
+          git push origin HEAD:codex/claude-pass
