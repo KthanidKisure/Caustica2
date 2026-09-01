@@ -1,6 +1,7 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
 import com.mojang.serialization.Dynamic;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import net.fabricmc.loader.api.FabricLoader;
@@ -21,6 +22,9 @@ import net.minecraft.world.level.block.state.BlockState;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
@@ -39,6 +43,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -46,6 +51,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -65,11 +71,12 @@ import java.util.zip.ZipInputStream;
  * Distant Horizons classes. The two small conversion libraries are isolated in a temporary child class
  * loader and are used only while an import is running.</p>
  *
- * <p>On Wynncraft, an existing {@code .voxy/saves/<server>} dataset is preferred. If none exists,
- * Caustica downloads the official WynnLOD Voxy archive, verifies its release SHA-256, converts it, then
- * deletes the extracted staging tree and archive. The conversion runs on a minimum-priority daemon
- * thread and publishes every region atomically, so it cannot stall the render thread or expose a
- * half-written region file.</p>
+ * <p>On Wynncraft, Caustica downloads the official WynnLOD Voxy archive, verifies its release SHA-256,
+ * converts it, then deletes the extracted staging tree and archive. The converter is deliberately
+ * bounded-memory: it indexes only horizontal section coordinates, point-reads one vertical column at a
+ * time, and spills finished surface tiles into small per-region staging files. It never keeps the whole
+ * Wynncraft surface in the Minecraft heap. The conversion runs on a minimum-priority daemon thread and
+ * publishes every final region atomically.</p>
  */
 final class RtCausticaLodImporter {
     private static final String WYNNLOD_URL =
@@ -190,76 +197,137 @@ final class RtCausticaLodImporter {
     }
 
     private static ImportStats convertDatabase(RocksBridge bridge, Path database, Path sessionRoot) throws Exception {
-        try (RocksBridge.Database db = bridge.open(database)) {
-            BlockState[] states = decodeBlockMappings(bridge, db);
-            HashMap<Long, TileBuilder> tiles = new HashMap<>(131_072);
-            long[] sectionCount = {0L};
-            long[] malformedCount = {0L};
-            long startNanos = System.nanoTime();
+        Path spoolRoot = sessionRoot.resolve(".wynnlod-spool");
+        deleteTree(spoolRoot);
+        deleteImportedRegions(sessionRoot);
+        Files.createDirectories(spoolRoot);
 
-            bridge.forEach(db, "world_sections", (keyBytes, compressed) -> {
-                if (keyBytes.length != Long.BYTES) {
-                    return;
-                }
-                long key = ByteBuffer.wrap(keyBytes).order(ByteOrder.BIG_ENDIAN).getLong();
-                if (voxyLevel(key) != 0) {
-                    return;
-                }
-                try {
-                    byte[] raw = bridge.decompress(compressed);
-                    ingestSection(key, raw, states, tiles);
-                    sectionCount[0]++;
-                    if ((sectionCount[0] & 0x7ffL) == 0L) {
-                        CausticaMod.LOGGER.info("CausticaLOD WynnLOD conversion: {} level-0 sections, {} surface tiles",
-                                sectionCount[0], tiles.size());
-                    }
-                } catch (Throwable t) {
-                    malformedCount[0]++;
-                    if (malformedCount[0] <= 8) {
-                        CausticaMod.LOGGER.warn("Skipping malformed WynnLOD section 0x{}: {}",
-                                Long.toUnsignedString(key, 16), t.toString());
-                    }
-                }
-            });
+        try (RocksBridge.Database db = bridge.open(database);
+   RegionSpool spool = new RegionSpool(spoolRoot)) {
+  BlockState[] states = decodeBlockMappings(bridge, db);
 
-            HashMap<Long, HashMap<Integer, RtCausticaLodRegionStore.TileData>> regions = new HashMap<>();
-            int usableTiles = 0;
-            for (Map.Entry<Long, TileBuilder> entry : tiles.entrySet()) {
-                int chunkX = (int) (entry.getKey() >> 32);
-                int chunkZ = (int) (long) entry.getKey();
-                RtCausticaLodRegionStore.TileData tile = entry.getValue().finish();
-                if (tile == null) {
-                    continue;
-                }
-                usableTiles++;
-                int rx = RtCausticaLodRegionStore.regionX(chunkX);
-                int rz = RtCausticaLodRegionStore.regionZ(chunkZ);
-                long regionKey = packCoords(rx, rz);
-                regions.computeIfAbsent(regionKey, ignored -> new HashMap<>())
-                        .put(RtCausticaLodRegionStore.slot(chunkX, chunkZ), tile);
-            }
-            tiles.clear();
+  // Voxy's RocksDB key order is excellent for level filtering but Y-major inside level 0. A
+  // sequential value scan would therefore keep most horizontal columns alive at once. First
+  // collect only their 64-bit X/Z identities (primitive set, no section payloads), then use
+  // RocksDB's point-lookup path to process one complete vertical column at a time.
+  LongOpenHashSet horizontalColumns = new LongOpenHashSet(131_072);
+  int[] minSectionY = {Integer.MAX_VALUE};
+  int[] maxSectionY = {Integer.MIN_VALUE};
+  long[] candidateSections = {0L};
+  bridge.forEachKey(db, "world_sections", keyBytes -> {
+      if (keyBytes.length != Long.BYTES) {
+          return;
+      }
+      long key = ByteBuffer.wrap(keyBytes).order(ByteOrder.BIG_ENDIAN).getLong();
+      if (voxyLevel(key) != 0) {
+          return;
+      }
+      int sx = voxyX(key);
+      int sy = voxyY(key);
+      int sz = voxyZ(key);
+      horizontalColumns.add(packCoords(sx, sz));
+      minSectionY[0] = Math.min(minSectionY[0], sy);
+      maxSectionY[0] = Math.max(maxSectionY[0], sy);
+      candidateSections[0]++;
+  });
+  if (horizontalColumns.isEmpty()) {
+      throw new IOException("WynnLOD world_sections contains no level-0 Voxy sections");
+  }
 
-            int regionCount = 0;
-            ArrayList<Long> regionKeys = new ArrayList<>(regions.keySet());
-            regionKeys.sort(Comparator.comparingLong(Long::longValue));
-            for (long regionKey : regionKeys) {
-                int rx = (int) (regionKey >> 32);
-                int rz = (int) regionKey;
-                RtCausticaLodRegionStore.writeRegion(sessionRoot, rx, rz, regions.remove(regionKey));
-                regionCount++;
-                if ((regionCount & 31) == 0) {
-                    CausticaMod.LOGGER.info("CausticaLOD WynnLOD pack write: {}/{} regions", regionCount, regionKeys.size());
-                }
-            }
+  long[] columns = horizontalColumns.toLongArray();
+  java.util.Arrays.sort(columns);
+  horizontalColumns.clear();
+  CausticaMod.LOGGER.info(
+          "CausticaLOD WynnLOD index: {} level-0 section records, {} horizontal columns, section Y {}..{}",
+          candidateSections[0], columns.length, minSectionY[0], maxSectionY[0]);
 
-            double seconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
-            if (malformedCount[0] != 0) {
-                CausticaMod.LOGGER.warn("CausticaLOD WynnLOD conversion skipped {} malformed section(s)", malformedCount[0]);
-            }
-            CausticaMod.LOGGER.info("CausticaLOD WynnLOD conversion finished in {} s", String.format(Locale.ROOT, "%.1f", seconds));
-            return new ImportStats(sectionCount[0], usableTiles, regionCount);
+  long successfulSections = 0L;
+  long malformedSections = 0L;
+  int usableTiles = 0;
+  long startNanos = System.nanoTime();
+  byte[] lookupKey = new byte[Long.BYTES];
+
+  for (int columnIndex = 0; columnIndex < columns.length; columnIndex++) {
+      long horizontal = columns[columnIndex];
+      int sx = (int) (horizontal >> 32);
+      int sz = (int) horizontal;
+      int baseChunkX = sx * 2;
+      int baseChunkZ = sz * 2;
+
+      // Exactly four 16x16 chunks cover one 32x32 Voxy section footprint. Pre-seeding these
+      // builders makes ingestSection allocation-free no matter how many vertical slabs exist.
+      HashMap<Long, TileBuilder> tiles = new HashMap<>(8);
+      for (int dx = 0; dx < 2; dx++) {
+          for (int dz = 0; dz < 2; dz++) {
+              int cx = baseChunkX + dx;
+              int cz = baseChunkZ + dz;
+              tiles.put(packCoords(cx, cz), new TileBuilder());
+          }
+      }
+
+      for (int sy = maxSectionY[0]; sy >= minSectionY[0]; sy--) {
+          long sectionKey = voxySectionKey(sx, sy, sz);
+          writeLongBigEndian(sectionKey, lookupKey);
+          byte[] compressed = bridge.get(db, "world_sections", lookupKey);
+          if (compressed == null) {
+              continue;
+          }
+          try {
+              byte[] raw = bridge.decompress(compressed);
+              ingestSection(sectionKey, raw, states, tiles);
+              successfulSections++;
+          } catch (Throwable t) {
+              malformedSections++;
+              if (malformedSections <= 8) {
+                  CausticaMod.LOGGER.warn("Skipping malformed WynnLOD section 0x{}: {}",
+                          Long.toUnsignedString(sectionKey, 16), t.toString());
+              }
+          }
+          if (allGroundResolved(tiles)) {
+              break;
+          }
+      }
+
+      for (Map.Entry<Long, TileBuilder> entry : tiles.entrySet()) {
+          RtCausticaLodRegionStore.TileData tile = entry.getValue().finish();
+          if (tile == null) {
+              continue;
+          }
+          int chunkX = (int) (entry.getKey() >> 32);
+          int chunkZ = (int) (long) entry.getKey();
+          spool.append(chunkX, chunkZ, tile);
+          usableTiles++;
+      }
+
+      int done = columnIndex + 1;
+      if ((done & 0x1ff) == 0 || done == columns.length) {
+          CausticaMod.LOGGER.info(
+                  "CausticaLOD WynnLOD conversion: {}/{} horizontal columns, {} surface tiles",
+                  done, columns.length, usableTiles);
+      }
+  }
+
+  int regionCount = spool.publish(sessionRoot);
+  double seconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
+  if (malformedSections != 0L) {
+      CausticaMod.LOGGER.warn("CausticaLOD WynnLOD conversion skipped {} malformed section(s)", malformedSections);
+  }
+  CausticaMod.LOGGER.info(
+          "CausticaLOD WynnLOD bounded conversion finished in {} s; peak tile working set is one Voxy column plus one packed region",
+          String.format(Locale.ROOT, "%.1f", seconds));
+  return new ImportStats(successfulSections, usableTiles, regionCount);
+        } finally {
+  deleteTree(spoolRoot);
         }
+    }
+
+    private static boolean allGroundResolved(HashMap<Long, TileBuilder> tiles) {
+        for (TileBuilder tile : tiles.values()) {
+  if (!tile.complete()) {
+      return false;
+  }
+        }
+        return true;
     }
 
     private static BlockState[] decodeBlockMappings(RocksBridge bridge, RocksBridge.Database db) throws Exception {
@@ -635,6 +703,41 @@ final class RtCausticaLodImporter {
         return ((long) x << 32) ^ (z & 0xffff_ffffL);
     }
 
+    private static long voxySectionKey(int x, int y, int z) {
+        return ((long) (y & 0xff) << 52)
+                | ((long) (z & 0x00ff_ffff) << 28)
+                | ((long) (x & 0x00ff_ffff) << 4);
+    }
+
+    private static void writeLongBigEndian(long value, byte[] out) {
+        for (int i = 0; i < Long.BYTES; i++) {
+            out[i] = (byte) (value >>> (56 - i * 8));
+        }
+    }
+
+    /** Remove only partial imported region packs. Live .clod captures are a separate namespace. */
+    private static void deleteImportedRegions(Path sessionRoot) throws IOException {
+        RtCausticaLodRegionStore.reset();
+        if (!Files.isDirectory(sessionRoot)) {
+            return;
+        }
+        try (var files = Files.list(sessionRoot)) {
+            files.filter(Files::isRegularFile).filter(path -> {
+                String name = path.getFileName().toString();
+                return name.startsWith("r.") && (name.endsWith(".clodr") || name.endsWith(".clodr.tmp"));
+            }).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+        } catch (java.io.UncheckedIOException e) {
+            throw e.getCause();
+        }
+    }
+
+
     private static int voxyLevel(long key) {
         return (int) ((key >>> 60) & 0xfL);
     }
@@ -661,6 +764,7 @@ final class RtCausticaLodImporter {
         final int[] groundStateId = new int[RtCausticaLodRegionStore.TILE_COLUMNS];
         final int[] bodyStateId = new int[RtCausticaLodRegionStore.TILE_COLUMNS];
         final int[] surfaceStateId = new int[RtCausticaLodRegionStore.TILE_COLUMNS];
+        int resolvedGroundColumns;
 
         TileBuilder() {
             java.util.Arrays.fill(groundY, RtCausticaLodRegionStore.NO_HEIGHT);
@@ -676,10 +780,17 @@ final class RtCausticaLodImporter {
 
         void offerGround(int column, int y, int groundId, int bodyId) {
             if (groundY[column] == RtCausticaLodRegionStore.NO_HEIGHT || y > groundY[column]) {
+                if (groundY[column] == RtCausticaLodRegionStore.NO_HEIGHT) {
+                    resolvedGroundColumns++;
+                }
                 groundY[column] = clampHeight(y);
                 groundStateId[column] = groundId;
                 bodyStateId[column] = bodyId;
             }
+        }
+
+        boolean complete() {
+            return resolvedGroundColumns == RtCausticaLodRegionStore.TILE_COLUMNS;
         }
 
         RtCausticaLodRegionStore.TileData finish() {
@@ -706,6 +817,134 @@ final class RtCausticaLodImporter {
         }
     }
 
+    /**
+     * Small disk-backed staging area. At most 32 append streams and one 32x32-chunk region payload are
+     * resident at once, so conversion memory does not scale with Wynncraft's map area.
+     */
+    private static final class RegionSpool implements AutoCloseable {
+        private static final int MAX_OPEN_STREAMS = 32;
+        private final Path root;
+        private final Set<Long> regionKeys = new HashSet<>();
+        private final LinkedHashMap<Long, DataOutputStream> streams = new LinkedHashMap<>(32, 0.75f, true);
+
+        RegionSpool(Path root) {
+  this.root = root;
+        }
+
+        void append(int chunkX, int chunkZ, RtCausticaLodRegionStore.TileData tile) throws IOException {
+  int rx = RtCausticaLodRegionStore.regionX(chunkX);
+  int rz = RtCausticaLodRegionStore.regionZ(chunkZ);
+  long regionKey = packCoords(rx, rz);
+  regionKeys.add(regionKey);
+  DataOutputStream out = stream(regionKey, rx, rz);
+  out.writeInt(RtCausticaLodRegionStore.slot(chunkX, chunkZ));
+  writeTile(out, tile);
+        }
+
+        int publish(Path sessionRoot) throws IOException {
+  closeStreams();
+  ArrayList<Long> keys = new ArrayList<>(regionKeys);
+  keys.sort(Comparator.comparingLong(Long::longValue));
+  int count = 0;
+  for (long regionKey : keys) {
+      int rx = (int) (regionKey >> 32);
+      int rz = (int) regionKey;
+      HashMap<Integer, RtCausticaLodRegionStore.TileData> tiles = new HashMap<>(1024);
+      Path path = spoolPath(rx, rz);
+      try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path), 1 << 16))) {
+          while (true) {
+              final int slot;
+              try {
+                  slot = in.readInt();
+              } catch (EOFException done) {
+                  break;
+              }
+              if (slot < 0 || slot >= 1024) {
+                  throw new IOException("Invalid CausticaLOD spool slot " + slot + " in " + path);
+              }
+              RtCausticaLodRegionStore.TileData previous = tiles.put(slot, readTile(in));
+              if (previous != null) {
+                  throw new IOException("Duplicate CausticaLOD spool slot " + slot + " in " + path);
+              }
+          }
+      }
+      RtCausticaLodRegionStore.writeRegion(sessionRoot, rx, rz, tiles);
+      Files.deleteIfExists(path);
+      count++;
+      if ((count & 31) == 0 || count == keys.size()) {
+          CausticaMod.LOGGER.info("CausticaLOD WynnLOD pack publish: {}/{} regions", count, keys.size());
+      }
+  }
+  return count;
+        }
+
+        private DataOutputStream stream(long key, int rx, int rz) throws IOException {
+  DataOutputStream current = streams.get(key);
+  if (current != null) {
+      return current;
+  }
+  if (streams.size() >= MAX_OPEN_STREAMS) {
+      Map.Entry<Long, DataOutputStream> eldest = streams.entrySet().iterator().next();
+      eldest.getValue().close();
+      streams.remove(eldest.getKey());
+  }
+  DataOutputStream opened = new DataOutputStream(new BufferedOutputStream(
+          Files.newOutputStream(spoolPath(rx, rz), StandardOpenOption.CREATE, StandardOpenOption.APPEND), 1 << 16));
+  streams.put(key, opened);
+  return opened;
+        }
+
+        private Path spoolPath(int rx, int rz) {
+  return root.resolve("r." + rx + "." + rz + ".spool");
+        }
+
+        private static void writeTile(DataOutputStream out, RtCausticaLodRegionStore.TileData tile) throws IOException {
+  for (int i = 0; i < RtCausticaLodRegionStore.TILE_COLUMNS; i++) {
+      out.writeShort(tile.groundY()[i]);
+      out.writeShort(tile.surfaceY()[i]);
+      out.writeInt(tile.groundStateId()[i]);
+      out.writeInt(tile.bodyStateId()[i]);
+      out.writeInt(tile.surfaceStateId()[i]);
+  }
+        }
+
+        private static RtCausticaLodRegionStore.TileData readTile(DataInputStream in) throws IOException {
+  short[] groundY = new short[RtCausticaLodRegionStore.TILE_COLUMNS];
+  short[] surfaceY = new short[RtCausticaLodRegionStore.TILE_COLUMNS];
+  int[] groundState = new int[RtCausticaLodRegionStore.TILE_COLUMNS];
+  int[] bodyState = new int[RtCausticaLodRegionStore.TILE_COLUMNS];
+  int[] surfaceState = new int[RtCausticaLodRegionStore.TILE_COLUMNS];
+  for (int i = 0; i < RtCausticaLodRegionStore.TILE_COLUMNS; i++) {
+      groundY[i] = in.readShort();
+      surfaceY[i] = in.readShort();
+      groundState[i] = in.readInt();
+      bodyState[i] = in.readInt();
+      surfaceState[i] = in.readInt();
+  }
+  return new RtCausticaLodRegionStore.TileData(groundY, surfaceY, groundState, bodyState, surfaceState);
+        }
+
+        private void closeStreams() throws IOException {
+  IOException failure = null;
+  for (DataOutputStream out : streams.values()) {
+      try {
+          out.close();
+      } catch (IOException e) {
+          if (failure == null) failure = e; else failure.addSuppressed(e);
+      }
+  }
+  streams.clear();
+  if (failure != null) {
+      throw failure;
+  }
+        }
+
+        @Override
+        public void close() throws IOException {
+  closeStreams();
+        }
+    }
+
     /** Reflection boundary around optional conversion libraries, keeping them out of Caustica's runtime ABI. */
     private static final class RocksBridge implements AutoCloseable {
         private final URLClassLoader loader;
@@ -723,6 +962,7 @@ final class RtCausticaLodImporter {
         private final Method iteratorKey;
         private final Method iteratorValue;
         private final Method iteratorNext;
+        private final Method get;
         private final Object zstd;
         private final Method zstdSize;
         private final Method zstdDecompress;
@@ -746,6 +986,7 @@ final class RtCausticaLodImporter {
             this.iteratorKey = iteratorClass.getMethod("key");
             this.iteratorValue = iteratorClass.getMethod("value");
             this.iteratorNext = iteratorClass.getMethod("next");
+            this.get = rocksClass.getMethod("get", cfHandleClass, byte[].class);
 
             Class<?> zstdClass = Class.forName("io.airlift.compress.v3.zstd.ZstdJavaDecompressor", true, loader);
             this.zstd = zstdClass.getConstructor().newInstance();
@@ -791,6 +1032,31 @@ final class RtCausticaLodImporter {
                 byName.put(new String(names.get(i), StandardCharsets.UTF_8), handles.get(i));
             }
             return new Database((AutoCloseable) db, (AutoCloseable) dbOptions, cfOptions, handles, byName);
+        }
+
+        void forEachKey(Database db, String columnFamily, KeyConsumer consumer) throws Exception {
+  Object handle = db.handlesByName.get(columnFamily);
+  if (handle == null) {
+      throw new IOException("Voxy database lacks column family " + columnFamily);
+  }
+  Object iterator = newIterator.invoke(db.db, handle);
+  try {
+      iteratorSeekToFirst.invoke(iterator);
+      while ((boolean) iteratorIsValid.invoke(iterator)) {
+          consumer.accept((byte[]) iteratorKey.invoke(iterator));
+          iteratorNext.invoke(iterator);
+      }
+  } finally {
+      ((AutoCloseable) iterator).close();
+  }
+        }
+
+        byte[] get(Database db, String columnFamily, byte[] key) throws Exception {
+  Object handle = db.handlesByName.get(columnFamily);
+  if (handle == null) {
+      throw new IOException("Voxy database lacks column family " + columnFamily);
+  }
+  return (byte[]) get.invoke(db.db, handle, key);
         }
 
         void forEach(Database db, String columnFamily, ByteConsumer consumer) throws Exception {
@@ -886,6 +1152,11 @@ final class RtCausticaLodImporter {
                 return current;
             }
         }
+    }
+
+    @FunctionalInterface
+    private interface KeyConsumer {
+        void accept(byte[] key) throws Exception;
     }
 
     @FunctionalInterface
