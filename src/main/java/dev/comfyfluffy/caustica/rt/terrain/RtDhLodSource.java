@@ -4,7 +4,10 @@ import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.fabricmc.loader.api.FabricLoader;
@@ -47,6 +50,7 @@ public final class RtDhLodSource {
     private static Method getSinglePlayerLevel;
     private static Method getAllLoadedLevelWrappers;
     private static Method worldLoaded;
+    private static Method levelWrapperGetMinHeight;
     private static Object softCache;
     private static Field resultPayload;
     private static Field resultSuccess;
@@ -58,11 +62,35 @@ public final class RtDhLodSource {
     private static Field pointBlockState;
     private static Method wrapperGetMcObject;
 
+    /*
+     * DH 3.2 has a second, more specific readiness requirement than worldProxy.worldLoaded():
+     * DhApiTerrainDataRepo resolves the supplied ILevelWrapper back through AbstractDhWorld.getLevel().
+     * On proxy-heavy multiplayer servers that lookup can stay broken even though the wrapper came from
+     * getAllLoadedLevelWrappers(). The optional adapter below bypasses only that lookup. It obtains the
+     * IDhLevel already attached to DH's core wrapper and reads the same FullDataSourceProviderV2 that the
+     * public terrain repo uses. All fields/methods remain reflected so DH stays an optional dependency.
+     */
+    private static boolean directCoreResolved;
+    private static boolean directCoreAvailable;
+    private static Method coreWrapperGetDhLevel;
+    private static Method dhLevelGetFullDataProvider;
+    private static Method providerGetAsync;
+    private static Method sectionEncode;
+    private static int sectionMinimumDetailLevel = 6;
+    private static Field dataSourceMapping;
+    private static Method dataSourceGetColumnAtRelPos;
+    private static Method fullDataToApiPoint;
+    private static Method longArrayListSize;
+    private static Method longArrayListGetLong;
+
     private static final AtomicBoolean loggedWorldNotReady = new AtomicBoolean();
     private static final AtomicBoolean loggedQueryFailure = new AtomicBoolean();
     private static final AtomicBoolean loggedQuerySuccess = new AtomicBoolean();
     private static final AtomicBoolean loggedNoLevel = new AtomicBoolean();
     private static final AtomicBoolean loggedMultipleLevels = new AtomicBoolean();
+    private static final AtomicBoolean loggedDirectFallback = new AtomicBoolean();
+    private static final AtomicBoolean loggedDirectFallbackUnavailable = new AtomicBoolean();
+    private static final AtomicBoolean loggedDirectNoLevel = new AtomicBoolean();
 
     private RtDhLodSource() {
     }
@@ -86,12 +114,11 @@ public final class RtDhLodSource {
     }
 
     /**
-     * True only when the reflected API is present AND DH says its world is actually loaded.
+     * True only when the reflected API is present AND DH says a world object exists.
      *
-     * <p>This worldLoaded gate is important on multiplayer. Caustica can finish its expensive RT/material
-     * startup while DH is still switching from its interim/hub world to the real server level. Querying
-     * during that window returns "Unable to get terrain data before the world has loaded". Treating that
-     * temporary result as an empty LOD section poisoned the whole ring's retry cache.
+     * <p>DH 3.2's worldLoaded() is only a coarse lifecycle gate; fetchRegion performs the stricter
+     * per-level check and can fall back to DH's directly attached IDhLevel when the public repo's
+     * AbstractDhWorld.getLevel(wrapper) lookup is stale.</p>
      */
     public static synchronized boolean available() {
         resolve();
@@ -149,6 +176,7 @@ public final class RtDhLodSource {
                     "getAllTerrainDataAtDetailLevelAndPos",
                     levelWrapper, byte.class, int.class, int.class, cacheInterface);
             createSoftCache = repoInterface.getMethod("createSoftCache");
+            levelWrapperGetMinHeight = levelWrapper.getMethod("getMinHeight");
 
             Class<?> worldProxyInterface = Class.forName(
                     "com.seibel.distanthorizons.api.interfaces.world.IDhApiWorldProxy");
@@ -174,6 +202,7 @@ public final class RtDhLodSource {
             wrapperGetMcObject = unsafeWrapper.getMethod("getWrappedMcObject");
 
             softCache = createSoftCache.invoke(terrainRepo);
+            resolveDirectCore();
             state = State.READY;
             LOGGER.info("Distant Horizons LOD source resolved ({})", dhApi.getName());
         } catch (ReflectiveOperationException | RuntimeException e) {
@@ -183,6 +212,49 @@ public final class RtDhLodSource {
             softCache = null;
             LOGGER.warn("Distant Horizons is installed but its API did not resolve; distant LOD terrain disabled. {}",
                     e.toString());
+        }
+    }
+
+    /**
+     * Best-effort adapter for the DH 3.2 core data path. Failure here never disables the public API path.
+     */
+    private static void resolveDirectCore() {
+        if (directCoreResolved) {
+            return;
+        }
+        directCoreResolved = true;
+        try {
+            Class<?> coreLevelWrapper = Class.forName(
+                    "com.seibel.distanthorizons.core.wrapperInterfaces.world.ILevelWrapper");
+            Class<?> dhLevel = Class.forName("com.seibel.distanthorizons.core.level.IDhLevel");
+            Class<?> provider = Class.forName(
+                    "com.seibel.distanthorizons.core.file.fullDatafile.V2.FullDataSourceProviderV2");
+            Class<?> sectionPos = Class.forName("com.seibel.distanthorizons.core.pos.DhSectionPos");
+            Class<?> dataSource = Class.forName(
+                    "com.seibel.distanthorizons.core.dataObjects.fullData.sources.FullDataSourceV2");
+            Class<?> idMap = Class.forName(
+                    "com.seibel.distanthorizons.core.dataObjects.fullData.FullDataPointIdMap");
+            Class<?> pointUtil = Class.forName(
+                    "com.seibel.distanthorizons.core.util.DhApiTerrainDataPointUtil");
+            Class<?> longArrayList = Class.forName("it.unimi.dsi.fastutil.longs.LongArrayList");
+
+            coreWrapperGetDhLevel = coreLevelWrapper.getMethod("getDhLevel");
+            dhLevelGetFullDataProvider = dhLevel.getMethod("getFullDataProvider");
+            providerGetAsync = provider.getMethod("getAsync", long.class);
+            sectionEncode = sectionPos.getMethod("encode", byte.class, int.class, int.class);
+            sectionMinimumDetailLevel = sectionPos.getField("SECTION_MINIMUM_DETAIL_LEVEL").getByte(null);
+            dataSourceMapping = dataSource.getField("mapping");
+            dataSourceGetColumnAtRelPos = dataSource.getMethod("getColumnAtRelPos", int.class, int.class);
+            fullDataToApiPoint = pointUtil.getMethod(
+                    "createApiDatapoint", int.class, idMap, byte.class, long.class);
+            longArrayListSize = longArrayList.getMethod("size");
+            longArrayListGetLong = longArrayList.getMethod("getLong", int.class);
+
+            directCoreAvailable = true;
+            LOGGER.info("Distant Horizons direct FullDataProvider fallback resolved");
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            directCoreAvailable = false;
+            LOGGER.debug("Distant Horizons direct FullDataProvider fallback unavailable: {}", e.toString());
         }
     }
 
@@ -227,27 +299,35 @@ public final class RtDhLodSource {
             for (Object levelWrapper : wrappers) {
                 Object result = getAllTerrainDataAtDetailLevelAndPos.invoke(
                         terrainRepo, levelWrapper, detailLevel, posX, posZ, softCache);
-                if (result == null || !resultSuccess.getBoolean(result)) {
-                    if (firstFailureMessage == null && result != null) {
-                        firstFailureMessage = resultMessage.get(result);
+                if (result != null && resultSuccess.getBoolean(result)) {
+                    hadSuccessfulQuery = true;
+                    Object grid = resultPayload.get(result);
+                    List<LodBox> boxes = grid == null
+                            ? List.of()
+                            : flatten(grid, footprintBlocks, originBlockX, originBlockZ);
+                    if (!boxes.isEmpty()) {
+                        logSuccess(detailLevel, posX, posZ, boxes.size(), false);
+                        return new FetchResult(boxes, true);
                     }
+                    successfulEmpty = boxes;
                     continue;
                 }
 
-                hadSuccessfulQuery = true;
-                Object grid = resultPayload.get(result);
-                List<LodBox> boxes = grid == null
-                        ? List.of()
-                        : flatten(grid, footprintBlocks, originBlockX, originBlockZ);
-                if (!boxes.isEmpty()) {
-                    if (loggedQuerySuccess.compareAndSet(false, true)) {
-                        LOGGER.info("DH query succeeded at detail {} pos {},{} with {} terrain boxes",
-                                detailLevel, posX, posZ, boxes.size());
-                    }
-                    loggedQueryFailure.set(false);
-                    return new FetchResult(boxes, true);
+                if (firstFailureMessage == null && result != null) {
+                    firstFailureMessage = resultMessage.get(result);
                 }
-                successfulEmpty = boxes;
+
+                // DH 3.2 can expose a loaded wrapper that its own terrainRepo cannot map back to the
+                // current world's level. Use the IDhLevel already attached to that wrapper instead.
+                FetchResult direct = fetchDirectCore(levelWrapper, footprintBlocks, originBlockX, originBlockZ);
+                if (direct.querySucceeded()) {
+                    hadSuccessfulQuery = true;
+                    if (!direct.boxes().isEmpty()) {
+                        logSuccess(detailLevel, posX, posZ, direct.boxes().size(), true);
+                        return direct;
+                    }
+                    successfulEmpty = direct.boxes();
+                }
             }
 
             if (hadSuccessfulQuery) {
@@ -269,6 +349,120 @@ public final class RtDhLodSource {
             LOGGER.debug("DH region fetch failed at detail {} ({}, {}): {}",
                     detailLevel, posX, posZ, e.toString());
             return new FetchResult(List.of(), false);
+        }
+    }
+
+    private static void logSuccess(byte detailLevel, int posX, int posZ, int boxCount, boolean direct) {
+        if (loggedQuerySuccess.compareAndSet(false, true)) {
+            LOGGER.info("DH query succeeded at detail {} pos {},{} with {} terrain boxes{}",
+                    detailLevel, posX, posZ, boxCount,
+                    direct ? " via direct FullDataProvider fallback" : "");
+        }
+        loggedQueryFailure.set(false);
+    }
+
+    /**
+     * Bypasses DhApiTerrainDataRepo's world.getLevel(wrapper) lookup, but still reads DH's own persistent
+     * FullDataSourceProviderV2 and uses DH's own packed-data-to-API-point converter. This keeps the exact
+     * block-state/light semantics of the public terrain API while avoiding the broken wrapper re-lookup.
+     */
+    private static FetchResult fetchDirectCore(Object levelWrapper,
+                                                int footprintBlocks,
+                                                int originBlockX,
+                                                int originBlockZ) {
+        if (!directCoreAvailable) {
+            if (loggedDirectFallbackUnavailable.compareAndSet(false, true)) {
+                LOGGER.info("DH public terrain lookup failed and direct FullDataProvider fallback is unavailable");
+            }
+            return new FetchResult(List.of(), false);
+        }
+
+        Map<Long, Object> dataSources = new HashMap<>();
+        try {
+            Object dhLevel = coreWrapperGetDhLevel.invoke(levelWrapper);
+            if (dhLevel == null) {
+                if (loggedDirectNoLevel.compareAndSet(false, true)) {
+                    LOGGER.info("DH loaded wrapper has no attached IDhLevel; direct terrain fallback will retry");
+                }
+                return new FetchResult(List.of(), false);
+            }
+
+            Object provider = dhLevelGetFullDataProvider.invoke(dhLevel);
+            if (provider == null) {
+                return new FetchResult(List.of(), false);
+            }
+
+            if (loggedDirectFallback.compareAndSet(false, true)) {
+                LOGGER.info("DH public terrain lookup rejected a loaded level; using direct FullDataProvider fallback");
+            }
+
+            int minHeight = ((Number) levelWrapperGetMinHeight.invoke(levelWrapper)).intValue();
+            int sourceWidth = 1 << sectionMinimumDetailLevel;
+            List<LodBox> boxes = new ArrayList<>();
+
+            for (int ix = 0; ix < footprintBlocks; ix++) {
+                int blockX = originBlockX + ix;
+                int sectionX = Math.floorDiv(blockX, sourceWidth);
+                int relX = Math.floorMod(blockX, sourceWidth);
+
+                for (int iz = 0; iz < footprintBlocks; iz++) {
+                    int blockZ = originBlockZ + iz;
+                    int sectionZ = Math.floorDiv(blockZ, sourceWidth);
+                    int relZ = Math.floorMod(blockZ, sourceWidth);
+
+                    long sectionPos = ((Number) sectionEncode.invoke(
+                            null, sectionMinimumDetailLevel, sectionX, sectionZ)).longValue();
+
+                    Object dataSource = dataSources.get(sectionPos);
+                    if (dataSource == null && !dataSources.containsKey(sectionPos)) {
+                        Object future = providerGetAsync.invoke(provider, sectionPos);
+                        if (!(future instanceof CompletableFuture<?> completable)) {
+                            return new FetchResult(List.of(), false);
+                        }
+                        dataSource = completable.get();
+                        if (dataSource == null) {
+                            return new FetchResult(List.of(), false);
+                        }
+                        dataSources.put(sectionPos, dataSource);
+                    }
+
+                    if (dataSource == null) {
+                        continue;
+                    }
+                    Object mapping = dataSourceMapping.get(dataSource);
+                    Object column = dataSourceGetColumnAtRelPos.invoke(dataSource, relX, relZ);
+                    if (mapping == null || column == null) {
+                        continue;
+                    }
+
+                    int count = ((Number) longArrayListSize.invoke(column)).intValue();
+                    for (int i = 0; i < count; i++) {
+                        long packed = ((Number) longArrayListGetLong.invoke(column, i)).longValue();
+                        Object point = fullDataToApiPoint.invoke(
+                                null, minHeight, mapping, (byte) 0, packed);
+                        appendPoint(boxes, point, blockX, blockZ, 1);
+                    }
+                }
+            }
+
+            return new FetchResult(boxes, true);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new FetchResult(List.of(), false);
+        } catch (ReflectiveOperationException | RuntimeException | java.util.concurrent.ExecutionException e) {
+            LOGGER.debug("DH direct FullDataProvider query failed at ({}, {}), size {}: {}",
+                    originBlockX, originBlockZ, footprintBlocks, e.toString());
+            return new FetchResult(List.of(), false);
+        } finally {
+            for (Object dataSource : dataSources.values()) {
+                if (dataSource instanceof AutoCloseable closeable) {
+                    try {
+                        closeable.close();
+                    } catch (Exception ignored) {
+                        // FullDataSourceV2 releases pooled arrays here; failure should not break rendering.
+                    }
+                }
+            }
         }
     }
 
@@ -295,48 +489,50 @@ public final class RtDhLodSource {
                 int lenY = Array.getLength(entries);
                 for (int iy = 0; iy < lenY; iy++) {
                     Object point = Array.get(entries, iy);
-                    if (point == null) {
-                        continue;
+                    if (point != null) {
+                        appendPoint(boxes, point,
+                                originX + ix * sizeXZ,
+                                originZ + iz * sizeXZ,
+                                sizeXZ);
                     }
-                    int bottomY = pointBottomY.getInt(point);
-                    int topY = pointTopY.getInt(point);
-                    if (topY <= bottomY) {
-                        continue;
-                    }
-                    Object wrapper = pointBlockState.get(point);
-                    if (wrapper == null) {
-                        continue;
-                    }
-                    Object mcObject = wrapperGetMcObject.invoke(wrapper);
-                    if (!(mcObject instanceof BlockState blockState) || blockState.isAir()) {
-                        continue;
-                    }
-                    boxes.add(new LodBox(
-                            originX + ix * sizeXZ,
-                            bottomY,
-                            topY,
-                            originZ + iz * sizeXZ,
-                            sizeXZ,
-                            blockState,
-                            pointBlockLight.getInt(point),
-                            pointSkyLight.getInt(point)));
                 }
             }
         }
         return boxes;
     }
 
+    private static void appendPoint(List<LodBox> boxes, Object point,
+                                    int blockX, int blockZ, int sizeXZ)
+            throws ReflectiveOperationException {
+        int bottomY = pointBottomY.getInt(point);
+        int topY = pointTopY.getInt(point);
+        if (topY <= bottomY) {
+            return;
+        }
+        Object wrapper = pointBlockState.get(point);
+        if (wrapper == null) {
+            return;
+        }
+        Object mcObject = wrapperGetMcObject.invoke(wrapper);
+        if (!(mcObject instanceof BlockState blockState) || blockState.isAir()) {
+            return;
+        }
+        boxes.add(new LodBox(
+                blockX,
+                bottomY,
+                topY,
+                blockZ,
+                sizeXZ,
+                blockState,
+                pointBlockLight.getInt(point),
+                pointSkyLight.getInt(point)));
+    }
+
     private static List<Object> levelWrappers() throws ReflectiveOperationException {
         List<Object> wrappers = new ArrayList<>();
-        try {
-            Object single = getSinglePlayerLevel.invoke(worldProxy);
-            if (single != null) {
-                wrappers.add(single);
-            }
-        } catch (java.lang.reflect.InvocationTargetException e) {
-            // IllegalStateException on multiplayer is expected; use the loaded set below.
-        }
 
+        // Prefer wrappers owned by the current DH world. On proxy servers the Minecraft client's
+        // convenience wrapper can briefly point at a level that DH has not attached to the active world.
         Object loaded = getAllLoadedLevelWrappers.invoke(worldProxy);
         if (loaded instanceof Iterable<?> iterable) {
             for (Object wrapper : iterable) {
@@ -344,6 +540,15 @@ public final class RtDhLodSource {
                     wrappers.add(wrapper);
                 }
             }
+        }
+
+        try {
+            Object single = getSinglePlayerLevel.invoke(worldProxy);
+            if (single != null && !containsIdentity(wrappers, single)) {
+                wrappers.add(single);
+            }
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            // Some DH implementations can reject this outside true single-player; loaded wrappers suffice.
         }
         return wrappers;
     }
@@ -372,10 +577,25 @@ public final class RtDhLodSource {
             }
             softCache = null;
         }
+        directCoreResolved = false;
+        directCoreAvailable = false;
+        coreWrapperGetDhLevel = null;
+        dhLevelGetFullDataProvider = null;
+        providerGetAsync = null;
+        sectionEncode = null;
+        dataSourceMapping = null;
+        dataSourceGetColumnAtRelPos = null;
+        fullDataToApiPoint = null;
+        longArrayListSize = null;
+        longArrayListGetLong = null;
+
         loggedWorldNotReady.set(false);
         loggedQueryFailure.set(false);
         loggedQuerySuccess.set(false);
         loggedNoLevel.set(false);
         loggedMultipleLevels.set(false);
+        loggedDirectFallback.set(false);
+        loggedDirectFallbackUnavailable.set(false);
+        loggedDirectNoLevel.set(false);
     }
 }
