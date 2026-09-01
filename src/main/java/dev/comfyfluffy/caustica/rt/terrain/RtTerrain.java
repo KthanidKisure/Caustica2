@@ -169,17 +169,25 @@ public final class RtTerrain {
      * dispatchLodSection and publishLodPrepared, both of which run on the render thread.
      */
     private final LongOpenHashSet lodInFlight = new LongOpenHashSet();
-    private final List<PreparedSection> lodPrepared =
+    /** Worker/GPU completions carry their dispatch generation so stale work can never publish after
+     * a world/config transition. The lists are synchronized because completions arrive off-thread. */
+    private final List<LodPrepared> lodPrepared =
             java.util.Collections.synchronizedList(new ArrayList<>());
-    /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
-    private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
+    private final List<LodCompletion> lodFailed =
+            java.util.Collections.synchronizedList(new ArrayList<>());
     /** Transient source misses: retry soon and never poison the long empty-region cooldown. */
-    private final List<Long> lodRetrySoon = java.util.Collections.synchronizedList(new ArrayList<>());
+    private final List<LodCompletion> lodRetrySoon =
+            java.util.Collections.synchronizedList(new ArrayList<>());
     /** Render-frame deadline before an empty/failed native LOD region may be queried again. Render-thread only. */
     private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
     private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
     private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;
     private long lodSourceRetryAfterNanos;
+    /** Monotonic render-owned epoch for native LOD work. Every release/config change invalidates old callbacks. */
+    private long lodGeneration = 1L;
+    private int lodActiveDetail = Integer.MIN_VALUE;
+    private int lodActiveHeightSections = Integer.MIN_VALUE;
+    private int lodLoggedEmptyCount = -1;
     /**
      * Keeps LOD keys clear of real section keys. The key packs scy into 12 signed bits, and legal
      * Minecraft section Y is roughly -4..20, so offsetting by 512 per detail level cannot collide with
@@ -1476,37 +1484,49 @@ public final class RtTerrain {
 
     private void streamLod(RtContext ctx, ClientLevel level, int pbx, int pby, int pbz) {
         boolean enabled = CausticaConfig.Rt.Lod.ENABLED.value();
+        int requestedDetail = CausticaConfig.Rt.Lod.DETAIL.value();
+        int requestedHeightSections = CausticaConfig.Rt.Lod.HEIGHT_SECTIONS.value();
+
         if (!enabled || !RtDhLodSource.available()) {
             if (enabled && !lodLoggedState) {
-                // The single most useful line separates disabled/unavailable native source state from
-                // later meshing or BLAS publication failures.
                 lodLoggedState = true;
-                CausticaMod.LOGGER.info("CausticaLOD enabled but its native source is not ready; no distant terrain yet");
+                CausticaMod.LOGGER.info(
+                        "CausticaLOD enabled but its native source is not ready; no distant terrain yet");
             }
             releaseLod(ctx);
             return;
         }
+
+        if (lodActiveDetail != requestedDetail || lodActiveHeightSections != requestedHeightSections) {
+            releaseLod(ctx);
+            lodActiveDetail = requestedDetail;
+            lodActiveHeightSections = requestedHeightSections;
+        }
+
         int empties = lodEmptyRegions.get();
-        if (empties >= 64 && empties % 64 == 0 && lodResident.isEmpty()) {
+        if (empties >= 64 && empties % 64 == 0 && lodResident.isEmpty()
+                && empties != lodLoggedEmptyCount) {
+            lodLoggedEmptyCount = empties;
             CausticaMod.LOGGER.info(
                     "CausticaLOD: {} empty regions, {} source boxes observed, none published (detail {})",
-                    empties, lodBoxesSeen.get(), CausticaConfig.Rt.Lod.DETAIL.value());
+                    empties, lodBoxesSeen.get(), requestedDetail);
         }
         if (!lodLoggedState) {
             lodLoggedState = true;
             CausticaMod.LOGGER.info("CausticaLOD active: detail={}, radius={}, native source available",
-                    CausticaConfig.Rt.Lod.DETAIL.value(), CausticaConfig.Rt.Lod.RADIUS.value());
+                    requestedDetail, CausticaConfig.Rt.Lod.RADIUS.value());
         }
+
         publishLodPrepared(ctx, pbx, pby, pbz);
         if (System.nanoTime() < lodSourceRetryAfterNanos) {
             return;
         }
 
-        int detail = CausticaConfig.Rt.Lod.DETAIL.value();
+        int detail = requestedDetail;
         int scale = 1 << detail;
         int sectionBlocks = RtDhLodRegion.SECTION_BLOCKS * scale;
         int radius = CausticaConfig.Rt.Lod.RADIUS.value();
-        int configuredHeightSections = CausticaConfig.Rt.Lod.HEIGHT_SECTIONS.value();
+        int configuredHeightSections = requestedHeightSections;
         int budget = CausticaConfig.Rt.Lod.SECTIONS_PER_FRAME.value();
 
         int centreX = Math.floorDiv(pbx, sectionBlocks);
@@ -1521,14 +1541,16 @@ public final class RtTerrain {
         int startPageY = Math.clamp(playerPageY - heightSections / 2, minPageY, maxStartY);
         evictLodOutside(ctx, centreX, centreZ, sectionBlocks, radius + 2);
         long frame = RtComposite.frameCounter();
+        if ((frame & 127L) == 0L) {
+            pruneExpiredLodRetries(frame);
+        }
 
-        // Nearest-first, so the ring the player is looking at fills before the far edge.
         outer:
         for (int ring = 0; ring <= radius; ring++) {
             for (int dx = -ring; dx <= ring; dx++) {
                 for (int dz = -ring; dz <= ring; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) {
-                        continue; // only this ring's perimeter; inner rings were done already
+                        continue;
                     }
                     for (int dy = 0; dy < heightSections; dy++) {
                         if (budget <= 0) {
@@ -1561,6 +1583,7 @@ public final class RtTerrain {
         int originX = lx * sectionBlocks;
         int originY = ly * sectionBlocks;
         int originZ = lz * sectionBlocks;
+        long generation = lodGeneration;
         lodInFlight.add(key);
         beginActiveTask();
         try {
@@ -1572,7 +1595,7 @@ public final class RtTerrain {
                     RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
                     RtDhLodSource.FetchResult fetched = RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
         if (!fetched.querySucceeded()) {
-            finishLodRetrySoon(key);
+            finishLodRetrySoon(key, generation);
             return;
         }
         java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();
@@ -1582,7 +1605,7 @@ public final class RtTerrain {
                         // Empty means the native surface cache has no geometry for this page/footprint yet.
                         // Count rather than logging every region, which would produce thousands of lines.
                         lodEmptyRegions.incrementAndGet();
-                        finishLodTask(key, null);
+                        finishLodTask(key, null, generation, scale);
                         return;
                     }
                     WorkerTessState ws = WORKER_TESS.get();
@@ -1595,15 +1618,15 @@ public final class RtTerrain {
                             materialSnapshot, 0, 0, 0);
                     PackedSection packed = cpu.packed();
                     if (packed == null) {
-                        finishLodTask(key, null);
+                        finishLodTask(key, null, generation, scale);
                         return;
                     }
                     PreparedSection ps = RtSectionBuilder.prepare(dispatch.ctx(), packed,
                             cpu.opacityMicromap(), CausticaConfig.Rt.Terrain.BLAS_COMPACTION.value(),
                             key, originX, originY, originZ);
-                    submitLodBuild(dispatch.ctx(), key, ps, scale);
+                    submitLodBuild(dispatch.ctx(), key, ps, scale, generation);
                 } catch (Throwable t) {
-                    finishLodTask(key, null);
+                    finishLodTask(key, null, generation, scale);
                 }
             });
         } catch (Throwable t) {
@@ -1615,7 +1638,8 @@ public final class RtTerrain {
         }
     }
 
-    private void submitLodBuild(RtContext ctx, long key, PreparedSection prepared, int scale) {
+    private void submitLodBuild(RtContext ctx, long key, PreparedSection prepared,
+                                int scale, long generation) {
         ctx.gpuExecutor().submit(
                 () -> false,
                 cmd -> {
@@ -1629,102 +1653,127 @@ public final class RtTerrain {
                 (build, failure) -> {
                     if (failure != null) {
                         destroyPreparedSection(prepared);
-                        finishLodTask(key, null);
+                        finishLodTask(key, null, generation, scale);
                         return;
                     }
                     prepared.releaseBuildInputs();
-                    finishLodTask(key, prepared);
+                    finishLodTask(key, prepared, generation, scale);
                 });
     }
 
-    /**
-     * Worker/GPU-callback side of a dispatch. Only ever appends to a synchronized list; the in-flight
-     * set is cleared later, on the render thread, in publishLodPrepared.
-     */
-    private void finishLodTask(long key, PreparedSection prepared) {
+    private void finishLodTask(long key, PreparedSection prepared, long generation, int scale) {
         if (prepared != null) {
-            lodPrepared.add(prepared);
+            lodPrepared.add(new LodPrepared(prepared, generation, scale));
         } else {
-            lodFailed.add(key);
+            lodFailed.add(new LodCompletion(key, generation));
         }
         finishActiveTask();
     }
 
-    private void finishLodRetrySoon(long key) {
-    lodRetrySoon.add(key);
-    finishActiveTask();
-}
+    private void finishLodRetrySoon(long key, long generation) {
+        lodRetrySoon.add(new LodCompletion(key, generation));
+        finishActiveTask();
+    }
 
     /** Publishes finished LOD sections into the shared section table. */
     private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
-    // A transient source miss is not a confirmed empty terrain result.
-    if (!lodRetrySoon.isEmpty()) {
-        List<Long> retrySoon;
-        synchronized (lodRetrySoon) {
-            retrySoon = new ArrayList<>(lodRetrySoon);
-            lodRetrySoon.clear();
-        }
-        for (Long key : retrySoon) {
-            lodInFlight.remove(key.longValue());
-        }
-        lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
-        CausticaMod.LOGGER.info(
-                "CausticaLOD source not query-ready; retrying in 1 second ({} regions deferred)",
-                retrySoon.size());
-    }
+        long currentGeneration = lodGeneration;
 
-        // Retire failed keys first so they become eligible for redispatch. Done here, on the render
-        // thread, because lodInFlight is not thread-safe.
+        if (!lodRetrySoon.isEmpty()) {
+            List<LodCompletion> retrySoon;
+            synchronized (lodRetrySoon) {
+                retrySoon = new ArrayList<>(lodRetrySoon);
+                lodRetrySoon.clear();
+            }
+            int currentDeferred = 0;
+            for (LodCompletion completion : retrySoon) {
+                if (completion.generation() != currentGeneration) {
+                    continue;
+                }
+                lodInFlight.remove(completion.key());
+                currentDeferred++;
+            }
+            if (currentDeferred != 0) {
+                lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
+                CausticaMod.LOGGER.info(
+                        "CausticaLOD source not query-ready; retrying in 1 second ({} regions deferred)",
+                        currentDeferred);
+            }
+        }
+
         if (!lodFailed.isEmpty()) {
-            List<Long> failed;
+            List<LodCompletion> failed;
             synchronized (lodFailed) {
                 failed = new ArrayList<>(lodFailed);
                 lodFailed.clear();
             }
             long retryAfter = RtComposite.frameCounter() + LOD_RETRY_COOLDOWN_FRAMES;
-            for (Long key : failed) {
-                long primitiveKey = key.longValue();
-                lodInFlight.remove(primitiveKey);
-                lodRetryAfterFrame.put(primitiveKey, retryAfter);
+            for (LodCompletion completion : failed) {
+                if (completion.generation() != currentGeneration) {
+                    continue;
+                }
+                lodInFlight.remove(completion.key());
+                lodRetryAfterFrame.put(completion.key(), retryAfter);
             }
         }
+
         if (lodPrepared.isEmpty()) {
             return;
         }
-        List<PreparedSection> batch;
+        List<LodPrepared> batch;
         synchronized (lodPrepared) {
             batch = new ArrayList<>(lodPrepared);
             lodPrepared.clear();
         }
-        int scale = 1 << CausticaConfig.Rt.Lod.DETAIL.value();
-        for (PreparedSection ps : batch) {
-            lodInFlight.remove(ps.key());
-            lodRetryAfterFrame.remove(ps.key());
-            if (lodResident.containsKey(ps.key()) || !CausticaConfig.Rt.Lod.ENABLED.value()) {
-                // Either a duplicate dispatch of the same key, or LOD was switched off while this was
-                // in flight. Retire it rather than publishing geometry nothing will ever release.
-                ctx.gpuExecutor().retireUnpublished(() -> destroyPreparedSection(ps));
+
+        boolean changed = false;
+        for (LodPrepared completion : batch) {
+            PreparedSection ps = completion.prepared();
+            if (completion.generation() != currentGeneration
+                    || lodActiveDetail == Integer.MIN_VALUE
+                    || !CausticaConfig.Rt.Lod.ENABLED.value()) {
+                destroyPreparedSection(ps);
                 continue;
             }
+
+            lodInFlight.remove(ps.key());
+            lodRetryAfterFrame.remove(ps.key());
+            if (lodResident.containsKey(ps.key())) {
+                destroyPreparedSection(ps);
+                continue;
+            }
+
             SectionGeom g = new SectionGeom(ps.key(), ps.uvs(), ps.material(),
                     ps.blas().accel, ps.triBase(), ps.sx(), ps.sy(), ps.sz(), ps.lights());
-            g.lodScale = scale;
+            g.lodScale = completion.scale();
             g.slot = table.allocateSlot();
             g.instanceIndex = table.instanceList.size();
             table.slots.set(g.slot, g);
             table.write(g);
             table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
             lodResident.put(ps.key(), g);
+            changed = true;
         }
-        // Logged at a few thresholds rather than per section: enough to tell "nothing is publishing"
-        // from "sections are arriving", without a line per frame while the ring fills.
+
+        if (!changed) {
+            return;
+        }
         int count = lodResident.size();
         if (count != lodLoggedPublished && (count == 1 || count == 8 || count == 32 || count == 128)) {
             lodLoggedPublished = count;
-            CausticaMod.LOGGER.info("LOD sections published: {}", count);
+            CausticaMod.LOGGER.info("CausticaLOD sections published: {}", count);
         }
         table.flushWrites();
         table.instances = table.instanceList;
+    }
+
+    private void pruneExpiredLodRetries(long frame) {
+        var iterator = lodRetryAfterFrame.long2LongEntrySet().fastIterator();
+        while (iterator.hasNext()) {
+            if (iterator.next().getLongValue() <= frame) {
+                iterator.remove();
+            }
+        }
     }
 
     private void evictLodOutside(RtContext ctx, int centreX, int centreZ,
@@ -1773,36 +1822,71 @@ public final class RtTerrain {
      * that list, so removing entries in place would invalidate every later section's index.
      */
     private void releaseLod(RtContext ctx) {
-        if (lodResident.isEmpty()) {
-            return;
+        boolean hadAsync = !lodInFlight.isEmpty() || !lodPrepared.isEmpty()
+                || !lodFailed.isEmpty() || !lodRetrySoon.isEmpty();
+        boolean hadState = lodActiveDetail != Integer.MIN_VALUE || !lodResident.isEmpty()
+                || hadAsync || !lodRetryAfterFrame.isEmpty();
+
+        if (hadState) {
+            lodGeneration++;
         }
-        List<SectionGeom> doomed = new ArrayList<>(lodResident.values());
-        lodResident.clear();
-        lodInFlight.clear();
-        lodRetryAfterFrame.clear();
+        lodActiveDetail = Integer.MIN_VALUE;
+        lodActiveHeightSections = Integer.MIN_VALUE;
+        lodSourceRetryAfterNanos = 0L;
+
+        List<LodPrepared> completed;
+        synchronized (lodPrepared) {
+            completed = new ArrayList<>(lodPrepared);
+            lodPrepared.clear();
+        }
+        for (LodPrepared completion : completed) {
+            destroyPreparedSection(completion.prepared());
+        }
         synchronized (lodFailed) {
             lodFailed.clear();
         }
-        // Anything still in flight will land in lodPrepared after this; publishLodPrepared drops
-        // prepared sections whose key is no longer wanted, so they are retired rather than leaked.
-        for (SectionGeom g : doomed) {
-            if (g.slot >= 0 && g.slot < table.slots.size()) {
-                table.slots.set(g.slot, null);
-                table.freeSlots.add(g.slot);
-            }
-            g.slot = -1;
-            g.instanceIndex = -1;
+        synchronized (lodRetrySoon) {
+            lodRetrySoon.clear();
         }
-        table.instanceList.clear();
-        for (int i = 0; i < table.slots.size(); i++) {
-            SectionGeom g = table.slots.get(i);
-            if (g != null) {
-                g.instanceIndex = table.instanceList.size();
-                table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
+        lodInFlight.clear();
+        lodRetryAfterFrame.clear();
+
+        if (!lodResident.isEmpty()) {
+            List<SectionGeom> doomed = new ArrayList<>(lodResident.values());
+            lodResident.clear();
+            for (SectionGeom g : doomed) {
+                if (g.slot >= 0 && g.slot < table.slots.size()) {
+                    table.slots.set(g.slot, null);
+                    table.freeSlots.add(g.slot);
+                }
+                g.slot = -1;
+                g.instanceIndex = -1;
             }
+            table.instanceList.clear();
+            for (int i = 0; i < table.slots.size(); i++) {
+                SectionGeom g = table.slots.get(i);
+                if (g != null) {
+                    g.instanceIndex = table.instanceList.size();
+                    table.instanceList.add(table.instanceFor(g, blockX, blockY, blockZ));
+                }
+            }
+            table.instances = table.instanceList;
+            retire(ctx, ctx.gpuExecutor().latestGraphicsUse(), doomed);
         }
-        table.instances = table.instanceList;
-        retire(ctx, ctx.gpuExecutor().latestGraphicsUse(), doomed);
+
+        lodEmptyRegions.set(0);
+        lodBoxesSeen.set(0);
+        lodLoggedEmptyCount = -1;
+        lodLoggedPublished = -1;
+        if (!CausticaConfig.Rt.Lod.ENABLED.value()) {
+            lodLoggedState = false;
+        }
+    }
+
+    private record LodPrepared(PreparedSection prepared, long generation, int scale) {
+    }
+
+    private record LodCompletion(long key, long generation) {
     }
 
     private record DispatchContext(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
@@ -2071,7 +2155,9 @@ public final class RtTerrain {
         // its resources before the executor, allocator, and VkDevice disappear.
         terrainEpoch++;
         lightGrid.cancelPending();
+        releaseLod(ctx);
         drainTasksForClear(ctx);
+        releaseLod(ctx);
         cancelAllDirtyGroups();
         ctx.waitIdle();
         ctx.gpuExecutor().flushDestroysAfterDeviceIdle();
@@ -2150,6 +2236,7 @@ public final class RtTerrain {
     private void clearAsync(RtContext ctx) {
         ctx.gpuExecutor().throwIfFailed();
         terrainEpoch++;
+        releaseLod(ctx);
 
         // Token maps are render-thread ownership, so clearing them makes every old completion unpublishable
         // even in the narrow race where it observed the previous epoch immediately before this increment.
