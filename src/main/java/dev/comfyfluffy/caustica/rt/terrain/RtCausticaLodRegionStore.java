@@ -17,8 +17,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.InflaterInputStream;
@@ -44,7 +44,8 @@ final class RtCausticaLodRegionStore {
     private static final int HEADER_BYTES = 16 + REGION_SLOTS * 8;
     private static final int RAW_TILE_BYTES = TILE_COLUMNS * (2 + 2 + 4 + 4 + 4);
 
-    private static final ConcurrentHashMap<Path, RegionReader> READERS = new ConcurrentHashMap<>();
+    private static final int MAX_OPEN_READERS = 64;
+    private static final LinkedHashMap<Path, RegionReader> READERS = new LinkedHashMap<>(64, 0.75f, true);
 
     private RtCausticaLodRegionStore() {
     }
@@ -62,21 +63,31 @@ final class RtCausticaLodRegionStore {
     }
 
     static boolean hasTile(Path root, int chunkX, int chunkZ) {
-        RegionReader reader = reader(root, chunkX, chunkZ);
-        return reader != null && reader.has(slot(chunkX, chunkZ));
+        synchronized (READERS) {
+            RegionReader reader = readerLocked(root, chunkX, chunkZ);
+            return reader != null && reader.has(slot(chunkX, chunkZ));
+        }
     }
 
     static TileData read(Path root, int chunkX, int chunkZ) {
-        RegionReader reader = reader(root, chunkX, chunkZ);
-        return reader != null ? reader.read(slot(chunkX, chunkZ)) : null;
+        // Keep the cache lock through the small positional read/decompression. That makes eviction
+        // unable to close a channel that another worker is actively using, without a ref-counted FD
+        // wrapper. Region payloads are only ~4 KiB raw, so this lock is much cheaper than an OS-handle
+        // leak and disk remains far outside the render thread.
+        synchronized (READERS) {
+            RegionReader reader = readerLocked(root, chunkX, chunkZ);
+            return reader != null ? reader.read(slot(chunkX, chunkZ)) : null;
+        }
     }
 
     /** Closes positional-read channels when the client swaps server/dimension or shuts RT down. */
     static void reset() {
-        for (RegionReader reader : READERS.values()) {
-            reader.close();
+        synchronized (READERS) {
+            for (RegionReader reader : READERS.values()) {
+                reader.close();
+            }
+            READERS.clear();
         }
-        READERS.clear();
     }
 
     /**
@@ -135,9 +146,11 @@ final class RtCausticaLodRegionStore {
             Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
         }
 
-        RegionReader stale = READERS.remove(target.toAbsolutePath().normalize());
-        if (stale != null) {
-            stale.close();
+        synchronized (READERS) {
+            RegionReader stale = READERS.remove(target.toAbsolutePath().normalize());
+            if (stale != null) {
+                stale.close();
+            }
         }
     }
 
@@ -153,7 +166,8 @@ final class RtCausticaLodRegionStore {
         return Math.floorMod(chunkX, REGION_EDGE) * REGION_EDGE + Math.floorMod(chunkZ, REGION_EDGE);
     }
 
-    private static RegionReader reader(Path root, int chunkX, int chunkZ) {
+    /** Called only while synchronized on READERS. */
+    private static RegionReader readerLocked(Path root, int chunkX, int chunkZ) {
         if (root == null) {
             return null;
         }
@@ -169,10 +183,11 @@ final class RtCausticaLodRegionStore {
         }
         try {
             RegionReader opened = new RegionReader(path, rx, rz);
-            RegionReader raced = READERS.putIfAbsent(path, opened);
-            if (raced != null) {
-                opened.close();
-                return raced;
+            READERS.put(path, opened);
+            while (READERS.size() > MAX_OPEN_READERS) {
+                Map.Entry<Path, RegionReader> eldest = READERS.entrySet().iterator().next();
+                READERS.remove(eldest.getKey());
+                eldest.getValue().close();
             }
             return opened;
         } catch (IOException | RuntimeException e) {
