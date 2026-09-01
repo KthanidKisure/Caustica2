@@ -1,0 +1,48 @@
+name: CausticaLOD Aircompressor 3.7 validation
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-aircompressor37.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Verify Maven artifact, SHA-256 and reflected Zstd API
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://repo.maven.apache.org/maven2/io/airlift/aircompressor-v3/3.7/aircompressor-v3-3.7.jar"
+          curl --fail --location --retry 3 -o aircompressor.jar "$base"
+          curl --fail --location --retry 3 -o aircompressor.jar.sha256 "$base.sha256"
+          expected="$(awk '{print $1}' aircompressor.jar.sha256)"
+          echo "$expected  aircompressor.jar" | sha256sum --check
+          jar tf aircompressor.jar | grep -q '^io/airlift/compress/v3/zstd/ZstdJavaDecompressor.class$'
+          javap -classpath aircompressor.jar io.airlift.compress.v3.zstd.ZstdJavaDecompressor | grep -q 'getDecompressedSize'
+          javap -classpath aircompressor.jar io.airlift.compress.v3.zstd.ZstdJavaDecompressor | grep -q 'decompress'
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java')
+          s = p.read_text()
+          old = 'private static final String AIRCOMPRESSOR_VERSION = "3.6";'
+          new = 'private static final String AIRCOMPRESSOR_VERSION = "3.7";'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java
+          git commit -m "Upgrade WynnLOD decompressor to Aircompressor 3.7"
+          git push origin HEAD:codex/claude-pass
