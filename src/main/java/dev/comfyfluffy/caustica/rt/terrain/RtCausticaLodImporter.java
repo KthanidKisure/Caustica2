@@ -93,7 +93,9 @@ final class RtCausticaLodImporter {
         return thread;
     });
     private static final AtomicBoolean RUNNING = new AtomicBoolean();
-    private static volatile String attemptedIdentity = "";
+    private static final long RETRY_DELAY_NANOS = 30_000_000_000L;
+    private static volatile String retryIdentity = "";
+    private static volatile long retryAfterNanos;
 
     private RtCausticaLodImporter() {
     }
@@ -111,22 +113,29 @@ final class RtCausticaLodImporter {
         if (Files.isRegularFile(marker)) {
             return;
         }
-        if (sessionIdentity.equals(attemptedIdentity) || !RUNNING.compareAndSet(false, true)) {
+        long now = System.nanoTime();
+        if (!sessionIdentity.equals(retryIdentity)) {
+            retryIdentity = sessionIdentity;
+            retryAfterNanos = 0L;
+        }
+        if (now < retryAfterNanos || !RUNNING.compareAndSet(false, true)) {
             return;
         }
-        attemptedIdentity = sessionIdentity;
         WORKER.execute(() -> {
             try {
-                importWynncraft(mc, server, sessionRoot, marker);
+                importWynncraft(sessionRoot, marker);
+                retryAfterNanos = Long.MAX_VALUE;
             } catch (Throwable t) {
-                CausticaMod.LOGGER.error("CausticaLOD WynnLOD import failed; live native capture remains usable", t);
+                retryAfterNanos = System.nanoTime() + RETRY_DELAY_NANOS;
+                CausticaMod.LOGGER.error(
+                        "CausticaLOD WynnLOD import failed; live native capture remains usable and import will retry", t);
             } finally {
                 RUNNING.set(false);
             }
         });
     }
 
-    private static void importWynncraft(Minecraft mc, String server, Path sessionRoot, Path marker) throws Exception {
+    private static void importWynncraft(Path sessionRoot, Path marker) throws Exception {
         Files.createDirectories(sessionRoot);
         Path gameDir = FabricLoader.getInstance().getGameDir();
         Path tools = gameDir.resolve("caustica_lod").resolve("tools");
@@ -141,26 +150,22 @@ final class RtCausticaLodImporter {
                 tools.resolve("aircompressor-v3-" + AIRCOMPRESSOR_VERSION + ".jar"));
 
         try (RocksBridge bridge = new RocksBridge(rocksJar, airJar)) {
-            Path existingVoxy = gameDir.resolve(".voxy").resolve("saves").resolve(server.replace(':', '_'));
-            List<Path> databases = discoverDatabases(existingVoxy, bridge);
-            Path downloadedArchive = null;
+            // The official WynnLOD release is the deterministic bulk source. Never silently depend on
+            // an installed Voxy database: it may be partial, stale, from another profile, or absent.
+            Path downloadedArchive = importRoot.resolve("frumavoxylods.zip");
             Path staging = importRoot.resolve("staging");
-            boolean downloaded = false;
-
-            if (databases.isEmpty()) {
-                downloadedArchive = importRoot.resolve("frumavoxylods.zip");
-                ensureDownload(URI.create(WYNNLOD_URL), downloadedArchive, "SHA-256", WYNNLOD_SHA256);
-                Path extractedMarker = staging.resolve(".complete");
-                if (!Files.isRegularFile(extractedMarker)) {
-                    deleteTree(staging);
-                    Files.createDirectories(staging);
-                    CausticaMod.LOGGER.info("CausticaLOD extracting WynnLOD Voxy archive for one-time conversion");
-                    extractZip(downloadedArchive, staging);
-                    Files.writeString(extractedMarker, WYNNLOD_SHA256, StandardCharsets.US_ASCII);
-                }
-                databases = discoverDatabases(staging, bridge);
-                downloaded = true;
+            ensureDownload(URI.create(WYNNLOD_URL), downloadedArchive, "SHA-256", WYNNLOD_SHA256);
+            Path extractedMarker = staging.resolve(".complete");
+            boolean extractionMatches = Files.isRegularFile(extractedMarker)
+                    && WYNNLOD_SHA256.equals(Files.readString(extractedMarker, StandardCharsets.US_ASCII).trim());
+            if (!extractionMatches) {
+                deleteTree(staging);
+                Files.createDirectories(staging);
+                CausticaMod.LOGGER.info("CausticaLOD extracting official WynnLOD Voxy archive for one-time conversion");
+                extractZip(downloadedArchive, staging);
+                Files.writeString(extractedMarker, WYNNLOD_SHA256, StandardCharsets.US_ASCII);
             }
+            List<Path> databases = discoverDatabases(staging, bridge);
 
             if (databases.isEmpty()) {
                 throw new IOException("No Voxy RocksDB containing world_sections + id_mappings was found");
@@ -179,12 +184,8 @@ final class RtCausticaLodImporter {
                     "CausticaLOD WynnLOD import complete: {} level-0 sections -> {} surface tiles in {} packed regions; DH/Voxy are not required for rendering",
                     stats.sections, stats.tiles, stats.regions);
 
-            if (downloaded) {
-                deleteTree(staging);
-                if (downloadedArchive != null) {
-                    Files.deleteIfExists(downloadedArchive);
-                }
-            }
+            deleteTree(staging);
+            Files.deleteIfExists(downloadedArchive);
         }
     }
 

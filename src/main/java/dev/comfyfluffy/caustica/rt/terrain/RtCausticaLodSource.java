@@ -415,6 +415,9 @@ public final class RtCausticaLodSource {
         IO.execute(() -> {
             try {
                 writeTile(tile);
+                // Once the live override is atomically visible, evict any imported copy cached by the
+                // packed source so the next distant query immediately observes the visited terrain.
+                RtCausticaLodPackedSource.invalidateTile(tile.chunkX, tile.chunkZ);
             } finally {
                 WRITE_PENDING.remove(key);
             }

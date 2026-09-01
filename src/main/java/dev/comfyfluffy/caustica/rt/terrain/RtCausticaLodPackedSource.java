@@ -117,6 +117,10 @@ final class RtCausticaLodPackedSource {
         return new RtCausticaLodSource.FetchResult(boxes, true);
     }
 
+    static void invalidateTile(int chunkX, int chunkZ) {
+        MEMORY.remove(packCoords(chunkX, chunkZ));
+    }
+
     static synchronized void invalidate() {
         MEMORY.clear();
         identity = "";
