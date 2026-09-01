@@ -173,9 +173,9 @@ public final class RtTerrain {
             java.util.Collections.synchronizedList(new ArrayList<>());
     /** Keys whose dispatch ended without geometry (empty region, DH miss, or a build failure). */
     private final List<Long> lodFailed = java.util.Collections.synchronizedList(new ArrayList<>());
-    /** Failed DH API/lifecycle queries: retry soon; never poison the long empty-region cache. */
+    /** Transient source misses: retry soon and never poison the long empty-region cooldown. */
     private final List<Long> lodRetrySoon = java.util.Collections.synchronizedList(new ArrayList<>());
-    /** Render-frame deadline before an empty/failed DH region may be queried again. Render-thread only. */
+    /** Render-frame deadline before an empty/failed native LOD region may be queried again. Render-thread only. */
     private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
     private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
     private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;
@@ -186,10 +186,10 @@ public final class RtTerrain {
      * a real section or with another detail level.
      */
     private static final int LOD_KEY_Y_OFFSET = 512;
-    /** Regions DH had no geometry for. If this climbs while published stays 0, the database is the problem. */
+    /** Native LOD regions with no geometry. If this climbs while published stays 0, inspect source coverage. */
     private final java.util.concurrent.atomic.AtomicInteger lodEmptyRegions =
             new java.util.concurrent.atomic.AtomicInteger();
-    /** Total boxes DH handed back. Non-zero with zero published means meshing is the problem, not DH. */
+    /** Total surface boxes handed to the virtual mesher. Non-zero with zero published isolates meshing/BLAS. */
     private final java.util.concurrent.atomic.AtomicInteger lodBoxesSeen =
             new java.util.concurrent.atomic.AtomicInteger();
     // Worker/build bookkeeping. `inFlight` maps a dispatched section key to a monotonic token; a completed
@@ -1457,7 +1457,7 @@ public final class RtTerrain {
 
     /** Per-tick render-thread snapshot dependencies shared by reextract + missing dispatch. */
 
-    // ---- Distant LOD from Distant Horizons -------------------------------------------------------
+    // ---- Caustica-native distant LOD --------------------------------------------------------------
     //
     // A second, much coarser section grid living entirely past the vanilla chunk cache. It rides the
     // same mesh -> upload -> BLAS -> table pipeline as ordinary terrain, but is tracked separately
@@ -1478,10 +1478,10 @@ public final class RtTerrain {
         boolean enabled = CausticaConfig.Rt.Lod.ENABLED.value();
         if (!enabled || !RtDhLodSource.available()) {
             if (enabled && !lodLoggedState) {
-                // The single most useful line: says plainly whether DH's API resolved at all, which
-                // separates "Caustica is not asking" from "DH has no data".
+                // The single most useful line separates disabled/unavailable native source state from
+                // later meshing or BLAS publication failures.
                 lodLoggedState = true;
-                CausticaMod.LOGGER.info("LOD enabled but the Distant Horizons API is unavailable; no distant terrain");
+                CausticaMod.LOGGER.info("CausticaLOD enabled but its native source is not ready; no distant terrain yet");
             }
             releaseLod(ctx);
             return;
@@ -1489,12 +1489,12 @@ public final class RtTerrain {
         int empties = lodEmptyRegions.get();
         if (empties >= 64 && empties % 64 == 0 && lodResident.isEmpty()) {
             CausticaMod.LOGGER.info(
-                    "LOD: {} regions queried, {} boxes returned by DH, none published (detail {})",
+                    "CausticaLOD: {} empty regions, {} source boxes observed, none published (detail {})",
                     empties, lodBoxesSeen.get(), CausticaConfig.Rt.Lod.DETAIL.value());
         }
         if (!lodLoggedState) {
             lodLoggedState = true;
-            CausticaMod.LOGGER.info("LOD active: detail={}, radius={}, DH source available",
+            CausticaMod.LOGGER.info("CausticaLOD active: detail={}, radius={}, native source available",
                     CausticaConfig.Rt.Lod.DETAIL.value(), CausticaConfig.Rt.Lod.RADIUS.value());
         }
         publishLodPrepared(ctx, pbx, pby, pbz);
@@ -1506,12 +1506,19 @@ public final class RtTerrain {
         int scale = 1 << detail;
         int sectionBlocks = RtDhLodRegion.SECTION_BLOCKS * scale;
         int radius = CausticaConfig.Rt.Lod.RADIUS.value();
-        int heightSections = CausticaConfig.Rt.Lod.HEIGHT_SECTIONS.value();
+        int configuredHeightSections = CausticaConfig.Rt.Lod.HEIGHT_SECTIONS.value();
         int budget = CausticaConfig.Rt.Lod.SECTIONS_PER_FRAME.value();
 
         int centreX = Math.floorDiv(pbx, sectionBlocks);
         int centreZ = Math.floorDiv(pbz, sectionBlocks);
-        int centreY = Math.floorDiv(62, sectionBlocks);
+        int minPageY = Math.floorDiv(level.getMinY(), sectionBlocks);
+        int maxBlockY = level.getMinY() + level.getHeight() - 1;
+        int maxPageY = Math.floorDiv(maxBlockY, sectionBlocks);
+        int worldPageCount = Math.max(1, maxPageY - minPageY + 1);
+        int heightSections = Math.min(configuredHeightSections, worldPageCount);
+        int playerPageY = Math.floorDiv(pby, sectionBlocks);
+        int maxStartY = maxPageY - heightSections + 1;
+        int startPageY = Math.clamp(playerPageY - heightSections / 2, minPageY, maxStartY);
         evictLodOutside(ctx, centreX, centreZ, sectionBlocks, radius + 2);
         long frame = RtComposite.frameCounter();
 
@@ -1529,7 +1536,7 @@ public final class RtTerrain {
                         }
                         int lx = centreX + dx;
                         int lz = centreZ + dz;
-                        int ly = centreY + dy;
+                        int ly = startPageY + dy;
                         long key = lodKey(lx, ly, lz, detail);
                         if (lodResident.containsKey(key) || lodInFlight.contains(key)) {
                             continue;
@@ -1559,10 +1566,9 @@ public final class RtTerrain {
         try {
             RtWorkerPool.INSTANCE.submit(() -> {
                 try {
-                    // One query covering the section's whole footprint. DH's detailLevel is the size of
-                    // the queried AREA, not the data resolution, so the footprint is what it needs —
-                    // asking for "detail 3" got an 8x8-block area per 128-block section, which is why
-                    // sections came back empty.
+                    // One source query covers this virtual section's whole horizontal footprint. The source
+                    // returns world-space surface boxes; RtDhLodRegion clips/resamples them into this
+                    // page before the ordinary material mesher builds its path-traced geometry.
                     RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
                     RtDhLodSource.FetchResult fetched = RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
         if (!fetched.querySucceeded()) {
@@ -1573,9 +1579,8 @@ public final class RtTerrain {
                     region.fill(boxes);
                     lodBoxesSeen.addAndGet(boxes.size());
                     if (region.isEmpty()) {
-                        // Empty means DH returned no solid blocks here — either the region is not in
-                        // its database, or the detail level has not been generated. Counted rather
-                        // than logged per section, which would be thousands of lines.
+                        // Empty means the native surface cache has no geometry for this page/footprint yet.
+                        // Count rather than logging every region, which would produce thousands of lines.
                         lodEmptyRegions.incrementAndGet();
                         finishLodTask(key, null);
                         return;
@@ -1652,7 +1657,7 @@ public final class RtTerrain {
 
     /** Publishes finished LOD sections into the shared section table. */
     private void publishLodPrepared(RtContext ctx, int pbx, int pby, int pbz) {
-    // A rejected DH call is a source lifecycle problem, not an empty terrain result.
+    // A transient source miss is not a confirmed empty terrain result.
     if (!lodRetrySoon.isEmpty()) {
         List<Long> retrySoon;
         synchronized (lodRetrySoon) {
@@ -1664,7 +1669,7 @@ public final class RtTerrain {
         }
         lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
         CausticaMod.LOGGER.info(
-                "LOD: DH source not query-ready; retrying in 1 second ({} regions deferred)",
+                "CausticaLOD source not query-ready; retrying in 1 second ({} regions deferred)",
                 retrySoon.size());
     }
 

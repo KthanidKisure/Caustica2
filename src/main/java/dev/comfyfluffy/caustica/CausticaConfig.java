@@ -924,24 +924,22 @@ public final class CausticaConfig {
         }
 
         /**
-         * Distant terrain from Distant Horizons' database. Off by default.
+         * Caustica-native path-traced distant terrain. No external LOD mod is required. Live worlds
+         * teach the persistent surface cache as chunks arrive; Wynncraft can additionally seed the
+         * cache from the verified official WynnLOD dataset in a one-time background conversion.
          *
-         * <p>DH is used as a WORLD DATABASE only — its own rendering should be disabled. Caustica reads
-         * LOD terrain through DH's public API, meshes it, and puts it in the acceleration structure, so
-         * distant terrain is traced like everything else: it casts shadows, appears in reflections and
-         * contributes to global illumination, which a rasterised LOD renderer cannot do.
-         *
-         * <p>Requires Distant Horizons installed with data for the current world. On a server that means
-         * something has populated its database — on Wynncraft, the WynnLODGrabber download.
+         * <p>The representation stores the visible surface shell rather than complete chunks, then
+         * follows the ordinary Caustica material -> BLAS -> TLAS path, so distant terrain participates
+         * in ray-traced shadows, reflections and global illumination without raster LOD composition.
          */
         public static final class Lod {
-            /** Master switch. Off skips every DH query, mesh and BLAS build. */
+            /** Master switch for native surface capture, imported packs, meshing and LOD BLAS residency. */
             public static final BooleanSetting ENABLED =
-                    bool("caustica.rt.lod.enabled", "lod.enabled", false);
+                    bool("caustica.rt.lod.enabled", "lod.enabled", true);
             /**
-             * DH detail level. Each virtual block covers 2^detail world blocks, and one LOD section
-             * therefore spans 16*2^detail blocks for the triangle cost of one ordinary section:
-             * 3 gives 128-block sections, 4 gives 256. Lower is sharper and far more expensive.
+             * Surface detail level. Each virtual cell covers 2^detail world blocks and one LOD section
+             * spans 16*2^detail blocks: 3 gives 128-block sections, 4 gives 256. Lower is sharper and
+             * more expensive; higher is cheaper and intended for very distant terrain.
              */
             public static final IntSetting DETAIL =
                     clampedInt("caustica.rt.lod.detail", "lod.detail", 3, 1, 6);
@@ -949,14 +947,15 @@ public final class CausticaConfig {
             public static final IntSetting RADIUS =
                     clampedInt("caustica.rt.lod.radius", "lod.radius", 8, 1, 64);
             /**
-             * Vertical span in LOD sections, centred on sea level. Distant terrain rarely needs the
-             * full world height, and every extra layer is a full ring of sections.
+             * Maximum vertical LOD pages. The streamer derives the pages from the world's actual
+             * build-height range; the default covers the complete range at every supported detail.
+             * Lowering this centres the retained pages around the player as a performance trade-off.
              */
             public static final IntSetting HEIGHT_SECTIONS =
-                    clampedInt("caustica.rt.lod.heightSections", "lod.height-sections", 2, 1, 16);
+                    clampedInt("caustica.rt.lod.heightSections", "lod.height-sections", 16, 1, 16);
             /**
-             * LOD sections started per frame. This is the streaming throttle: each one is a DH database
-             * query plus a mesh plus a BLAS build, so a high value stutters while the world loads.
+             * LOD sections started per frame. This is the streaming throttle: each one samples the
+             * native surface source, meshes it and prepares a BLAS, so a high value can cause load spikes.
              */
             public static final IntSetting SECTIONS_PER_FRAME =
                     clampedInt("caustica.rt.lod.sectionsPerFrame", "lod.sections-per-frame", 2, 1, 32);
