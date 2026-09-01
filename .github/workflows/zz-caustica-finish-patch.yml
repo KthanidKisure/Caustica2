@@ -19,72 +19,43 @@ jobs:
           ref: codex/claude-pass
           fetch-depth: 0
 
-      - name: Apply validated source patches
+      - name: Apply source-only patches
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          # Minecraft 26.2 DataFixer returns Dynamic<?>. NbtOps guarantees its value is a Tag,
-          # but Java's generic inference cannot prove that at the BlockState.CODEC call site.
           p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java')
           s = p.read_text()
           old = 'return BlockState.CODEC.parse(NbtOps.INSTANCE, updated.getValue()).getOrThrow();'
           new = 'return BlockState.CODEC.parse(NbtOps.INSTANCE, (net.minecraft.nbt.Tag) updated.getValue()).getOrThrow();'
-          assert old in s, 'Importer DataFixer parse site changed unexpectedly'
+          assert old in s
           p.write_text(s.replace(old, new, 1))
 
-          # Reuse the async RT command buffer. The executor is the sole command-pool owner and waits
-          # for each submitted batch timeline value before normal reuse, so allocate/free every batch
-          # only adds driver churn. If a submitted batch fails before completion is observed, abandon
-          # that command buffer in the pool and allocate another rather than resetting an in-flight CB.
           p = Path('src/main/java/dev/comfyfluffy/caustica/rt/RtGpuExecutor.java')
           s = p.read_text()
-
-          old = '''    private final Thread thread;\n    private long commandPool;\n    private volatile boolean closed;'''
-          new = '''    private final Thread thread;\n    private long commandPool;\n    private VkCommandBuffer commandBuffer;\n    private volatile boolean closed;'''
-          assert old in s, 'RtGpuExecutor field site changed unexpectedly'
-          s = s.replace(old, new, 1)
-
-          old = '''        createCommandPool();\n        this.thread = new Thread(this::run, "Caustica GPU executor");'''
-          new = '''        createCommandPool();\n        this.commandBuffer = allocateCommandBuffer();\n        this.thread = new Thread(this::run, "Caustica GPU executor");'''
-          assert old in s, 'RtGpuExecutor constructor site changed unexpectedly'
-          s = s.replace(old, new, 1)
-
-          old = '''        VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);\n        commandPool = 0L;'''
-          new = '''        // Destroying the pool releases every primary command buffer it owns, including any\n        // abandoned buffer from a failed submitted batch. The executor thread is joined and the\n        // device is idle here, so no command buffer can still be pending.\n        commandBuffer = null;\n        VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);\n        commandPool = 0L;'''
-          assert old in s, 'RtGpuExecutor shutdown site changed unexpectedly'
-          s = s.replace(old, new, 1)
-
-          old = '''    private void execute(List<Job> batch) {\n        VkCommandBuffer cmd = null;\n        boolean submitted = false;\n        boolean completed = false;\n        long signalValue = batch.get(batch.size() - 1).build.value;\n        long firstValue = batch.get(0).build.value;\n        VulkanDiagnostics.setInFlight("async-compute",\n                "recording builds=" + firstValue + ".." + signalValue + " batch=" + batch.size()\n                        + " queued=" + jobs.size());\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()\n                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);\n            PointerBuffer pCmd = stack.mallocPointer(1);\n            RtContext.check(VK10.vkAllocateCommandBuffers(ctx.vk(), ai, pCmd), "vkAllocateCommandBuffers(RT GPU executor)");\n            cmd = new VkCommandBuffer(pCmd.get(0), ctx.vk());\n            VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);'''
-          new = '''    private void execute(List<Job> batch) {\n        VkCommandBuffer cmd = commandBuffer;\n        if (cmd == null) {\n            cmd = allocateCommandBuffer();\n            commandBuffer = cmd;\n        }\n        boolean submitted = false;\n        boolean completed = false;\n        long signalValue = batch.get(batch.size() - 1).build.value;\n        long firstValue = batch.get(0).build.value;\n        VulkanDiagnostics.setInFlight("async-compute",\n                "recording builds=" + firstValue + ".." + signalValue + " batch=" + batch.size()\n                        + " queued=" + jobs.size());\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            RtContext.check(VK10.vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer(RT GPU executor)");\n            VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);'''
-          assert old in s, 'RtGpuExecutor execute allocation site changed unexpectedly'
-          s = s.replace(old, new, 1)
-
-          old = '''        } finally {\n            // Never retry a failed host wait while unwinding: propagate its original error. A command\n            // buffer is safe to release here only if submission never happened or completion was observed.\n            // Otherwise the command pool owns it until shutdown waits the device idle and destroys the pool.\n            if (cmd != null && (!submitted || completed)) {\n                try (MemoryStack stack = MemoryStack.stackPush()) {\n                    VK10.vkFreeCommandBuffers(ctx.vk(), commandPool, stack.pointers(cmd));\n                }\n            }\n            if (!submitted || completed) {\n                VulkanDiagnostics.setInFlight("async-compute", null);\n            }\n        }\n    }'''
-          new = '''        } finally {\n            // Normal batches wait for their timeline value before returning, so the same primary CB is\n            // immediately safe to reset and reuse. If submission happened but completion was not\n            // observed (for example a device/host-wait failure), never reset that potentially in-flight\n            // command buffer: leave it owned by the pool until idle teardown and use a fresh one later.\n            if (submitted && !completed && commandBuffer == cmd) {\n                commandBuffer = null;\n            }\n            if (!submitted || completed) {\n                VulkanDiagnostics.setInFlight("async-compute", null);\n            }\n        }\n    }'''
-          assert old in s, 'RtGpuExecutor execute cleanup site changed unexpectedly'
-          s = s.replace(old, new, 1)
-
-          old = '''    private void createCommandPool() {\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandPoolCreateInfo ci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)\n                    .queueFamilyIndex(computeQueue.queueFamilyIndex());\n            LongBuffer out = stack.mallocLong(1);\n            RtContext.check(VK10.vkCreateCommandPool(ctx.vk(), ci, null, out), "vkCreateCommandPool(RT GPU executor)");\n            commandPool = out.get(0);\n            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "RT GPU executor command pool");\n        }\n    }'''
-          new = '''    private void createCommandPool() {\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandPoolCreateInfo ci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)\n                    .queueFamilyIndex(computeQueue.queueFamilyIndex());\n            LongBuffer out = stack.mallocLong(1);\n            RtContext.check(VK10.vkCreateCommandPool(ctx.vk(), ci, null, out), "vkCreateCommandPool(RT GPU executor)");\n            commandPool = out.get(0);\n            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "RT GPU executor command pool");\n        }\n    }\n\n    private VkCommandBuffer allocateCommandBuffer() {\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()\n                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);\n            PointerBuffer out = stack.mallocPointer(1);\n            RtContext.check(VK10.vkAllocateCommandBuffers(ctx.vk(), ai, out),\n                    "vkAllocateCommandBuffers(RT GPU executor)");\n            return new VkCommandBuffer(out.get(0), ctx.vk());\n        }\n    }'''
-          assert old in s, 'RtGpuExecutor command-pool site changed unexpectedly'
-          p.write_text(s.replace(old, new, 1))
-
-          # Build shaders and validate with the current Vulkan SDK rather than the older May toolchain.
-          p = Path('.github/workflows/ci.yml')
-          s = p.read_text()
-          assert 'VULKAN_SDK_VERSION: 1.4.350.0' in s
-          assert 'VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2' in s
-          s = s.replace('VULKAN_SDK_VERSION: 1.4.350.0', 'VULKAN_SDK_VERSION: 1.4.357.0', 1)
-          s = s.replace('VULKAN_SDK_SHA256: b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2',
-                        'VULKAN_SDK_SHA256: 0f09bf6a0625e346bf004be70b92907e934a4c76606b323441b2baf3a5a0e66d', 1)
+          replacements = [
+            ('''    private final Thread thread;\n    private long commandPool;\n    private volatile boolean closed;''',
+             '''    private final Thread thread;\n    private long commandPool;\n    private VkCommandBuffer commandBuffer;\n    private volatile boolean closed;'''),
+            ('''        createCommandPool();\n        this.thread = new Thread(this::run, "Caustica GPU executor");''',
+             '''        createCommandPool();\n        this.commandBuffer = allocateCommandBuffer();\n        this.thread = new Thread(this::run, "Caustica GPU executor");'''),
+            ('''        VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);\n        commandPool = 0L;''',
+             '''        // The pool owns every primary CB, including any abandoned after a failed submitted batch.\n        // The executor is joined and the device is idle here, so pool destruction is sufficient.\n        commandBuffer = null;\n        VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);\n        commandPool = 0L;'''),
+            ('''    private void execute(List<Job> batch) {\n        VkCommandBuffer cmd = null;\n        boolean submitted = false;\n        boolean completed = false;\n        long signalValue = batch.get(batch.size() - 1).build.value;\n        long firstValue = batch.get(0).build.value;\n        VulkanDiagnostics.setInFlight("async-compute",\n                "recording builds=" + firstValue + ".." + signalValue + " batch=" + batch.size()\n                        + " queued=" + jobs.size());\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()\n                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);\n            PointerBuffer pCmd = stack.mallocPointer(1);\n            RtContext.check(VK10.vkAllocateCommandBuffers(ctx.vk(), ai, pCmd), "vkAllocateCommandBuffers(RT GPU executor)");\n            cmd = new VkCommandBuffer(pCmd.get(0), ctx.vk());\n            VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);''',
+             '''    private void execute(List<Job> batch) {\n        VkCommandBuffer cmd = commandBuffer;\n        if (cmd == null) {\n            cmd = allocateCommandBuffer();\n            commandBuffer = cmd;\n        }\n        boolean submitted = false;\n        boolean completed = false;\n        long signalValue = batch.get(batch.size() - 1).build.value;\n        long firstValue = batch.get(0).build.value;\n        VulkanDiagnostics.setInFlight("async-compute",\n                "recording builds=" + firstValue + ".." + signalValue + " batch=" + batch.size()\n                        + " queued=" + jobs.size());\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            RtContext.check(VK10.vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer(RT GPU executor)");\n            VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);'''),
+            ('''        } finally {\n            // Never retry a failed host wait while unwinding: propagate its original error. A command\n            // buffer is safe to release here only if submission never happened or completion was observed.\n            // Otherwise the command pool owns it until shutdown waits the device idle and destroys the pool.\n            if (cmd != null && (!submitted || completed)) {\n                try (MemoryStack stack = MemoryStack.stackPush()) {\n                    VK10.vkFreeCommandBuffers(ctx.vk(), commandPool, stack.pointers(cmd));\n                }\n            }\n            if (!submitted || completed) {\n                VulkanDiagnostics.setInFlight("async-compute", null);\n            }\n        }\n    }''',
+             '''        } finally {\n            // Completed batches can safely reset/reuse the same primary command buffer. If submission\n            // happened but completion was not observed, leave that CB pool-owned until idle teardown.\n            if (submitted && !completed && commandBuffer == cmd) {\n                commandBuffer = null;\n            }\n            if (!submitted || completed) {\n                VulkanDiagnostics.setInFlight("async-compute", null);\n            }\n        }\n    }'''),
+            ('''    private void createCommandPool() {\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandPoolCreateInfo ci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)\n                    .queueFamilyIndex(computeQueue.queueFamilyIndex());\n            LongBuffer out = stack.mallocLong(1);\n            RtContext.check(VK10.vkCreateCommandPool(ctx.vk(), ci, null, out), "vkCreateCommandPool(RT GPU executor)");\n            commandPool = out.get(0);\n            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "RT GPU executor command pool");\n        }\n    }''',
+             '''    private void createCommandPool() {\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandPoolCreateInfo ci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()\n                    .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)\n                    .queueFamilyIndex(computeQueue.queueFamilyIndex());\n            LongBuffer out = stack.mallocLong(1);\n            RtContext.check(VK10.vkCreateCommandPool(ctx.vk(), ci, null, out), "vkCreateCommandPool(RT GPU executor)");\n            commandPool = out.get(0);\n            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "RT GPU executor command pool");\n        }\n    }\n\n    private VkCommandBuffer allocateCommandBuffer() {\n        try (MemoryStack stack = MemoryStack.stackPush()) {\n            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()\n                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);\n            PointerBuffer out = stack.mallocPointer(1);\n            RtContext.check(VK10.vkAllocateCommandBuffers(ctx.vk(), ai, out),\n                    "vkAllocateCommandBuffers(RT GPU executor)");\n            return new VkCommandBuffer(out.get(0), ctx.vk());\n        }\n    }''')
+          ]
+          for old, new in replacements:
+              assert old in s
+              s = s.replace(old, new, 1)
           p.write_text(s)
           PY
 
-          rm .github/workflows/zz-caustica-finish-patch.yml
           git config user.name "Caustica CI patch"
           git config user.email "actions@users.noreply.github.com"
-          git add -A
-          git commit -m "Fix WynnLOD import typing and reuse Vulkan command buffer"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java src/main/java/dev/comfyfluffy/caustica/rt/RtGpuExecutor.java
+          git commit -m "Fix WynnLOD import and reuse Vulkan command buffer"
           git push origin HEAD:codex/claude-pass
