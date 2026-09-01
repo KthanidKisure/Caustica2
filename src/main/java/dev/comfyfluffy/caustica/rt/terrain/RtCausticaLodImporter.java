@@ -287,13 +287,9 @@ final class RtCausticaLodImporter {
                 }
             }
         });
-        BlockState[] states = new BlockState[maxId[0] + 1];
+        BlockState[] states = new BlockState[Math.max(1, maxId[0] + 1)];
         decoded.forEach((id, state) -> states[id] = state);
-        if (states.length == 0) {
-            states = new BlockState[]{Blocks.AIR.defaultBlockState()};
-        } else {
-            states[0] = Blocks.AIR.defaultBlockState();
-        }
+        states[0] = Blocks.AIR.defaultBlockState();
         CausticaMod.LOGGER.info("CausticaLOD decoded {} WynnLOD block-state mappings ({} failed)", decoded.size(), failures[0]);
         return states;
     }
