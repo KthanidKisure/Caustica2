@@ -66,6 +66,7 @@ final class RtCausticaLodPackedSource {
             return new RtCausticaLodSource.FetchResult(List.of(), false);
         }
         int scale = Math.max(1, footprintBlocks / RtDhLodRegion.SECTION_BLOCKS);
+        SurfaceColumn[] surfaceGrid = sampleSurfaceGrid(originBlockX, originBlockZ, scale);
         ArrayList<RtCausticaLodSource.LodBox> boxes =
                 new ArrayList<>(RtDhLodRegion.SECTION_BLOCKS * RtDhLodRegion.SECTION_BLOCKS * 3);
         int resolvedCells = 0;
@@ -74,7 +75,7 @@ final class RtCausticaLodPackedSource {
             int cellX = originBlockX + vx * scale;
             for (int vz = 0; vz < RtDhLodRegion.SECTION_BLOCKS; vz++) {
                 int cellZ = originBlockZ + vz * scale;
-                SurfaceColumn column = representativeColumn(cellX, cellZ, scale);
+                SurfaceColumn column = surfaceGrid[gridIndex(vx + 1, vz + 1)];
                 if (column == null || column.groundY == NO_HEIGHT) {
                     continue;
                 }
@@ -92,7 +93,7 @@ final class RtCausticaLodPackedSource {
                     body = ground;
                 }
 
-                int skirtBottom = skirtBottom(cellX, cellZ, scale, groundY);
+                int skirtBottom = skirtBottom(surfaceGrid, vx + 1, vz + 1, groundY);
                 if (skirtBottom < groundY) {
                     boxes.add(new RtCausticaLodSource.LodBox(
                             cellX, skirtBottom, groundY, cellZ, scale, body, 0, 15));
@@ -132,21 +133,34 @@ final class RtCausticaLodPackedSource {
         RtCausticaLodRegionStore.reset();
     }
 
-    /**
-     * Lowest neighboring surface needed to close this cell's visible vertical boundary. Higher
-     * neighbors do not increase the skirt. Unknown neighbors are ignored so partial live caches do
-     * not fabricate walls at the edge of data that has not arrived yet.
-     */
-    private static int skirtBottom(int cellX, int cellZ, int scale, int groundY) {
+    /** Pre-sample the page plus a one-cell border so cliff skirts reuse exactly the same data. */
+    private static SurfaceColumn[] sampleSurfaceGrid(int originBlockX, int originBlockZ, int scale) {
+        int edge = RtDhLodRegion.SECTION_BLOCKS + 2;
+        SurfaceColumn[] grid = new SurfaceColumn[edge * edge];
+        for (int gx = -1; gx <= RtDhLodRegion.SECTION_BLOCKS; gx++) {
+            int x = originBlockX + gx * scale;
+            for (int gz = -1; gz <= RtDhLodRegion.SECTION_BLOCKS; gz++) {
+                int z = originBlockZ + gz * scale;
+                grid[gridIndex(gx + 1, gz + 1)] = representativeColumn(x, z, scale);
+            }
+        }
+        return grid;
+    }
+
+    private static int gridIndex(int x, int z) {
+        return x * (RtDhLodRegion.SECTION_BLOCKS + 2) + z;
+    }
+
+    private static int skirtBottom(SurfaceColumn[] grid, int gx, int gz, int groundY) {
         int bottom = groundY;
-        int[][] offsets = {
-                {-scale, 0},
-                {scale, 0},
-                {0, -scale},
-                {0, scale},
+        int[] indices = {
+                gridIndex(gx - 1, gz),
+                gridIndex(gx + 1, gz),
+                gridIndex(gx, gz - 1),
+                gridIndex(gx, gz + 1),
         };
-        for (int[] offset : offsets) {
-            SurfaceColumn neighbor = representativeColumn(cellX + offset[0], cellZ + offset[1], scale);
+        for (int index : indices) {
+            SurfaceColumn neighbor = grid[index];
             if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
                 bottom = Math.min(bottom, neighbor.groundY);
             }
