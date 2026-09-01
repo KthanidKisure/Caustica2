@@ -85,7 +85,7 @@ final class RtCausticaLodImporter {
             "2b494667869473c0133cc3de7c25b9b41b52382b1de79c7e79068139aad3f725";
 
     private static final String ROCKS_VERSION = "10.10.1.1";
-    private static final String AIRCOMPRESSOR_VERSION = "3.6";
+    private static final String AIRCOMPRESSOR_VERSION = "3.7";
     private static final int VOXY_SECTION_EDGE = 32;
     private static final int VOXY_SECTION_VOLUME = VOXY_SECTION_EDGE * VOXY_SECTION_EDGE * VOXY_SECTION_EDGE;
     private static final int VOXY_MAPPING_BYTES = VOXY_SECTION_VOLUME * 2;
