@@ -200,10 +200,12 @@ public final class RtCausticaLodSource {
                     body = ground;
                 }
 
-                // A filled column body gives cliffs and mountain silhouettes without storing caves or
-                // internal blocks. Adjacent virtual cells cull the interior faces in the ordinary mesher.
-                if (groundY > worldMinY) {
-                    boxes.add(new LodBox(cellX, worldMinY, groundY, cellZ, scale, body, 0, 15));
+                // Store only the exterior height-field shell. The vertical skirt reaches only as low
+                // as an adjacent sampled surface, which closes visible cliffs without inventing a solid
+                // pillar down to world minimum under every distant roof, island, hill and plateau.
+                int skirtBottom = skirtBottom(cellX, cellZ, scale, groundY);
+                if (skirtBottom < groundY) {
+                    boxes.add(new LodBox(cellX, skirtBottom, groundY, cellZ, scale, body, 0, 15));
                 }
                 boxes.add(new LodBox(cellX, groundY, groundY + 1, cellZ, scale, ground, 0, 15));
 
@@ -339,6 +341,28 @@ public final class RtCausticaLodSource {
             y--;
         }
         return Blocks.AIR.defaultBlockState();
+    }
+
+    /**
+     * Lowest neighboring surface needed to close this cell's visible vertical boundary. Higher
+     * neighbors do not increase the skirt. Unknown neighbors are ignored so partial live caches do
+     * not fabricate walls at the edge of data that has not arrived yet.
+     */
+    private static int skirtBottom(int cellX, int cellZ, int scale, int groundY) {
+        int bottom = groundY;
+        int[][] offsets = {
+                {-scale, 0},
+                {scale, 0},
+                {0, -scale},
+                {0, scale},
+        };
+        for (int[] offset : offsets) {
+            SurfaceColumn neighbor = representativeColumn(cellX + offset[0], cellZ + offset[1], scale);
+            if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
+                bottom = Math.min(bottom, neighbor.groundY);
+            }
+        }
+        return bottom;
     }
 
     private static SurfaceColumn representativeColumn(int cellX, int cellZ, int scale) {

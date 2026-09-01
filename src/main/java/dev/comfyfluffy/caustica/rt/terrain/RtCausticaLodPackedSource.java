@@ -92,8 +92,10 @@ final class RtCausticaLodPackedSource {
                     body = ground;
                 }
 
-                if (groundY > minY) {
-                    boxes.add(new RtCausticaLodSource.LodBox(cellX, minY, groundY, cellZ, scale, body, 0, 15));
+                int skirtBottom = skirtBottom(cellX, cellZ, scale, groundY);
+                if (skirtBottom < groundY) {
+                    boxes.add(new RtCausticaLodSource.LodBox(
+                            cellX, skirtBottom, groundY, cellZ, scale, body, 0, 15));
                 }
                 boxes.add(new RtCausticaLodSource.LodBox(cellX, groundY, groundY + 1, cellZ, scale, ground, 0, 15));
                 if (surfaceY > groundY) {
@@ -128,6 +130,28 @@ final class RtCausticaLodPackedSource {
         LOGGED_FIRST_QUERY.set(false);
         LOGGED_PACK_READY.set(false);
         RtCausticaLodRegionStore.reset();
+    }
+
+    /**
+     * Lowest neighboring surface needed to close this cell's visible vertical boundary. Higher
+     * neighbors do not increase the skirt. Unknown neighbors are ignored so partial live caches do
+     * not fabricate walls at the edge of data that has not arrived yet.
+     */
+    private static int skirtBottom(int cellX, int cellZ, int scale, int groundY) {
+        int bottom = groundY;
+        int[][] offsets = {
+                {-scale, 0},
+                {scale, 0},
+                {0, -scale},
+                {0, scale},
+        };
+        for (int[] offset : offsets) {
+            SurfaceColumn neighbor = representativeColumn(cellX + offset[0], cellZ + offset[1], scale);
+            if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
+                bottom = Math.min(bottom, neighbor.groundY);
+            }
+        }
+        return bottom;
     }
 
     private static SurfaceColumn representativeColumn(int cellX, int cellZ, int scale) {
