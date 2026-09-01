@@ -1,0 +1,52 @@
+name: CausticaLOD reader cap
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-region-reader-cap.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Cap packed region file handles
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodRegionStore.java')
+          s = p.read_text()
+          s = s.replace('import java.util.Map;\nimport java.util.concurrent.ConcurrentHashMap;\n', 'import java.util.LinkedHashMap;\nimport java.util.Map;\n', 1)
+          old = '    private static final ConcurrentHashMap<Path, RegionReader> READERS = new ConcurrentHashMap<>();\n'
+          new = '    private static final int MAX_OPEN_READERS = 64;\n    private static final LinkedHashMap<Path, RegionReader> READERS = new LinkedHashMap<>(64, 0.75f, true);\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '    static boolean hasTile(Path root, int chunkX, int chunkZ) {\n        RegionReader reader = reader(root, chunkX, chunkZ);\n        return reader != null && reader.has(slot(chunkX, chunkZ));\n    }\n\n    static TileData read(Path root, int chunkX, int chunkZ) {\n        RegionReader reader = reader(root, chunkX, chunkZ);\n        return reader != null ? reader.read(slot(chunkX, chunkZ)) : null;\n    }\n\n    /** Closes positional-read channels when the client swaps server/dimension or shuts RT down. */\n    static void reset() {\n        for (RegionReader reader : READERS.values()) {\n            reader.close();\n        }\n        READERS.clear();\n    }\n'
+          new = '    static boolean hasTile(Path root, int chunkX, int chunkZ) {\n        synchronized (READERS) {\n            RegionReader reader = readerLocked(root, chunkX, chunkZ);\n            return reader != null && reader.has(slot(chunkX, chunkZ));\n        }\n    }\n\n    static TileData read(Path root, int chunkX, int chunkZ) {\n        // Keep the cache lock through the small positional read/decompression. That makes eviction\n        // unable to close a channel that another worker is actively using, without a ref-counted FD\n        // wrapper. Region payloads are only ~4 KiB raw, so this lock is much cheaper than an OS-handle\n        // leak and disk remains far outside the render thread.\n        synchronized (READERS) {\n            RegionReader reader = readerLocked(root, chunkX, chunkZ);\n            return reader != null ? reader.read(slot(chunkX, chunkZ)) : null;\n        }\n    }\n\n    /** Closes positional-read channels when the client swaps server/dimension or shuts RT down. */\n    static void reset() {\n        synchronized (READERS) {\n            for (RegionReader reader : READERS.values()) {\n                reader.close();\n            }\n            READERS.clear();\n        }\n    }\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '        RegionReader stale = READERS.remove(target.toAbsolutePath().normalize());\n        if (stale != null) {\n            stale.close();\n        }\n'
+          new = '        synchronized (READERS) {\n            RegionReader stale = READERS.remove(target.toAbsolutePath().normalize());\n            if (stale != null) {\n                stale.close();\n            }\n        }\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          start = s.index('    private static RegionReader reader(Path root, int chunkX, int chunkZ) {')
+          end = s.index('    private static Path regionPath(', start)
+          new_method = '''    /** Called only while synchronized on READERS. */\n    private static RegionReader readerLocked(Path root, int chunkX, int chunkZ) {\n        if (root == null) {\n            return null;\n        }\n        int rx = regionX(chunkX);\n        int rz = regionZ(chunkZ);\n        Path path = regionPath(root, rx, rz).toAbsolutePath().normalize();\n        if (!Files.isRegularFile(path)) {\n            return null;\n        }\n        RegionReader current = READERS.get(path);\n        if (current != null) {\n            return current;\n        }\n        try {\n            RegionReader opened = new RegionReader(path, rx, rz);\n            READERS.put(path, opened);\n            while (READERS.size() > MAX_OPEN_READERS) {\n                Map.Entry<Path, RegionReader> eldest = READERS.entrySet().iterator().next();\n                READERS.remove(eldest.getKey());\n                eldest.getValue().close();\n            }\n            return opened;\n        } catch (IOException | RuntimeException e) {\n            CausticaMod.LOGGER.debug("CausticaLOD region open failed for {}: {}", path, e.toString());\n            return null;\n        }\n    }\n\n'''
+          s = s[:start] + new_method + s[end:]
+          p.write_text(s)
+          PY
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodRegionStore.java
+          git commit -m "Bound CausticaLOD packed region readers"
+          git push origin HEAD:codex/claude-pass
