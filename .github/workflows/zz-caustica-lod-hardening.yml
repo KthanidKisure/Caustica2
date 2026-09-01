@@ -1,0 +1,73 @@
+name: CausticaLOD runtime hardening
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-lod-hardening.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Harden DH-free WynnLOD import
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java')
+          s = p.read_text()
+
+          old = '''    private static final AtomicBoolean RUNNING = new AtomicBoolean();\n    private static volatile String attemptedIdentity = "";'''
+          new = '''    private static final AtomicBoolean RUNNING = new AtomicBoolean();\n    private static final long RETRY_DELAY_NANOS = 30_000_000_000L;\n    private static volatile String retryIdentity = "";\n    private static volatile long retryAfterNanos;'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''        if (sessionIdentity.equals(attemptedIdentity) || !RUNNING.compareAndSet(false, true)) {\n            return;\n        }\n        attemptedIdentity = sessionIdentity;\n        WORKER.execute(() -> {\n            try {\n                importWynncraft(mc, server, sessionRoot, marker);\n            } catch (Throwable t) {\n                CausticaMod.LOGGER.error("CausticaLOD WynnLOD import failed; live native capture remains usable", t);\n            } finally {\n                RUNNING.set(false);\n            }\n        });'''
+          new = '''        long now = System.nanoTime();\n        if (!sessionIdentity.equals(retryIdentity)) {\n            retryIdentity = sessionIdentity;\n            retryAfterNanos = 0L;\n        }\n        if (now < retryAfterNanos || !RUNNING.compareAndSet(false, true)) {\n            return;\n        }\n        WORKER.execute(() -> {\n            try {\n                importWynncraft(sessionRoot, marker);\n                retryAfterNanos = Long.MAX_VALUE;\n            } catch (Throwable t) {\n                retryAfterNanos = System.nanoTime() + RETRY_DELAY_NANOS;\n                CausticaMod.LOGGER.error(\n                        "CausticaLOD WynnLOD import failed; live native capture remains usable and import will retry", t);\n            } finally {\n                RUNNING.set(false);\n            }\n        });'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''    private static void importWynncraft(Minecraft mc, String server, Path sessionRoot, Path marker) throws Exception {'''
+          new = '''    private static void importWynncraft(Path sessionRoot, Path marker) throws Exception {'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''        try (RocksBridge bridge = new RocksBridge(rocksJar, airJar)) {\n            Path existingVoxy = gameDir.resolve(".voxy").resolve("saves").resolve(server.replace(':', '_'));\n            List<Path> databases = discoverDatabases(existingVoxy, bridge);\n            Path downloadedArchive = null;\n            Path staging = importRoot.resolve("staging");\n            boolean downloaded = false;\n\n            if (databases.isEmpty()) {\n                downloadedArchive = importRoot.resolve("frumavoxylods.zip");\n                ensureDownload(URI.create(WYNNLOD_URL), downloadedArchive, "SHA-256", WYNNLOD_SHA256);\n                Path extractedMarker = staging.resolve(".complete");\n                if (!Files.isRegularFile(extractedMarker)) {\n                    deleteTree(staging);\n                    Files.createDirectories(staging);\n                    CausticaMod.LOGGER.info("CausticaLOD extracting WynnLOD Voxy archive for one-time conversion");\n                    extractZip(downloadedArchive, staging);\n                    Files.writeString(extractedMarker, WYNNLOD_SHA256, StandardCharsets.US_ASCII);\n                }\n                databases = discoverDatabases(staging, bridge);\n                downloaded = true;\n            }\n\n            if (databases.isEmpty()) {'''
+          new = '''        try (RocksBridge bridge = new RocksBridge(rocksJar, airJar)) {\n            // The official WynnLOD release is the deterministic bulk source. Never silently depend on\n            // an installed Voxy database: it may be partial, stale, from another profile, or absent.\n            Path downloadedArchive = importRoot.resolve("frumavoxylods.zip");\n            Path staging = importRoot.resolve("staging");\n            ensureDownload(URI.create(WYNNLOD_URL), downloadedArchive, "SHA-256", WYNNLOD_SHA256);\n            Path extractedMarker = staging.resolve(".complete");\n            boolean extractionMatches = Files.isRegularFile(extractedMarker)\n                    && WYNNLOD_SHA256.equals(Files.readString(extractedMarker, StandardCharsets.US_ASCII).trim());\n            if (!extractionMatches) {\n                deleteTree(staging);\n                Files.createDirectories(staging);\n                CausticaMod.LOGGER.info("CausticaLOD extracting official WynnLOD Voxy archive for one-time conversion");\n                extractZip(downloadedArchive, staging);\n                Files.writeString(extractedMarker, WYNNLOD_SHA256, StandardCharsets.US_ASCII);\n            }\n            List<Path> databases = discoverDatabases(staging, bridge);\n\n            if (databases.isEmpty()) {'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''            if (downloaded) {\n                deleteTree(staging);\n                if (downloadedArchive != null) {\n                    Files.deleteIfExists(downloadedArchive);\n                }\n            }'''
+          new = '''            deleteTree(staging);\n            Files.deleteIfExists(downloadedArchive);'''
+          assert old in s
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java')
+          s = p.read_text()
+          old = '''    static synchronized void invalidate() {\n        MEMORY.clear();'''
+          new = '''    static void invalidateTile(int chunkX, int chunkZ) {\n        MEMORY.remove(packCoords(chunkX, chunkZ));\n    }\n\n    static synchronized void invalidate() {\n        MEMORY.clear();'''
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java')
+          s = p.read_text()
+          old = '''        IO.execute(() -> {\n            try {\n                writeTile(tile);\n            } finally {\n                WRITE_PENDING.remove(key);\n            }\n        });'''
+          new = '''        IO.execute(() -> {\n            try {\n                writeTile(tile);\n                // Once the live override is atomically visible, evict any imported copy cached by the\n                // packed source so the next distant query immediately observes the visited terrain.\n                RtCausticaLodPackedSource.invalidateTile(tile.chunkX, tile.chunkZ);\n            } finally {\n                WRITE_PENDING.remove(key);\n            }\n        });'''
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java
+          git commit -m "Make WynnLOD import deterministic and retryable"
+          git push origin HEAD:codex/claude-pass
