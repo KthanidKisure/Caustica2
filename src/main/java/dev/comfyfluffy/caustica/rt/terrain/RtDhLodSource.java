@@ -7,12 +7,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Compatibility facade for the original DH-backed LOD call sites.
+ * Compatibility facade for the original distant-LOD call sites.
  *
- * <p>The renderer no longer depends on Distant Horizons at runtime. RtTerrain and RtDhLodRegion keep
- * their existing ABI while the data comes from {@link RtCausticaLodSource}, Caustica's own persistent
- * surface cache. Keeping this tiny bridge lets the renderer pivot safely without mixing a large rename
- * into the functional change; the old DH reflection/database code is intentionally gone.</p>
+ * <p>The renderer has no Distant Horizons runtime dependency. Imported Wynncraft data is read from
+ * Caustica's own packed surface regions when available; otherwise the source is the native live cache
+ * learned from already-loaded Minecraft chunks. Keeping this small facade avoids coupling the terrain
+ * streamer and TLAS code to any particular persistence/import format.</p>
  */
 public final class RtDhLodSource {
     private RtDhLodSource() {
@@ -33,7 +33,9 @@ public final class RtDhLodSource {
     }
 
     public static boolean available() {
-        return RtCausticaLodSource.available();
+        // Calling packed availability also starts the one-time WynnLOD conversion when the current
+        // server is Wynncraft and LOD is enabled. It only schedules background work; no IO happens here.
+        return RtCausticaLodPackedSource.available() || RtCausticaLodSource.available();
     }
 
     public static FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
@@ -58,8 +60,11 @@ public final class RtDhLodSource {
             }
         }
 
-        RtCausticaLodSource.FetchResult source =
-                RtCausticaLodSource.fetchArea(footprintBlocks, originBlockX, originBlockZ);
+        // A completed imported pack is authoritative for the far map and also checks live per-chunk
+        // overrides first. Until that one-time conversion finishes, native capture keeps LOD usable.
+        RtCausticaLodSource.FetchResult source = RtCausticaLodPackedSource.available()
+                ? RtCausticaLodPackedSource.fetchArea(footprintBlocks, originBlockX, originBlockZ)
+                : RtCausticaLodSource.fetchArea(footprintBlocks, originBlockX, originBlockZ);
         if (source.boxes().isEmpty()) {
             return new FetchResult(List.of(), source.querySucceeded());
         }
@@ -74,5 +79,6 @@ public final class RtDhLodSource {
 
     public static void invalidate() {
         RtCausticaLodSource.invalidate();
+        RtCausticaLodPackedSource.invalidate();
     }
 }
