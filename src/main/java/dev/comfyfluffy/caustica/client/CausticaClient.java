@@ -10,6 +10,7 @@ import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.terrain.RtCausticaLodSource;
+import dev.comfyfluffy.caustica.rt.terrain.RtCausticaLodWarmup;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
@@ -40,10 +41,13 @@ public final class CausticaClient implements ClientModInitializer {
 				return;
 			}
 
-			// CausticaLOD learns only the visible surface of already-loaded vanilla chunks. This is
-			// intentionally independent of DH/Voxy and never creates or mutates another renderer's world.
-			// Capture happens on the client thread; compression/disk writes are asynchronous.
-			RtCausticaLodSource.tick();
+			// CausticaLOD learns only the visible surface of already-loaded vanilla chunks. Wynncraft
+			// replaces ClientLevel objects during HUB/proxy transitions, so require the same level to be
+			// stable for a few seconds before persisting anything. This prevents transient HUB/interim
+			// geometry from poisoning the long-lived server/dimension cache.
+			if (RtCausticaLodWarmup.ready(client.level)) {
+				RtCausticaLodSource.tick();
+			}
 
 			// Bring up the RT device/context once; terrain residency + the composite follow below.
 			if (!rtInitDone && RtDeviceBringup.rtRequested()) {
@@ -80,6 +84,7 @@ public final class CausticaClient implements ClientModInitializer {
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
 			RtCausticaLodSource.invalidate();
+			RtCausticaLodWarmup.reset();
 			RtComposite.INSTANCE.resetExposureHistory();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
 		});
@@ -91,6 +96,7 @@ public final class CausticaClient implements ClientModInitializer {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
 		RtCausticaLodSource.invalidate();
+		RtCausticaLodWarmup.reset();
 		if (!rtInitDone) {
 			RtWorkerPool.INSTANCE.shutdown();
 			return;
