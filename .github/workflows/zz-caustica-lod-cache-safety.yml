@@ -1,0 +1,61 @@
+name: CausticaLOD cache safety
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-lod-cache-safety.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Bound tile caches and unify session identity
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java')
+          s = p.read_text()
+          old = '    private static final ConcurrentHashMap<Long, SurfaceTile> MEMORY = new ConcurrentHashMap<>();\n    private static final ConcurrentHashMap<Long, Boolean> KNOWN_ON_DISK = new ConcurrentHashMap<>();\n'
+          new = '    private static final RtLodTileCache<SurfaceTile> MEMORY = new RtLodTileCache<>(8192);\n    private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+          old = '        String server = "singleplayer";\n        try {\n            if (mc.getCurrentServer() != null && mc.getCurrentServer().ip != null) {\n                server = mc.getCurrentServer().ip.toLowerCase(Locale.ROOT);\n            }\n        } catch (RuntimeException ignored) {\n            // The dimension still keeps caches separated for single-player and unusual connection states.\n        }\n        String identity = server + "|" + level.dimension();\n'
+          new = '        String identity = RtLodSession.identity(mc, level);\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java')
+          s = p.read_text()
+          old = '    private static final ConcurrentHashMap<Long, RtCausticaLodRegionStore.TileData> MEMORY = new ConcurrentHashMap<>();\n'
+          new = '    private static final RtLodTileCache<RtCausticaLodRegionStore.TileData> MEMORY = new RtLodTileCache<>(8192);\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+          old = '        String server = "singleplayer";\n        try {\n            if (mc.getCurrentServer() != null && mc.getCurrentServer().ip != null) {\n                server = mc.getCurrentServer().ip.toLowerCase(Locale.ROOT);\n            }\n        } catch (RuntimeException ignored) {\n        }\n        String nextIdentity = server + "|" + level.dimension();\n'
+          new = '        String nextIdentity = RtLodSession.identity(mc, level);\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java')
+          s = p.read_text()
+          old = '        String server = currentServer(mc);\n        if (!isWynncraft(server)) {\n            return;\n        }\n'
+          new = '        // The official WynnLOD archive describes the normal Wynncraft overworld only. Other\n        // dimensions still use Caustica\'s live native capture, never a duplicate/wrong bulk import.\n        if (!RtLodSession.shouldSeedOfficialWynnLod(mc, level)) {\n            return;\n        }\n'
+          assert old in s
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java
+          git commit -m "Harden CausticaLOD cache identity and memory"
+          git push origin HEAD:codex/claude-pass
