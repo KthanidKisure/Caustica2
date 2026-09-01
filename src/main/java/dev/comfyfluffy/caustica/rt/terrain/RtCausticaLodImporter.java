@@ -112,8 +112,9 @@ final class RtCausticaLodImporter {
         if (!CausticaConfig.Rt.Lod.ENABLED.value() || sessionRoot == null || level == null) {
             return;
         }
-        String server = currentServer(mc);
-        if (!isWynncraft(server)) {
+        // The official WynnLOD archive describes the normal Wynncraft overworld only. Other
+        // dimensions still use Caustica's live native capture, never a duplicate/wrong bulk import.
+        if (!RtLodSession.shouldSeedOfficialWynnLod(mc, level)) {
             return;
         }
         Path marker = sessionRoot.resolve("wynnlod-v2.complete");

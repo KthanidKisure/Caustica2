@@ -30,7 +30,7 @@ final class RtCausticaLodPackedSource {
     private static final int TILE_EDGE = RtCausticaLodRegionStore.TILE_EDGE;
     private static final short NO_HEIGHT = RtCausticaLodRegionStore.NO_HEIGHT;
 
-    private static final ConcurrentHashMap<Long, RtCausticaLodRegionStore.TileData> MEMORY = new ConcurrentHashMap<>();
+    private static final RtLodTileCache<RtCausticaLodRegionStore.TileData> MEMORY = new RtLodTileCache<>(8192);
     private static final AtomicBoolean LOGGED_FIRST_QUERY = new AtomicBoolean();
     private static final AtomicBoolean LOGGED_PACK_READY = new AtomicBoolean();
 
@@ -249,14 +249,7 @@ final class RtCausticaLodPackedSource {
     }
 
     private static synchronized void ensureSession(Minecraft mc, ClientLevel level) {
-        String server = "singleplayer";
-        try {
-            if (mc.getCurrentServer() != null && mc.getCurrentServer().ip != null) {
-                server = mc.getCurrentServer().ip.toLowerCase(Locale.ROOT);
-            }
-        } catch (RuntimeException ignored) {
-        }
-        String nextIdentity = server + "|" + level.dimension();
+        String nextIdentity = RtLodSession.identity(mc, level);
         if (nextIdentity.equals(identity) && root != null) {
             return;
         }

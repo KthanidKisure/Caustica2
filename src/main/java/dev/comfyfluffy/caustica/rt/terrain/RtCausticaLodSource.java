@@ -58,8 +58,8 @@ public final class RtCausticaLodSource {
     private static final int CAPTURE_CHUNKS_PER_TICK = 2;
     private static final int MAX_SCAN_PER_TICK = 96;
 
-    private static final ConcurrentHashMap<Long, SurfaceTile> MEMORY = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<Long, Boolean> KNOWN_ON_DISK = new ConcurrentHashMap<>();
+    private static final RtLodTileCache<SurfaceTile> MEMORY = new RtLodTileCache<>(8192);
+    private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);
     private static final ConcurrentHashMap<Long, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
     private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "caustica-lod-io");
@@ -254,15 +254,7 @@ public final class RtCausticaLodSource {
     }
 
     private static synchronized void ensureSession(Minecraft mc, ClientLevel level) {
-        String server = "singleplayer";
-        try {
-            if (mc.getCurrentServer() != null && mc.getCurrentServer().ip != null) {
-                server = mc.getCurrentServer().ip.toLowerCase(Locale.ROOT);
-            }
-        } catch (RuntimeException ignored) {
-            // The dimension still keeps caches separated for single-player and unusual connection states.
-        }
-        String identity = server + "|" + level.dimension();
+        String identity = RtLodSession.identity(mc, level);
         if (identity.equals(sessionIdentity) && sessionRoot != null) {
             return;
         }
