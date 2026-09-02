@@ -19,7 +19,6 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.InflaterInputStream;
 
@@ -31,6 +30,8 @@ final class RtCausticaLodPackedSource {
     private static final short NO_HEIGHT = RtCausticaLodRegionStore.NO_HEIGHT;
 
     private static final RtLodTileCache<RtCausticaLodRegionStore.TileData> MEMORY = new RtLodTileCache<>(8192);
+    /** Negative cache for uncovered chunks; imported regions are immutable once the completion marker exists. */
+    private static final RtLodTileCache<Boolean> MISSING = new RtLodTileCache<>(32768);
     private static final AtomicBoolean LOGGED_FIRST_QUERY = new AtomicBoolean();
     private static final AtomicBoolean LOGGED_PACK_READY = new AtomicBoolean();
 
@@ -121,11 +122,14 @@ final class RtCausticaLodPackedSource {
     }
 
     static void invalidateTile(int chunkX, int chunkZ) {
-        MEMORY.remove(packCoords(chunkX, chunkZ));
+        long key = packCoords(chunkX, chunkZ);
+        MEMORY.remove(key);
+        MISSING.remove(key);
     }
 
     static synchronized void invalidate() {
         MEMORY.clear();
+        MISSING.clear();
         identity = "";
         root = null;
         LOGGED_FIRST_QUERY.set(false);
@@ -180,17 +184,81 @@ final class RtCausticaLodPackedSource {
                 {quarter, threeQuarter},
                 {end, end},
         };
-        SurfaceColumn best = null;
+
+        SurfaceColumn[] samples = new SurfaceColumn[offsets.length];
+        int sampleCount = 0;
+        SurfaceColumn highest = null;
         for (int[] offset : offsets) {
             SurfaceColumn sample = columnAt(cellX + offset[0], cellZ + offset[1]);
             if (sample == null || sample.groundY == NO_HEIGHT) {
                 continue;
             }
-            if (best == null || sample.surfaceY > best.surfaceY) {
-                best = sample;
+            samples[sampleCount++] = sample;
+            if (highest == null || sample.surfaceY > highest.surfaceY) {
+                highest = sample;
             }
         }
-        return best;
+        if (sampleCount == 0) {
+            return null;
+        }
+
+        // Detail 1-2 cells are only 2-4 blocks wide, so the old upper-envelope sample is both cheap
+        // and visually useful. Starting at detail 3 a single outlier would inflate one sampled leaf,
+        // spire or puddle across 8x8+ world blocks, so use a robust height representative instead.
+        if (scale <= 4 || sampleCount == 1) {
+            return highest;
+        }
+
+        int[] groundHeights = new int[sampleCount];
+        for (int i = 0; i < sampleCount; i++) {
+            groundHeights[i] = samples[i].groundY;
+        }
+        java.util.Arrays.sort(groundHeights);
+        int medianGround = groundHeights[(sampleCount - 1) / 2];
+        SurfaceColumn ground = samples[0];
+        for (int i = 0; i < sampleCount; i++) {
+            if (samples[i].groundY == medianGround) {
+                ground = samples[i];
+                break;
+            }
+        }
+
+        SurfaceColumn[] elevated = new SurfaceColumn[sampleCount];
+        int elevatedCount = 0;
+        for (int i = 0; i < sampleCount; i++) {
+            SurfaceColumn sample = samples[i];
+            if (sample.surfaceY > sample.groundY) {
+                elevated[elevatedCount++] = sample;
+            }
+        }
+
+        // Require at least two independent samples before spreading an elevated surface over a coarse
+        // virtual cell. This removes isolated foliage/water spikes while retaining roofs, canopies and
+        // water bodies that occupy a meaningful fraction of the cell.
+        if (elevatedCount < 2) {
+            return new SurfaceColumn(ground.groundY, ground.groundY,
+                    ground.groundStateId, ground.bodyStateId, ground.groundStateId);
+        }
+
+        int[] surfaceHeights = new int[elevatedCount];
+        for (int i = 0; i < elevatedCount; i++) {
+            surfaceHeights[i] = elevated[i].surfaceY;
+        }
+        java.util.Arrays.sort(surfaceHeights);
+        int representativeSurface = surfaceHeights[(elevatedCount - 1) / 2];
+        SurfaceColumn surface = elevated[0];
+        for (int i = 0; i < elevatedCount; i++) {
+            if (elevated[i].surfaceY == representativeSurface) {
+                surface = elevated[i];
+                break;
+            }
+        }
+        if (surface.surfaceY <= ground.groundY) {
+            return new SurfaceColumn(ground.groundY, ground.groundY,
+                    ground.groundStateId, ground.bodyStateId, ground.groundStateId);
+        }
+        return new SurfaceColumn(ground.groundY, surface.surfaceY,
+                ground.groundStateId, ground.bodyStateId, surface.surfaceStateId);
     }
 
     private static SurfaceColumn columnAt(int blockX, int blockZ) {
@@ -215,18 +283,23 @@ final class RtCausticaLodPackedSource {
         if (cached != null) {
             return cached;
         }
+        if (MISSING.containsKey(key)) {
+            return null;
+        }
         Path sessionRoot = root;
         if (sessionRoot == null) {
             return null;
         }
-        RtCausticaLodRegionStore.TileData loaded = readLiveTile(sessionRoot.resolve("c." + chunkX + "." + chunkZ + ".clod"),
-                chunkX, chunkZ);
+        RtCausticaLodRegionStore.TileData loaded = readLiveTile(
+                sessionRoot.resolve("c." + chunkX + "." + chunkZ + ".clod"), chunkX, chunkZ);
         if (loaded == null) {
             loaded = RtCausticaLodRegionStore.read(sessionRoot, chunkX, chunkZ);
         }
         if (loaded == null) {
+            MISSING.put(key, Boolean.TRUE);
             return null;
         }
+        MISSING.remove(key);
         RtCausticaLodRegionStore.TileData raced = MEMORY.putIfAbsent(key, loaded);
         return raced != null ? raced : loaded;
     }
@@ -268,6 +341,7 @@ final class RtCausticaLodPackedSource {
             return;
         }
         MEMORY.clear();
+        MISSING.clear();
         RtCausticaLodRegionStore.reset();
         identity = nextIdentity;
         root = FabricLoader.getInstance().getGameDir()

@@ -60,6 +60,8 @@ public final class RtCausticaLodSource {
 
     private static final RtLodTileCache<SurfaceTile> MEMORY = new RtLodTileCache<>(8192);
     private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);
+    /** Missing/corrupt files discovered by worker queries; cleared only after a successful rewrite. */
+    private static final RtLodTileCache<Boolean> UNAVAILABLE_ON_DISK = new RtLodTileCache<>(32768);
     // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never
     // collide with or publish into the current session after a proxy/world transition.
     private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
@@ -137,7 +139,9 @@ public final class RtCausticaLodSource {
                 continue;
             }
             Path path = tilePath(cx, cz);
-            if (path != null && Files.isRegularFile(path)) {
+            // A worker may already have proved this file missing/corrupt. In that case do not trust
+            // its directory entry again: recapture the currently loaded chunk and atomically replace it.
+            if (!UNAVAILABLE_ON_DISK.containsKey(key) && path != null && Files.isRegularFile(path)) {
                 KNOWN_ON_DISK.put(key, Boolean.TRUE);
                 continue;
             }
@@ -247,6 +251,7 @@ public final class RtCausticaLodSource {
     public static synchronized void invalidate() {
         MEMORY.clear();
         KNOWN_ON_DISK.clear();
+        UNAVAILABLE_ON_DISK.clear();
         sessionIdentity = "";
         sessionRoot = null;
         scanCursor = 0;
@@ -264,6 +269,7 @@ public final class RtCausticaLodSource {
 
         MEMORY.clear();
         KNOWN_ON_DISK.clear();
+        UNAVAILABLE_ON_DISK.clear();
         sessionIdentity = identity;
         scanCursor = 0;
         sessionRoot = FabricLoader.getInstance().getGameDir()
@@ -377,8 +383,6 @@ public final class RtCausticaLodSource {
         int quarter = Math.max(0, scale / 4);
         int threeQuarter = Math.max(0, (scale * 3) / 4);
         int end = Math.max(0, scale - 1);
-
-        SurfaceColumn best = null;
         int[][] offsets = {
                 {half, half},
                 {quarter, quarter},
@@ -386,16 +390,81 @@ public final class RtCausticaLodSource {
                 {quarter, threeQuarter},
                 {end, end},
         };
+
+        SurfaceColumn[] samples = new SurfaceColumn[offsets.length];
+        int sampleCount = 0;
+        SurfaceColumn highest = null;
         for (int[] offset : offsets) {
             SurfaceColumn sample = columnAt(cellX + offset[0], cellZ + offset[1]);
             if (sample == null || sample.groundY == NO_HEIGHT) {
                 continue;
             }
-            if (best == null || sample.surfaceY > best.surfaceY) {
-                best = sample;
+            samples[sampleCount++] = sample;
+            if (highest == null || sample.surfaceY > highest.surfaceY) {
+                highest = sample;
             }
         }
-        return best;
+        if (sampleCount == 0) {
+            return null;
+        }
+
+        // Detail 1-2 cells are only 2-4 blocks wide, so the old upper-envelope sample is both cheap
+        // and visually useful. Starting at detail 3 a single outlier would inflate one sampled leaf,
+        // spire or puddle across 8x8+ world blocks, so use a robust height representative instead.
+        if (scale <= 4 || sampleCount == 1) {
+            return highest;
+        }
+
+        int[] groundHeights = new int[sampleCount];
+        for (int i = 0; i < sampleCount; i++) {
+            groundHeights[i] = samples[i].groundY;
+        }
+        java.util.Arrays.sort(groundHeights);
+        int medianGround = groundHeights[(sampleCount - 1) / 2];
+        SurfaceColumn ground = samples[0];
+        for (int i = 0; i < sampleCount; i++) {
+            if (samples[i].groundY == medianGround) {
+                ground = samples[i];
+                break;
+            }
+        }
+
+        SurfaceColumn[] elevated = new SurfaceColumn[sampleCount];
+        int elevatedCount = 0;
+        for (int i = 0; i < sampleCount; i++) {
+            SurfaceColumn sample = samples[i];
+            if (sample.surfaceY > sample.groundY) {
+                elevated[elevatedCount++] = sample;
+            }
+        }
+
+        // Require at least two independent samples before spreading an elevated surface over a coarse
+        // virtual cell. This removes isolated foliage/water spikes while retaining roofs, canopies and
+        // water bodies that occupy a meaningful fraction of the cell.
+        if (elevatedCount < 2) {
+            return new SurfaceColumn(ground.groundY, ground.groundY,
+                    ground.groundStateId, ground.bodyStateId, ground.groundStateId);
+        }
+
+        int[] surfaceHeights = new int[elevatedCount];
+        for (int i = 0; i < elevatedCount; i++) {
+            surfaceHeights[i] = elevated[i].surfaceY;
+        }
+        java.util.Arrays.sort(surfaceHeights);
+        int representativeSurface = surfaceHeights[(elevatedCount - 1) / 2];
+        SurfaceColumn surface = elevated[0];
+        for (int i = 0; i < elevatedCount; i++) {
+            if (elevated[i].surfaceY == representativeSurface) {
+                surface = elevated[i];
+                break;
+            }
+        }
+        if (surface.surfaceY <= ground.groundY) {
+            return new SurfaceColumn(ground.groundY, ground.groundY,
+                    ground.groundStateId, ground.bodyStateId, ground.groundStateId);
+        }
+        return new SurfaceColumn(ground.groundY, surface.surfaceY,
+                ground.groundStateId, ground.bodyStateId, surface.surfaceStateId);
     }
 
     private static SurfaceColumn columnAt(int blockX, int blockZ) {
@@ -422,12 +491,20 @@ public final class RtCausticaLodSource {
         if (resident != null) {
             return resident;
         }
+        if (UNAVAILABLE_ON_DISK.containsKey(key)) {
+            return null;
+        }
         Path path = tilePath(chunkX, chunkZ);
-        if (path == null || !Files.isRegularFile(path)) {
+        if (path == null) {
+            return null;
+        }
+        if (!Files.isRegularFile(path)) {
+            UNAVAILABLE_ON_DISK.put(key, Boolean.TRUE);
             return null;
         }
         SurfaceTile loaded = readTile(path, chunkX, chunkZ);
         if (loaded != null) {
+            UNAVAILABLE_ON_DISK.remove(key);
             SurfaceTile raced = MEMORY.putIfAbsent(key, loaded);
             KNOWN_ON_DISK.put(key, Boolean.TRUE);
             if (LOGGED_FIRST_DISK_LOAD.compareAndSet(false, true)) {
@@ -435,6 +512,9 @@ public final class RtCausticaLodSource {
             }
             return raced != null ? raced : loaded;
         }
+        // A stale/truncated tile must not permanently suppress recapture merely because the file exists.
+        KNOWN_ON_DISK.remove(key);
+        UNAVAILABLE_ON_DISK.put(key, Boolean.TRUE);
         return null;
     }
 
@@ -455,6 +535,7 @@ public final class RtCausticaLodSource {
                     // that same session is still current (or became current again) when IO completes.
                     Path currentRoot = sessionRoot;
                     if (capturedRoot.equals(currentRoot)) {
+                        UNAVAILABLE_ON_DISK.remove(key);
                         KNOWN_ON_DISK.put(key, Boolean.TRUE);
                         // Once the live override is atomically visible, evict any imported copy cached by
                         // the packed source so the next distant query observes the visited terrain.
