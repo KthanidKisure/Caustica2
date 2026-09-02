@@ -37,7 +37,6 @@ final class RtCausticaLodPackedSource {
 
     private static volatile String identity = "";
     private static volatile Path root;
-    private static volatile int minY = -64;
     private static volatile boolean packReady;
 
     private RtCausticaLodPackedSource() {
@@ -54,7 +53,6 @@ final class RtCausticaLodPackedSource {
             return false;
         }
         ensureSession(mc, level);
-        minY = level.getMinY();
         boolean ready = packReady;
         if (!ready) {
             // The importer publishes packReady after the completion marker is durable enough for this

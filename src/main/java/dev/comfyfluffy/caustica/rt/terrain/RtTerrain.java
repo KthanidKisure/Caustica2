@@ -184,7 +184,7 @@ public final class RtTerrain {
     /** Per-page retry for live-cache misses; never stalls unrelated LOD pages. */
     private static final long LOD_TRANSIENT_RETRY_FRAMES = 60L;
     /** Monotonic render-owned epoch for native LOD work. Every release/config change invalidates old callbacks. */
-    private long lodGeneration = 1L;
+    private volatile long lodGeneration = 1L;
     private int lodActiveDetail = Integer.MIN_VALUE;
     private int lodActiveHeightSections = Integer.MIN_VALUE;
     private int lodLoggedEmptyCount = -1;
@@ -1593,16 +1593,24 @@ public final class RtTerrain {
         try {
             RtWorkerPool.INSTANCE.submit(() -> {
                 try {
+                    if (generation != lodGeneration) {
+                        finishLodStale();
+                        return;
+                    }
                     // One source query covers this virtual section's whole horizontal footprint. The source
                     // returns world-space surface boxes; RtDhLodRegion clips/resamples them into this
                     // page before the ordinary material mesher builds its path-traced geometry.
                     RtDhLodRegion region = new RtDhLodRegion(level, detail, originX, originY, originZ);
                     RtDhLodSource.FetchResult fetched = RtDhLodSource.fetchArea(sectionBlocks, originX, originZ);
-        if (!fetched.querySucceeded()) {
-            finishLodRetrySoon(key, generation);
-            return;
-        }
-        java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();
+                    if (generation != lodGeneration) {
+                        finishLodStale();
+                        return;
+                    }
+                    if (!fetched.querySucceeded()) {
+                        finishLodRetrySoon(key, generation);
+                        return;
+                    }
+                    java.util.List<RtDhLodSource.LodBox> boxes = fetched.boxes();
                     region.fill(boxes);
                     lodBoxesSeen.addAndGet(boxes.size());
                     if (region.isEmpty()) {
@@ -1625,9 +1633,18 @@ public final class RtTerrain {
                         finishLodTask(key, null, generation, scale);
                         return;
                     }
+                    if (generation != lodGeneration) {
+                        finishLodStale();
+                        return;
+                    }
                     PreparedSection ps = RtSectionBuilder.prepare(dispatch.ctx(), packed,
                             cpu.opacityMicromap(), CausticaConfig.Rt.Terrain.BLAS_COMPACTION.value(),
                             key, originX, originY, originZ);
+                    if (generation != lodGeneration) {
+                        destroyPreparedSection(ps);
+                        finishLodStale();
+                        return;
+                    }
                     submitLodBuild(dispatch.ctx(), key, ps, scale, generation);
                 } catch (Throwable t) {
                     finishLodTask(key, null, generation, scale);
@@ -1645,7 +1662,7 @@ public final class RtTerrain {
     private void submitLodBuild(RtContext ctx, long key, PreparedSection prepared,
                                 int scale, long generation) {
         ctx.gpuExecutor().submit(
-                () -> false,
+                () -> generation != lodGeneration,
                 cmd -> {
                     RtSectionBuilder.recordUpload(cmd, prepared);
                     RtAccel.recordBlasBuilds(ctx, cmd, List.of(prepared.blas()));
@@ -1676,6 +1693,11 @@ public final class RtTerrain {
 
     private void finishLodRetrySoon(long key, long generation) {
         lodRetrySoon.add(new LodCompletion(key, generation));
+        finishActiveTask();
+    }
+
+    /** Old-generation work needs no retry bookkeeping: releaseLod already cleared its render-owned key. */
+    private void finishLodStale() {
         finishActiveTask();
     }
 
