@@ -92,6 +92,10 @@ final class RtCausticaLodImporter {
     private static final int VOXY_LUT_OFFSET = 16 + VOXY_MAPPING_BYTES;
     private static final int MAX_VOXY_RAW_BYTES = VOXY_LUT_OFFSET + VOXY_SECTION_VOLUME * 8;
     private static final long PROGRESS_STEP = 64L * 1024L * 1024L;
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "caustica-lod-import");
@@ -601,27 +605,44 @@ final class RtCausticaLodImporter {
             return;
         }
         Files.createDirectories(target.getParent());
-        Files.deleteIfExists(target);
         Path part = target.resolveSibling(target.getFileName() + ".part");
-        Files.deleteIfExists(part);
+        long existing = Files.isRegularFile(part) ? Files.size(part) : 0L;
 
-        HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofHours(2))
-                .header("User-Agent", "CausticaLOD/0.1")
-                .GET().build();
-        HttpResponse<InputStream> response = http().send(request, HttpResponse.BodyHandlers.ofInputStream());
-        if (response.statusCode() / 100 != 2) {
+        HttpResponse<InputStream> response = sendDownload(uri, existing);
+        boolean append = existing > 0L && response.statusCode() == 206
+                && contentRangeStartsAt(response, existing);
+        if (existing > 0L && !append) {
+            // The origin/CDN ignored or rejected our Range request. Never append a full response to a
+            // partial file: close it, discard only the partial staging file, and retry from byte zero.
             response.body().close();
-            throw new IOException("HTTP " + response.statusCode() + " downloading " + uri);
+            Files.deleteIfExists(part);
+            existing = 0L;
+            response = sendDownload(uri, 0L);
         }
-        long expectedBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
-        CausticaMod.LOGGER.info("CausticaLOD downloading {}{}", uri,
-                expectedBytes > 0 ? " (" + expectedBytes / (1024 * 1024) + " MiB)" : "");
+        if (response.statusCode() / 100 != 2) {
+            int status = response.statusCode();
+            response.body().close();
+            throw new IOException("HTTP " + status + " downloading " + uri);
+        }
+
+        long remainingBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
+        long expectedTotal = remainingBytes >= 0L ? existing + remainingBytes : -1L;
+        if (existing > 0L) {
+            CausticaMod.LOGGER.info("CausticaLOD resuming {} at {} MiB{}", uri, existing / (1024 * 1024),
+                    expectedTotal > 0L ? " / " + expectedTotal / (1024 * 1024) + " MiB" : "");
+        } else {
+            CausticaMod.LOGGER.info("CausticaLOD downloading {}{}", uri,
+                    expectedTotal > 0L ? " (" + expectedTotal / (1024 * 1024) + " MiB)" : "");
+        }
+
+        StandardOpenOption[] outputOptions = existing > 0L
+                ? new StandardOpenOption[]{StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND}
+                : new StandardOpenOption[]{StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING};
+        long total = existing;
         try (InputStream in = new BufferedInputStream(response.body(), 1 << 20);
-             var out = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20)) {
+             var out = new BufferedOutputStream(Files.newOutputStream(part, outputOptions), 1 << 20)) {
             byte[] buffer = new byte[1 << 20];
-            long total = 0L;
-            long nextProgress = PROGRESS_STEP;
+            long nextProgress = ((total / PROGRESS_STEP) + 1L) * PROGRESS_STEP;
             int read;
             while ((read = in.read(buffer)) >= 0) {
                 if (read == 0) {
@@ -631,12 +652,19 @@ final class RtCausticaLodImporter {
                 total += read;
                 if (total >= nextProgress) {
                     CausticaMod.LOGGER.info("CausticaLOD download progress: {} MiB", total / (1024 * 1024));
-                    nextProgress += PROGRESS_STEP;
+                    nextProgress = ((total / PROGRESS_STEP) + 1L) * PROGRESS_STEP;
                 }
             }
         }
+        if (expectedTotal >= 0L && total != expectedTotal) {
+            // Keep the partial staging file: the next retry can resume exactly where this response ended.
+            throw new IOException("Truncated download for " + uri + ": expected " + expectedTotal
+                    + " bytes, have " + total);
+        }
+
         String actual = digest(part, algorithm);
         if (!actual.equalsIgnoreCase(expectedHex)) {
+            // A complete-but-invalid payload is not resumable. Throw it away so the next retry starts clean.
             Files.deleteIfExists(part);
             throw new IOException("Digest mismatch for " + uri + ": expected " + expectedHex + ", got " + actual);
         }
@@ -647,23 +675,34 @@ final class RtCausticaLodImporter {
         }
     }
 
+    private static HttpResponse<InputStream> sendDownload(URI uri, long offset) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofHours(2))
+                .header("User-Agent", "CausticaLOD/0.1")
+                .GET();
+        if (offset > 0L) {
+            request.header("Range", "bytes=" + offset + "-");
+        }
+        return HTTP.send(request.build(), HttpResponse.BodyHandlers.ofInputStream());
+    }
+
+    private static boolean contentRangeStartsAt(HttpResponse<?> response, long offset) {
+        String expected = "bytes " + offset + "-";
+        return response.headers().firstValue("Content-Range")
+                .map(value -> value.toLowerCase(Locale.ROOT).startsWith(expected))
+                .orElse(false);
+    }
+
     private static String downloadText(URI uri) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofMinutes(2))
                 .header("User-Agent", "CausticaLOD/0.1")
                 .GET().build();
-        HttpResponse<String> response = http().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.US_ASCII));
+        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.US_ASCII));
         if (response.statusCode() / 100 != 2) {
             throw new IOException("HTTP " + response.statusCode() + " downloading " + uri);
         }
         return response.body();
-    }
-
-    private static HttpClient http() {
-        return HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
     }
 
     private static String digest(Path path, String algorithm) throws Exception {
