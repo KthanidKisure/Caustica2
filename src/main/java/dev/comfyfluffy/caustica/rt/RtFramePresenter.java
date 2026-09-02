@@ -27,7 +27,7 @@ import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 
 /**
- * DLSS Frame Generation present engine (slice 2). Shows more than one image per rendered frame: the
+ * DLSS Frame Generation present engine. Shows more than one image per rendered frame: the
  * generated frame(s), then the real frame.
  *
  * <p>It hooks Minecraft's frame tail (Minecraft.java: {@code blitFromTexture} → {@code encoder.submit()} →
@@ -50,13 +50,16 @@ import java.nio.LongBuffer;
 public final class RtFramePresenter {
     public static final RtFramePresenter INSTANCE = new RtFramePresenter();
 
-    private static final long ACQUIRE_TIMEOUT_NS = 5_000_000_000L;
+    // This runs on Minecraft's render thread. Swapchain backpressure must drop generated frames for the
+    // current real frame instead of freezing simulation and input while waiting for another image.
+    private static final long ACQUIRE_TIMEOUT_NS = 0L;
 
     private static final long LOG_INTERVAL_NS = 1_000_000_000L;
 
     private long[] acquireSemaphores = new long[0];
     private int acquireCursor;
     private boolean failed;
+    private boolean loggedSwapchainLimit;
 
     // Frames acquired + recorded this frame, awaiting present at present() HEAD (after MC's submit flush).
     private int[] pendingImageIndex = new int[0];
@@ -99,6 +102,17 @@ public final class RtFramePresenter {
         if (failed || swapchain == 0L || srcImage == 0L || generatedCount <= 0) {
             return;
         }
+        int requestedGeneratedCount = generatedCount;
+        generatedCount = maxGeneratedFramesForSwapchain(generatedCount, swapchainImages.size());
+        if (generatedCount <= 0) {
+            return;
+        }
+        if (generatedCount < requestedGeneratedCount && !loggedSwapchainLimit) {
+            loggedSwapchainLimit = true;
+            CausticaMod.LOGGER.warn(
+                    "DLSS-FG requested {} generated frames, but the {}-image swapchain can safely provide {}; clamping",
+                    requestedGeneratedCount, swapchainImages.size(), generatedCount);
+        }
         try {
             ensureCapacity(device, swapchainImages.size() + 1, generatedCount);
             for (int i = 0; i < generatedCount; i++) {
@@ -123,8 +137,12 @@ public final class RtFramePresenter {
                 try (MemoryStack stack = MemoryStack.stackPush()) {
                     IntBuffer pIndex = stack.callocInt(1);
                     int r = KHRSwapchain.vkAcquireNextImageKHR(device.vkDevice(), swapchain, ACQUIRE_TIMEOUT_NS, acquireSem, 0L, pIndex);
-                    if (r != VK10.VK_SUCCESS && r != 1000001003 /* SUBOPTIMAL */) {
-                        return; // out-of-date/timeout: present what we have, let MC recover
+                    if (r == VK10.VK_NOT_READY || r == VK10.VK_TIMEOUT
+                            || r == KHRSwapchain.VK_ERROR_OUT_OF_DATE_KHR) {
+                        return; // present anything already recorded; let the real frame drive recovery
+                    }
+                    if (r != VK10.VK_SUCCESS && r != KHRSwapchain.VK_SUBOPTIMAL_KHR) {
+                        throw new IllegalStateException("vkAcquireNextImageKHR(FG) failed: " + r);
                     }
                     imageIndex = pIndex.get(0);
                 }
@@ -138,7 +156,8 @@ public final class RtFramePresenter {
             }
         } catch (Throwable t) {
             failed = true;
-            pendingCount = 0;
+            // Frames recorded before this failure still own acquired swapchain images. Flush them once at
+            // present() HEAD; discarding the batch here would strand those images until swapchain recreation.
             CausticaMod.LOGGER.error("DLSS-FG present-record failed; frame generation disabled", t);
         }
     }
@@ -150,7 +169,7 @@ public final class RtFramePresenter {
      */
     public void flushPendingPresents(long swapchain, VkQueue presentQueue) {
         int presentedThisFrame = 0;
-        if (!failed && pendingCount != 0) {
+        if (pendingCount != 0) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 for (int i = 0; i < pendingCount; i++) {
                     VkPresentInfoKHR present = VkPresentInfoKHR.calloc(stack).sType$Default();
@@ -182,7 +201,18 @@ public final class RtFramePresenter {
     }
 
     /**
-     * Debug diagnostic (2026-07-01): tracks real vs generated {@code vkQueuePresentKHR} calls per second,
+     * Minecraft already owns one swapchain image for the real frame while this method records extras.
+     * Acquiring more than the remaining images before any present can complete would self-block.
+     */
+    static int maxGeneratedFramesForSwapchain(int requested, int swapchainImageCount) {
+        if (requested <= 0 || swapchainImageCount <= 1) {
+            return 0;
+        }
+        return Math.min(requested, swapchainImageCount - 1);
+    }
+
+    /**
+     * Tracks real vs generated {@code vkQueuePresentKHR} calls per second,
      * separate from MC's own fps counter — that counter only reflects simulated/rendered frames
      * (blitFromTexture calls), so it would NOT show an increase from FG's extra presents even if the display
      * is genuinely receiving more frames. Logged only when {@code caustica.rt.fg} is enabled.
@@ -329,6 +359,7 @@ public final class RtFramePresenter {
         pendingPresentSem = new long[0];
         pendingCount = 0;
         failed = false;
+        loggedSwapchainLimit = false;
         logWindowStartNs = 0L;
         realFramesInWindow = 0;
         generatedFramesInWindow = 0;
