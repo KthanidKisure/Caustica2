@@ -19,7 +19,6 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDependencyInfo;
 import org.lwjgl.vulkan.VkImageBlit;
 import org.lwjgl.vulkan.VkImageMemoryBarrier2;
-import org.lwjgl.vulkan.VkMemoryBarrier2;
 import org.lwjgl.vulkan.VkPresentInfoKHR;
 import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkSemaphoreCreateInfo;
@@ -230,7 +229,7 @@ public final class RtFramePresenter {
                     .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
             // Make only the actual source image's prior writes visible to the transfer read. This replaces
             // the old global memory barrier, avoiding an unnecessary dependency on unrelated RT resources.
-            beforeBlit.get(1).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(4096L).dstAccessMask(2048L)
+            beforeBlit.get(1).sType$Default().srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(4096L).dstAccessMask(2048L)
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(srcImage);
             beforeBlit.get(1).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
