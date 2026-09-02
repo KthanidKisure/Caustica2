@@ -23,7 +23,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Stream;
@@ -64,6 +67,18 @@ public final class NgxRuntime {
             initialized = true;
             return lib;
         } catch (Throwable t) {
+            // NGX can fail after loading the shim and partially initializing device-global state.
+            // Best-effort shutdown keeps a later RT/device restart from inheriting that half-state.
+            if (lib != null) {
+                try {
+                    lib.shutdown(device.vkDevice().address());
+                } catch (Throwable cleanup) {
+                    if (cleanup != t) {
+                        t.addSuppressed(cleanup);
+                    }
+                }
+            }
+            initialized = false;
             failed = true;
             lib = null;
             CausticaMod.LOGGER.error("NGX init failed; DLSS features disabled", t);
@@ -119,6 +134,7 @@ public final class NgxRuntime {
                 CausticaMod.LOGGER.warn("NGX feature libraries {} not found next to {}; those features will be unavailable",
                         missingFeatures, PLATFORM_NATIVES.shimName());
             }
+            logNativeInventory(nativesDir);
         }
 
         lib = NgxLibrary.load(shim);
@@ -239,6 +255,50 @@ public final class NgxRuntime {
         return missing;
     }
 
+    /**
+     * One-time exact inventory of the shim and feature runtimes. This makes runtime logs self-identifying
+     * when testing vendor DLL swaps (for example 310.7.x vs 310.8.x) without trusting file timestamps.
+     */
+    private static void logNativeInventory(Path dir) {
+        try (Stream<Path> files = Files.list(dir)) {
+            files.filter(Files::isRegularFile)
+                    .filter(path -> {
+                        String name = path.getFileName().toString();
+                        return name.equals(PLATFORM_NATIVES.shimName()) || PLATFORM_NATIVES.isFeatureLibrary(name);
+                    })
+                    .sorted((a, b) -> a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString()))
+                    .forEach(path -> {
+                        try {
+                            CausticaMod.LOGGER.info("NGX native {}: {} bytes, sha256={}",
+                                    path.getFileName(), Files.size(path), sha256(path));
+                        } catch (IOException e) {
+                            CausticaMod.LOGGER.debug("Could not fingerprint NGX native {}: {}", path, e.toString());
+                        }
+                    });
+        } catch (IOException e) {
+            CausticaMod.LOGGER.debug("Could not inventory NGX native directory {}: {}", dir, e.toString());
+        }
+    }
+
+    private static String sha256(Path path) throws IOException {
+        final MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);
+        }
+        try (InputStream in = Files.newInputStream(path)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) >= 0) {
+                if (read > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
     private static boolean sameBytes(Path path, byte[] bytes) throws IOException {
         try {
             return Files.size(path) == bytes.length && Arrays.equals(Files.readAllBytes(path), bytes);
@@ -266,20 +326,26 @@ public final class NgxRuntime {
     }
 
     private record PlatformNatives(String platformDir, String shimName, List<String> exactFeatureNames,
-                                   List<String> featureNamePrefixes, boolean supported) {
+                                   List<String> optionalFeatureNames, List<String> featureNamePrefixes,
+                                   boolean supported) {
         private static PlatformNatives current() {
             String os = System.getProperty("os.name", "").toLowerCase();
             String arch = System.getProperty("os.arch", "").toLowerCase();
             boolean x64 = arch.equals("x86_64") || arch.equals("amd64");
             if (os.contains("win") && x64) {
                 return new PlatformNatives("windows-x64", "ngxshim.dll",
-                        List.of("nvngx_dlssd.dll", "nvngx_dlssg.dll"), List.of(), true);
+                        List.of("nvngx_dlssd.dll", "nvngx_dlssg.dll"),
+                        // Streamline 2.13-era packages can additionally carry ordinary DLSS SR and
+                        // DLSS-NR. They are recognized/extracted/fingerprinted when bundled, but are not
+                        // required by Caustica's current RR/FG path and never cause a missing-file warning.
+                        List.of("nvngx_dlss.dll", "nvngx_dlssnr.dll"), List.of(), true);
             }
             if (os.contains("linux") && x64) {
-                return new PlatformNatives("linux-x64", "libngxshim.so", List.of(),
+                return new PlatformNatives("linux-x64", "libngxshim.so", List.of(), List.of(),
                         List.of("libnvidia-ngx-dlssd.so", "libnvidia-ngx-dlssg.so"), true);
             }
-            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"), List.of(), List.of(), false);
+            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"),
+                    List.of(), List.of(), List.of(), false);
         }
 
         private String resourceDir() {
@@ -287,7 +353,7 @@ public final class NgxRuntime {
         }
 
         private boolean isFeatureLibrary(String name) {
-            return exactFeatureNames.contains(name)
+            return exactFeatureNames.contains(name) || optionalFeatureNames.contains(name)
                     || featureNamePrefixes.stream().anyMatch(name::startsWith);
         }
 

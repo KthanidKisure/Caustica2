@@ -230,7 +230,13 @@ public final class RtDlssFg {
         if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
             releaseFeature(device);
         }
+        // Availability/failure state belongs to this NGX/device lifetime. Reset it with the feature so
+        // disabling/re-enabling RT or recreating the Vulkan device can probe a newer/recovered runtime.
         initialized = false;
+        failed = false;
+        probed = false;
+        available = false;
+        multiFrameCountMax = 0;
         lib = null;
     }
 
