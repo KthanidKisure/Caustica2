@@ -364,7 +364,7 @@ final class RtCausticaLodPackedSource {
                 .resolve(hashIdentity(nextIdentity));
         // One metadata check per session handles packs completed by an earlier client run. A pack
         // completed in this process uses markImportedPackReady() and needs no polling.
-        packReady = Files.isRegularFile(root.resolve("wynnlod-v2.complete"));
+        packReady = RtCausticaLodImporter.completedPackMarkerValid(root);
         LOGGED_FIRST_QUERY.set(false);
         LOGGED_PACK_READY.set(false);
     }
