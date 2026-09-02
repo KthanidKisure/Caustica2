@@ -1,0 +1,27 @@
+name: CausticaLOD resumable downloads
+
+on:
+  push:
+    branches: [codex/post-merge-optimizations]
+    paths: [".github/workflows/zz-lod-resume.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/post-merge-optimizations
+          fetch-depth: 0
+      - name: Apply resumable WynnLOD downloader
+        run: python3 .github/zz_patch_lod_resume.py
+      - name: Commit source patch
+        run: |
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java
+          git commit -m "Resume interrupted WynnLOD downloads"
+          git push origin HEAD:codex/post-merge-optimizations
