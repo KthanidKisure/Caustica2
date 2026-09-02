@@ -23,11 +23,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HexFormat;
-import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -192,16 +192,29 @@ public final class NgxRuntime {
 
     private static boolean extractBundledNative(String name, Path dst) throws IOException {
         String resource = PLATFORM_NATIVES.resourceDir() + name;
+        Path tmp = dst.resolveSibling(dst.getFileName() + ".tmp");
+        Files.deleteIfExists(tmp);
         try (InputStream in = NgxRuntime.class.getResourceAsStream(resource)) {
             if (in == null) {
                 return false;
             }
-            byte[] bytes = in.readAllBytes();
-            if (!sameBytes(dst, bytes)) {
-                Files.write(dst, bytes);
-            }
+            // Stream large vendor runtimes straight to disk. Do not materialize a second 50-165 MB heap
+            // array just to compare/update an already-extracted DLL.
+            Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+        } catch (Throwable t) {
+            Files.deleteIfExists(tmp);
+            throw t;
+        }
+        if (sameFileContents(dst, tmp)) {
+            Files.deleteIfExists(tmp);
             return true;
         }
+        try {
+            Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException atomicUnsupported) {
+            Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return true;
     }
 
     private static void extractBundledFeatureLibraries(Path dir) throws IOException {
@@ -299,11 +312,32 @@ public final class NgxRuntime {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    private static boolean sameBytes(Path path, byte[] bytes) throws IOException {
+    private static boolean sameFileContents(Path a, Path b) throws IOException {
         try {
-            return Files.size(path) == bytes.length && Arrays.equals(Files.readAllBytes(path), bytes);
+            if (Files.size(a) != Files.size(b)) {
+                return false;
+            }
         } catch (NoSuchFileException e) {
             return false;
+        }
+        try (InputStream left = Files.newInputStream(a); InputStream right = Files.newInputStream(b)) {
+            byte[] lb = new byte[64 * 1024];
+            byte[] rb = new byte[64 * 1024];
+            while (true) {
+                int ln = left.readNBytes(lb, 0, lb.length);
+                int rn = right.readNBytes(rb, 0, rb.length);
+                if (ln != rn) {
+                    return false;
+                }
+                if (ln == 0) {
+                    return true;
+                }
+                for (int i = 0; i < ln; i++) {
+                    if (lb[i] != rb[i]) {
+                        return false;
+                    }
+                }
+            }
         }
     }
 
