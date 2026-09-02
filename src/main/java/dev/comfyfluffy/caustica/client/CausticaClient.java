@@ -10,6 +10,7 @@ import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.terrain.RtCausticaLodSource;
+import dev.comfyfluffy.caustica.rt.terrain.RtDhLodSource;
 import dev.comfyfluffy.caustica.rt.terrain.RtCausticaLodWarmup;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
@@ -83,7 +84,7 @@ public final class CausticaClient implements ClientModInitializer {
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
-			RtCausticaLodSource.invalidate();
+			RtDhLodSource.invalidate();
 			RtCausticaLodWarmup.reset();
 			RtComposite.INSTANCE.resetExposureHistory();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
@@ -95,7 +96,7 @@ public final class CausticaClient implements ClientModInitializer {
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
-		RtCausticaLodSource.invalidate();
+		RtDhLodSource.invalidate();
 		RtCausticaLodWarmup.reset();
 		if (!rtInitDone) {
 			RtWorkerPool.INSTANCE.shutdown();
