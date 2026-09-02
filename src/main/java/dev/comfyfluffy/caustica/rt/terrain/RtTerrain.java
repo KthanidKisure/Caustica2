@@ -183,6 +183,9 @@ public final class RtTerrain {
     private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
     /** Per-page retry for live-cache misses; never stalls unrelated LOD pages. */
     private static final long LOD_TRANSIENT_RETRY_FRAMES = 60L;
+    private static final int LOD_MIN_IN_FLIGHT = 8;
+    private static final int LOD_MAX_IN_FLIGHT = 32;
+    private static final int LOD_PIPELINE_FRAMES = 4;
     /** Monotonic render-owned epoch for native LOD work. Every release/config change invalidates old callbacks. */
     private volatile long lodGeneration = 1L;
     private int lodActiveDetail = Integer.MIN_VALUE;
@@ -1527,7 +1530,7 @@ public final class RtTerrain {
         int sectionBlocks = RtDhLodRegion.SECTION_BLOCKS * scale;
         int radius = CausticaConfig.Rt.Lod.RADIUS.value();
         int configuredHeightSections = requestedHeightSections;
-        int budget = CausticaConfig.Rt.Lod.SECTIONS_PER_FRAME.value();
+        int requestedBudget = CausticaConfig.Rt.Lod.SECTIONS_PER_FRAME.value();
 
         int centreX = Math.floorDiv(pbx, sectionBlocks);
         int centreZ = Math.floorDiv(pbz, sectionBlocks);
@@ -1544,6 +1547,7 @@ public final class RtTerrain {
         if ((frame & 127L) == 0L) {
             pruneExpiredLodRetries(frame);
         }
+        int budget = lodDispatchBudget(requestedBudget, lodInFlight.size());
 
         outer:
         for (int ring = 0; ring <= radius; ring++) {
@@ -1581,6 +1585,15 @@ public final class RtTerrain {
                 }
             }
         }
+    }
+
+    static int lodDispatchBudget(int requested, int inFlight) {
+        if (requested <= 0) {
+            return 0;
+        }
+        int maxInFlight = Math.min(LOD_MAX_IN_FLIGHT,
+                Math.max(LOD_MIN_IN_FLIGHT, requested * LOD_PIPELINE_FRAMES));
+        return Math.min(requested, Math.max(0, maxInFlight - Math.max(inFlight, 0)));
     }
 
     private void dispatchLodSection(RtContext ctx, ClientLevel level, long key,

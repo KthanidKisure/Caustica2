@@ -55,6 +55,10 @@ public static const float RESTIR_DEPTH_TOLERANCE = 0.05;
 // Normal agreement in cosine. 0.9 is about 25 degrees — loose enough to survive normal-mapped detail,
 // tight enough to reject a perpendicular wall behind a silhouette.
 public static const float RESTIR_NORMAL_TOLERANCE = 0.9;
+// W is stored as fp16. Clamping before conversion prevents an unusually bright candidate from turning
+// into infinity and persisting as a white pixel through temporal reuse.
+public static const float RESTIR_W_MAX = 65504.0;
+static const float RESTIR_FINITE_LIMIT = 1.0e30;
 
 public struct PackedReservoir {
     public float3 pos;
@@ -77,7 +81,14 @@ public PackedReservoir packedEmpty() {
 }
 
 public bool packedValid(PackedReservoir p) {
-    return p.M > 0.0 && p.W > 0.0;
+    bool finiteVectors = all(p.pos == p.pos) && all(abs(p.pos) <= RESTIR_FINITE_LIMIT)
+            && all(p.lnrm == p.lnrm) && all(abs(p.lnrm) <= RESTIR_FINITE_LIMIT)
+            && all(p.le == p.le) && all(abs(p.le) <= RESTIR_FINITE_LIMIT);
+    bool finiteScalars = p.area == p.area && abs(p.area) <= RESTIR_FINITE_LIMIT
+            && p.M == p.M && p.W == p.W;
+    return finiteVectors && finiteScalars && p.area > 0.0
+            && p.M > 0.0 && p.M <= RESTIR_M_CAP
+            && p.W > 0.0 && p.W <= RESTIR_W_MAX;
 }
 
 // ---- Octahedral normal encoding, 16 bits per component into one float --------------------------------
@@ -125,7 +136,8 @@ float2 unpackHalf2(uint v) {
 uint packAreaMW(float area, float M, float W) {
     uint areaBits = uint(clamp(area / RESTIR_AREA_SCALE, 0.0, 1.0) * 255.0 + 0.5);
     uint mBits = uint(clamp(M / RESTIR_M_CAP, 0.0, 1.0) * 255.0 + 0.5);
-    return areaBits | (mBits << 8) | ((f32tof16(W) & 0xFFFFu) << 16);
+    return areaBits | (mBits << 8)
+            | ((f32tof16(clamp(W, 0.0, RESTIR_W_MAX)) & 0xFFFFu) << 16);
 }
 
 void unpackAreaMW(uint bits, out float area, out float M, out float W) {
@@ -238,6 +250,7 @@ public Reservoir temporalCombine(Reservoir current, PackedReservoir history,
         // The remembered emitter contributes nothing here — behind the surface now, or facing away.
         // Its M is still evidence about how much was sampled, but the sample itself cannot survive.
         current.M += min(history.M, RESTIR_M_CAP);
+        current.W = current.phat > 0.0 ? current.wSum / (current.M * current.phat) : 0.0;
         return current;
     }
     float historyM = min(history.M, RESTIR_M_CAP);
