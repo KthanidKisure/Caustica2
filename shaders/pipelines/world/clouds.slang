@@ -1,15 +1,13 @@
 // Raymarched volumetric cloud layer. Depends on sky and bindings.
 //
-// A single cumulus deck between cloudBottom and cloudBottom+thickness, marched front to back and lit by
+// A lower cumulus deck plus an optional higher altocumulus deck, marched front to back and lit by
 // whichever celestial body dominates, through the same transmittance LUT the terrain and the sun disc
 // use. Output is linear BT.709 (sky.slang's working space), returned as a scattered-radiance plus
 // transmittance pair so the caller composites the deck over the sky it already computed.
 //
-// Density is procedural rather than textured. A 3D noise texture would be the faster answer per sample,
-// but it costs a descriptor binding, a CPU-side bake, and a resource lifetime to manage in RtComposite;
-// the arithmetic version keeps the entire feature inside two shader files plus eight push floats. If this
-// ever becomes the frame's bottleneck, the density function is the single thing to move to a texture and
-// nothing else here changes.
+// Density comes from the precomputed, tiled RtCloudNoise 3D texture. The lower and upper decks reuse
+// that texture at different scales and wind rates, so adding cloud variety costs samples rather than a
+// second volume allocation or descriptor set.
 //
 // Shape is the standard cumulus recipe: a low-frequency fBm establishes the base shape, coverage remaps
 // it so raising coverage grows existing clouds outward instead of fading a uniform haze up from zero, a
@@ -36,8 +34,8 @@ import bindings;
 // the view steps is close to free visually on a moving camera because the deck is smooth and the
 // denoiser sees it as low-frequency, while halving the light steps costs more than it saves — the
 // light march is what produces the shading gradient across a cloud.
-public static const int CLOUD_VIEW_STEPS  = 64;
-public static const int CLOUD_LIGHT_STEPS = 6;
+public static const int CLOUD_VIEW_STEPS  = 48;
+public static const int CLOUD_LIGHT_STEPS = 5;
 // Marching past this is wasted work: at the deck's grazing angles the transmittance cutoff below always
 // trips first, and the noise domain loses fp32 precision long before this.
 public static const float CLOUD_MAX_MARCH = 60000.0;
@@ -59,6 +57,9 @@ public struct CloudParams {
     public float featureSize;  // blocks per noise period; smaller means more, tighter cloud masses
     public float ambient;      // fraction of zenith sky scattered in as multiple-scattering stand-in
     public float quality;      // scales the march step counts; 1 is reference, 0.5 is half the samples
+    public int weatherType;   // 0 ordinary/rain, 1 snow, 2 sand/dust
+    public float weatherIntensity;
+    public float secondaryCoverage; // higher altocumulus deck
 };
 
 public CloudParams makeCloudParams(WorldPush push) {
@@ -72,11 +73,32 @@ public CloudParams makeCloudParams(WorldPush push) {
     c.ambient = max(push.cloud1.w, 0.0);
     c.featureSize = max(push.cloud2.w, 1.0);
     c.quality = clamp(push.cloud3.x, 0.1, 1.0);
+    c.weatherType = int(round(push.cloud3.y));
+    c.weatherIntensity = clamp(push.cloud3.z, 0.0, 1.0);
+    c.secondaryCoverage = clamp(push.cloud3.w, 0.0, 1.0);
     return c;
 }
 
 public bool cloudsActive(CloudParams c) {
     return c.coverage > 0.0 && c.density > 0.0;
+}
+
+CloudParams secondaryCloudParams(CloudParams base) {
+    CloudParams high = base;
+    high.coverage = base.secondaryCoverage;
+    high.density = base.density * (base.weatherType == 1 ? 0.58 : 0.42);
+    high.bottomY = base.bottomY + base.thickness * 1.35;
+    high.thickness = max(base.thickness * 0.34, 20.0);
+    high.wind = base.wind * 1.55 + float2(19.0, -11.0);
+    high.detail = clamp(max(base.detail, 0.62), 0.0, 1.0);
+    high.featureSize = max(base.featureSize * 0.46, 32.0);
+    high.ambient = base.ambient * 1.15;
+    high.quality = max(base.quality * 0.48, 0.22);
+    high.secondaryCoverage = 0.0;
+    if (base.weatherType == 2) {
+        high.coverage *= 0.20;
+    }
+    return high;
 }
 
 // ---- Noise -------------------------------------------------------------------------------------------
@@ -340,7 +362,7 @@ float3 tintCloud(float3 scattering, float3 tint709, float strength) {
     return lerp(scattering, scattering * (tint / tintLuma), clamped);
 }
 
-public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, float3 direction,
+CloudResult marchCloudLayer(CloudParams c, SkyState state, float3 origin, float3 direction,
                                float3 tint709, float tintStrength) {
     CloudResult result;
     result.scattering = float3(0.0, 0.0, 0.0);
@@ -395,5 +417,32 @@ public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, flo
         t += stepSize;
     }
     result.scattering = tintCloud(result.scattering, tint709, tintStrength);
+    return result;
+}
+
+public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, float3 direction,
+                               float3 tint709, float tintStrength) {
+    CloudResult low = marchCloudLayer(c, state, origin, direction, tint709, tintStrength);
+    CloudParams highParams = secondaryCloudParams(c);
+    if (!cloudsActive(highParams)) {
+        return low;
+    }
+    CloudResult high = marchCloudLayer(highParams, state, origin, direction, tint709, tintStrength);
+
+    // Keep slab outputs on paths where Slang can prove they were assigned. This is equivalent to
+    // the old short-circuit form, but avoids reading an out value whose producer may have been skipped.
+    if (!cloudsActive(c)) return high;
+    float lowNear, lowFar;
+    if (!cloudSlabRange(c, origin, direction, lowNear, lowFar)) return high;
+    float highNear, highFar;
+    if (!cloudSlabRange(highParams, origin, direction, highNear, highFar)) return low;
+
+    CloudResult result;
+    if (lowNear <= highNear) {
+        result.scattering = low.scattering + low.transmittance * high.scattering;
+    } else {
+        result.scattering = high.scattering + high.transmittance * low.scattering;
+    }
+    result.transmittance = low.transmittance * high.transmittance;
     return result;
 }

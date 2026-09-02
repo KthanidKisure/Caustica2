@@ -9,6 +9,9 @@ import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.terrain.RtCausticaLodSource;
+import dev.comfyfluffy.caustica.rt.terrain.RtDhLodSource;
+import dev.comfyfluffy.caustica.rt.terrain.RtCausticaLodWarmup;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
@@ -37,6 +40,14 @@ public final class CausticaClient implements ClientModInitializer {
 					shutdownRt();
 				}
 				return;
+			}
+
+			// CausticaLOD learns only the visible surface of already-loaded vanilla chunks. Wynncraft
+			// replaces ClientLevel objects during HUB/proxy transitions, so require the same level to be
+			// stable for a few seconds before persisting anything. This prevents transient HUB/interim
+			// geometry from poisoning the long-lived server/dimension cache.
+			if (RtCausticaLodWarmup.ready(client.level)) {
+				RtCausticaLodSource.tick();
 			}
 
 			// Bring up the RT device/context once; terrain residency + the composite follow below.
@@ -73,18 +84,20 @@ public final class CausticaClient implements ClientModInitializer {
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
+			RtDhLodSource.invalidate();
+			RtCausticaLodWarmup.reset();
 			RtComposite.INSTANCE.resetExposureHistory();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
 		});
 
-		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
-			shutdownRt();
-		});
+		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> shutdownRt());
 	}
 
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
+		RtDhLodSource.invalidate();
+		RtCausticaLodWarmup.reset();
 		if (!rtInitDone) {
 			RtWorkerPool.INSTANCE.shutdown();
 			return;

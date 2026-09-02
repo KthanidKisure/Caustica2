@@ -23,8 +23,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -64,6 +67,18 @@ public final class NgxRuntime {
             initialized = true;
             return lib;
         } catch (Throwable t) {
+            // NGX can fail after loading the shim and partially initializing device-global state.
+            // Best-effort shutdown keeps a later RT/device restart from inheriting that half-state.
+            if (lib != null) {
+                try {
+                    lib.shutdown(device.vkDevice().address());
+                } catch (Throwable cleanup) {
+                    if (cleanup != t) {
+                        t.addSuppressed(cleanup);
+                    }
+                }
+            }
+            initialized = false;
             failed = true;
             lib = null;
             CausticaMod.LOGGER.error("NGX init failed; DLSS features disabled", t);
@@ -119,6 +134,7 @@ public final class NgxRuntime {
                 CausticaMod.LOGGER.warn("NGX feature libraries {} not found next to {}; those features will be unavailable",
                         missingFeatures, PLATFORM_NATIVES.shimName());
             }
+            logNativeInventory(nativesDir);
         }
 
         lib = NgxLibrary.load(shim);
@@ -176,24 +192,65 @@ public final class NgxRuntime {
 
     private static boolean extractBundledNative(String name, Path dst) throws IOException {
         String resource = PLATFORM_NATIVES.resourceDir() + name;
+        Path tmp = dst.resolveSibling(dst.getFileName() + ".tmp");
+        Files.deleteIfExists(tmp);
         try (InputStream in = NgxRuntime.class.getResourceAsStream(resource)) {
             if (in == null) {
                 return false;
             }
-            byte[] bytes = in.readAllBytes();
-            if (!sameBytes(dst, bytes)) {
-                Files.write(dst, bytes);
+            // Stream large vendor runtimes straight to disk. Do not materialize a second 50-165 MB heap
+            // array just to compare/update an already-extracted DLL.
+            Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException | RuntimeException | Error t) {
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException cleanup) {
+                t.addSuppressed(cleanup);
             }
+            throw t;
+        }
+        if (sameFileContents(dst, tmp)) {
+            Files.deleteIfExists(tmp);
             return true;
         }
+        try {
+            Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException atomicUnsupported) {
+            Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return true;
     }
 
     private static void extractBundledFeatureLibraries(Path dir) throws IOException {
+        java.util.HashSet<String> current = new java.util.HashSet<>();
         for (String name : PLATFORM_NATIVES.exactFeatureNames()) {
-            extractBundledNative(name, dir.resolve(name));
+            if (extractBundledNative(name, dir.resolve(name))) {
+                current.add(name);
+            }
         }
         for (String name : bundledFeatureLibraryNames()) {
-            extractBundledNative(name, dir.resolve(name));
+            // Required RR/FG names are also visible to the generic resource scan. Avoid streaming and
+            // byte-comparing those large DLLs twice on every startup.
+            if (current.contains(name)) {
+                continue;
+            }
+            if (extractBundledNative(name, dir.resolve(name))) {
+                current.add(name);
+            }
+        }
+
+        // This directory is Caustica-managed. Remove recognized feature runtimes left behind by an older
+        // JAR so switching 310.x generations cannot accidentally load a stale FG/RR/NR/SR binary.
+        List<Path> stale;
+        try (Stream<Path> files = Files.list(dir)) {
+            stale = files.filter(Files::isRegularFile)
+                    .filter(path -> PLATFORM_NATIVES.isFeatureLibrary(path.getFileName().toString()))
+                    .filter(path -> !current.contains(path.getFileName().toString()))
+                    .toList();
+        }
+        for (Path path : stale) {
+            Files.deleteIfExists(path);
+            CausticaMod.LOGGER.info("Removed stale NGX feature runtime {}", path.getFileName());
         }
     }
 
@@ -239,11 +296,76 @@ public final class NgxRuntime {
         return missing;
     }
 
-    private static boolean sameBytes(Path path, byte[] bytes) throws IOException {
+    /**
+     * One-time exact inventory of the shim and feature runtimes. This makes runtime logs self-identifying
+     * when testing vendor DLL swaps (for example 310.7.x vs 310.8.x) without trusting file timestamps.
+     */
+    private static void logNativeInventory(Path dir) {
+        try (Stream<Path> files = Files.list(dir)) {
+            files.filter(Files::isRegularFile)
+                    .filter(path -> {
+                        String name = path.getFileName().toString();
+                        return name.equals(PLATFORM_NATIVES.shimName()) || PLATFORM_NATIVES.isFeatureLibrary(name);
+                    })
+                    .sorted((a, b) -> a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString()))
+                    .forEach(path -> {
+                        try {
+                            CausticaMod.LOGGER.info("NGX native {}: {} bytes, sha256={}",
+                                    path.getFileName(), Files.size(path), sha256(path));
+                        } catch (IOException e) {
+                            CausticaMod.LOGGER.debug("Could not fingerprint NGX native {}: {}", path, e.toString());
+                        }
+                    });
+        } catch (IOException e) {
+            CausticaMod.LOGGER.debug("Could not inventory NGX native directory {}: {}", dir, e.toString());
+        }
+    }
+
+    private static String sha256(Path path) throws IOException {
+        final MessageDigest digest;
         try {
-            return Files.size(path) == bytes.length && Arrays.equals(Files.readAllBytes(path), bytes);
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);
+        }
+        try (InputStream in = Files.newInputStream(path)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) >= 0) {
+                if (read > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static boolean sameFileContents(Path a, Path b) throws IOException {
+        try {
+            if (Files.size(a) != Files.size(b)) {
+                return false;
+            }
         } catch (NoSuchFileException e) {
             return false;
+        }
+        try (InputStream left = Files.newInputStream(a); InputStream right = Files.newInputStream(b)) {
+            byte[] lb = new byte[64 * 1024];
+            byte[] rb = new byte[64 * 1024];
+            while (true) {
+                int ln = left.readNBytes(lb, 0, lb.length);
+                int rn = right.readNBytes(rb, 0, rb.length);
+                if (ln != rn) {
+                    return false;
+                }
+                if (ln == 0) {
+                    return true;
+                }
+                for (int i = 0; i < ln; i++) {
+                    if (lb[i] != rb[i]) {
+                        return false;
+                    }
+                }
+            }
         }
     }
 
@@ -266,20 +388,26 @@ public final class NgxRuntime {
     }
 
     private record PlatformNatives(String platformDir, String shimName, List<String> exactFeatureNames,
-                                   List<String> featureNamePrefixes, boolean supported) {
+                                   List<String> optionalFeatureNames, List<String> featureNamePrefixes,
+                                   boolean supported) {
         private static PlatformNatives current() {
             String os = System.getProperty("os.name", "").toLowerCase();
             String arch = System.getProperty("os.arch", "").toLowerCase();
             boolean x64 = arch.equals("x86_64") || arch.equals("amd64");
             if (os.contains("win") && x64) {
                 return new PlatformNatives("windows-x64", "ngxshim.dll",
-                        List.of("nvngx_dlssd.dll", "nvngx_dlssg.dll"), List.of(), true);
+                        List.of("nvngx_dlssd.dll", "nvngx_dlssg.dll"),
+                        // Streamline 2.13-era packages can additionally carry ordinary DLSS SR and
+                        // DLSS-NR. They are recognized/extracted/fingerprinted when bundled, but are not
+                        // required by Caustica's current RR/FG path and never cause a missing-file warning.
+                        List.of("nvngx_dlss.dll", "nvngx_dlssnr.dll"), List.of(), true);
             }
             if (os.contains("linux") && x64) {
-                return new PlatformNatives("linux-x64", "libngxshim.so", List.of(),
+                return new PlatformNatives("linux-x64", "libngxshim.so", List.of(), List.of(),
                         List.of("libnvidia-ngx-dlssd.so", "libnvidia-ngx-dlssg.so"), true);
             }
-            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"), List.of(), List.of(), false);
+            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"),
+                    List.of(), List.of(), List.of(), false);
         }
 
         private String resourceDir() {
@@ -287,7 +415,7 @@ public final class NgxRuntime {
         }
 
         private boolean isFeatureLibrary(String name) {
-            return exactFeatureNames.contains(name)
+            return exactFeatureNames.contains(name) || optionalFeatureNames.contains(name)
                     || featureNamePrefixes.stream().anyMatch(name::startsWith);
         }
 

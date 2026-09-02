@@ -115,9 +115,10 @@ public struct WorldPush {
     // dimCloud: rgb = vanilla CLOUD_COLOR (linear BT.709), w = tint strength (0 = leave the deck lit
     // purely by the atmosphere).
     public float4   dimCloud;
-    // cloud3: x cloud march quality scale (1 = reference step counts), yzw unused.
+    // cloud3: x cloud march quality scale, y weather type (0 rain/normal, 1 snow, 2 sand/dust),
+    // z weather intensity, w secondary high-cloud coverage.
     public float4   cloud3;
-    // fog2: x = debug mode (1 = show raw fog in-scatter as the final colour), yzw unused.
+    // fog2: x debug mode, y weather type, z weather intensity, w reserved.
     public float4   fog2;
     // ---- ReSTIR. x temporal reuse strength (0 disables it and both image accesses), y frame parity
     // selecting which reservoir image is history this frame, z spatial neighbour taps per pixel

@@ -94,6 +94,24 @@ float3 applyGrade(float3 acesCg) {
     return midtones * (shadowWeight + midWeight) + highlights * highlightWeight;
 }
 
+// Punchy is a scene-referred appearance, not an output transform. It raises local contrast and
+// chroma around photographic midtones while smoothly relaxing toward unity in bright highlights. The
+// ACES 2.0 SDR/HDR ODT still receives unbounded scene-linear values, so HDR highlight headroom remains
+// available instead of being rolled into AgX's approximately-100-nit sigmoid white point.
+float3 applyPunchyHdrLook(float3 acesCg) {
+    if (pc.punchyHdrLook == 0) {
+        return acesCg;
+    }
+    float3 color = max(acesCg, float3(0.0));
+    float luma = max(dot(color, ACESCG_LUMA), 1.0e-6);
+    float ev = log2(luma / GRADE_PIVOT);
+    float contrast = lerp(1.10, 1.035, smoothstep(2.0, 7.0, ev));
+    float mappedLuma = GRADE_PIVOT * exp2(ev * contrast);
+    float3 contrasted = color * (mappedLuma / luma);
+    float saturation = lerp(1.13, 1.01, smoothstep(0.8, 8.0, mappedLuma));
+    return max(lerp(float3(mappedLuma), contrasted, saturation), float3(0.0));
+}
+
 float3 sampleBloom(int2 outputPixel, uint outputWidth, uint outputHeight) {
     float2 uv = (float2(outputPixel) + 0.5) / float2(outputWidth, outputHeight);
     return bloomImage.SampleLevel(uv, 0.0).rgb;
@@ -196,7 +214,7 @@ float3 tonemapHdr(float3 lookedAcesCg) {
 float3 gradedAcesCg(int2 pix, float exposure, uint w, uint h) {
     float3 exposedAcesCg = max(rtImage[pix].rgb * exposure, float3(0.0));
     exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
-    return applyGrade(applyLook(exposedAcesCg));
+    return applyGrade(applyPunchyHdrLook(applyLook(exposedAcesCg)));
 }
 
 // ---- RCAS ------------------------------------------------------------------------------------------

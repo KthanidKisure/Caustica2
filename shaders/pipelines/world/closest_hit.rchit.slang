@@ -165,7 +165,8 @@ float2 parallaxLocalUv(MaterialHeader header, float2 localUv, float lod, float3 
     // so it is faded out by ray-cone LOD rather than switched off at a hard distance -- a hard cutoff
     // would pop a visible seam across the ground as you walk.
     float fade = 1.0 - smoothstep(pomParams.z - 1.0, pomParams.z, lod);
-    if (fade <= 0.0) {
+    float activeDepth = depthScale * fade;
+    if (activeDepth <= 0.0015) {
         return localUv;
     }
     float3 T;
@@ -180,12 +181,13 @@ float2 parallaxLocalUv(MaterialHeader header, float2 localUv, float lod, float3 
 
     localUv = clamp(localUv, float2(0.0), float2(1.0));
     // Total UV travel for a ray descending the full height range.
-    float2 maxOffset = (viewT.xy / vz) * depthScale * fade;
+    float2 maxOffset = (viewT.xy / vz) * activeDepth;
 
-    // Steps scale with view angle: a steep view crosses little of the height field and needs few
-    // samples, a grazing one crosses a lot and needs many.
-    int steps = int(clamp(lerp(float(POM_MAX_STEPS), 8.0, abs(viewT.z)) * max(pomParams.y, 0.1),
-            4.0, float(POM_MAX_STEPS)));
+    // Preserve the full close-range budget, but shed samples continuously with the same LOD fade that
+    // removes the parallax. Paying 64 samples for a sub-pixel offset near the fade boundary is wasted.
+    float fadeCost = lerp(0.35, 1.0, sqrt(fade));
+    int steps = int(clamp(lerp(float(POM_MAX_STEPS), 8.0, abs(viewT.z))
+            * max(pomParams.y, 0.1) * fadeCost, 4.0, float(POM_MAX_STEPS)));
     float stepDepth = 1.0 / float(steps);
     float2 stepOffset = maxOffset * stepDepth;
 
@@ -208,7 +210,8 @@ float2 parallaxLocalUv(MaterialHeader header, float2 localUv, float lod, float3 
     // almost entirely made of.
     float2 lo = current;
     float2 hi = current + stepOffset;
-    for (int i = 0; i < POM_REFINE_STEPS; ++i) {
+    int refineSteps = lod < 1.5 ? POM_REFINE_STEPS : 3;
+    for (int i = 0; i < refineSteps; ++i) {
         float2 mid = (lo + hi) * 0.5;
         float midRayDepth = rayDepth - stepDepth * 0.5;
         if (1.0 - pomHeightAt(header, mid, lod) > midRayDepth) {

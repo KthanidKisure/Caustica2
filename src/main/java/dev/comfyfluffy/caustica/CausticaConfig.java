@@ -662,7 +662,7 @@ public final class CausticaConfig {
 
         public static final class DlssRr {
             public static final BooleanSetting ENABLED = bool("caustica.rt.dlssRr", "dlss-rr.enabled", true);
-            public static final IntSetting PRESET = intValue("caustica.rt.dlssRr.preset", "dlss-rr.preset", 0);
+            public static final IntSetting PRESET = intValue("caustica.rt.dlssRr.preset", "dlss-rr.preset", 6);
 
             // NVSDK_NGX_PerfQuality_Value. Per NVIDIA's DLSS-RR programming guide, Ray Reconstruction only
             // supports Performance(0), Balanced(1), Quality(2), Ultra-Performance(3), and DLAA(5) —
@@ -670,7 +670,7 @@ public final class CausticaConfig {
             // zeroed render size for it) and is deliberately excluded here.
             public static final List<Integer> QUALITY_STEPS = List.of(3, 0, 1, 2, 5);
             public static final IntSetting QUALITY =
-                    intChoice("caustica.rt.dlssRr.quality", "dlss-rr.quality", 0, QUALITY_STEPS);
+                    intChoice("caustica.rt.dlssRr.quality", "dlss-rr.quality", 2, QUALITY_STEPS);
 
             private DlssRr() {
             }
@@ -692,7 +692,7 @@ public final class CausticaConfig {
          * and emits simulation, render-submit, and present latency markers.
          */
         /**
-         * Exponential height fog. Off by default: {@code density} is the extinction per block at
+         * Exponential height fog. A subtle aerial-perspective baseline is enabled by default: {@code density} is the extinction per block at
          * {@code height}, so 0 leaves the renderer bit-identical to a build without this feature.
          * Colour is not configurable on purpose — the fog is lit from the sky-view LUT, so it tracks
          * time of day and sun direction on its own.
@@ -700,7 +700,7 @@ public final class CausticaConfig {
         public static final class Fog {
             /** Extinction per block at the reference height. ~0.004 is a light haze, ~0.03 is thick. */
             public static final FloatSetting DENSITY =
-                    clampedFloat("caustica.rt.fog.density", "fog.density", 0.0f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.fog.density", "fog.density", 0.0025f, 0.0f, 1.0f);
             /** Blocks over which density falls by 1/e going up. Large values approach uniform distance fog. */
             public static final FloatSetting SCALE_HEIGHT =
                     clampedFloat("caustica.rt.fog.scaleHeight", "fog.scale-height", 24.0f, 1.0f, 1024.0f);
@@ -735,14 +735,14 @@ public final class CausticaConfig {
         }
 
         /**
-         * Volumetric cloud deck. Off by default: {@code coverage} 0 skips the march entirely, so a
+         * Volumetric cloud system. A moderate natural-sky coverage is enabled by default: {@code coverage} 0 skips the march entirely, so a
          * default build pays nothing. The deck is marched only on rays that may see the sun and moon
          * discs (primary and specular), so it does not contribute to bounce lighting.
          */
         public static final class Clouds {
             /** 0 clear, 1 overcast. Raising it grows existing clouds outward rather than fading in haze. */
             public static final FloatSetting COVERAGE =
-                    clampedFloat("caustica.rt.clouds.coverage", "clouds.coverage", 0.0f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.clouds.coverage", "clouds.coverage", 0.45f, 0.0f, 1.0f);
             /** Extinction per block inside fully dense cloud. Higher reads as darker, more solid cumulus. */
             public static final FloatSetting DENSITY =
                     clampedFloat("caustica.rt.clouds.density", "clouds.density", 0.045f, 0.0f, 1.0f);
@@ -861,7 +861,7 @@ public final class CausticaConfig {
              * same apparent enhancement as a midtone rather than hundreds of times more overshoot.
              */
             public static final FloatSetting SHARPNESS =
-                    clampedFloat("caustica.rt.grade.sharpness", "grade.sharpness", 0.0f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.grade.sharpness", "grade.sharpness", 0.12f, 0.0f, 1.0f);
 
             private Grade() {
             }
@@ -879,7 +879,7 @@ public final class CausticaConfig {
              * past ~0.12 the flat silhouettes start giving the illusion away at grazing angles.
              */
             public static final FloatSetting DEPTH =
-                    clampedFloat("caustica.rt.pom.depth", "pom.depth", 0.0f, 0.0f, 0.5f);
+                    clampedFloat("caustica.rt.pom.depth", "pom.depth", 0.05f, 0.0f, 0.5f);
             /** Scales the march's step count. Below 1 is faster and steppier on tall height fields. */
             public static final FloatSetting QUALITY =
                     clampedFloat("caustica.rt.pom.quality", "pom.quality", 1.0f, 0.1f, 2.0f);
@@ -892,7 +892,7 @@ public final class CausticaConfig {
         }
 
         /**
-         * ReSTIR temporal reuse for the block-emitter reservoirs. Off by default. Reuses last frame's
+         * ReSTIR temporal reuse for the block-emitter reservoirs. Enabled by default with conservative history weighting. Reuses last frame's
          * chosen emitter where the surface is unchanged, so a pixel accumulates far more effective
          * candidates than one frame's budget allows — the difference shows up in caves and at night,
          * where the light sampling is the noise floor.
@@ -924,24 +924,22 @@ public final class CausticaConfig {
         }
 
         /**
-         * Distant terrain from Distant Horizons' database. Off by default.
+         * Caustica-native path-traced distant terrain. No external LOD mod is required. Live worlds
+         * teach the persistent surface cache as chunks arrive; Wynncraft can additionally seed the
+         * cache from the verified official WynnLOD dataset in a one-time background conversion.
          *
-         * <p>DH is used as a WORLD DATABASE only — its own rendering should be disabled. Caustica reads
-         * LOD terrain through DH's public API, meshes it, and puts it in the acceleration structure, so
-         * distant terrain is traced like everything else: it casts shadows, appears in reflections and
-         * contributes to global illumination, which a rasterised LOD renderer cannot do.
-         *
-         * <p>Requires Distant Horizons installed with data for the current world. On a server that means
-         * something has populated its database — on Wynncraft, the WynnLODGrabber download.
+         * <p>The representation stores the visible surface shell rather than complete chunks, then
+         * follows the ordinary Caustica material -> BLAS -> TLAS path, so distant terrain participates
+         * in ray-traced shadows, reflections and global illumination without raster LOD composition.
          */
         public static final class Lod {
-            /** Master switch. Off skips every DH query, mesh and BLAS build. */
+            /** Master switch for native surface capture, imported packs, meshing and LOD BLAS residency. */
             public static final BooleanSetting ENABLED =
-                    bool("caustica.rt.lod.enabled", "lod.enabled", false);
+                    bool("caustica.rt.lod.enabled", "lod.enabled", true);
             /**
-             * DH detail level. Each virtual block covers 2^detail world blocks, and one LOD section
-             * therefore spans 16*2^detail blocks for the triangle cost of one ordinary section:
-             * 3 gives 128-block sections, 4 gives 256. Lower is sharper and far more expensive.
+             * Surface detail level. Each virtual cell covers 2^detail world blocks and one LOD section
+             * spans 16*2^detail blocks: 3 gives 128-block sections, 4 gives 256. Lower is sharper and
+             * more expensive; higher is cheaper and intended for very distant terrain.
              */
             public static final IntSetting DETAIL =
                     clampedInt("caustica.rt.lod.detail", "lod.detail", 3, 1, 6);
@@ -949,14 +947,15 @@ public final class CausticaConfig {
             public static final IntSetting RADIUS =
                     clampedInt("caustica.rt.lod.radius", "lod.radius", 8, 1, 64);
             /**
-             * Vertical span in LOD sections, centred on sea level. Distant terrain rarely needs the
-             * full world height, and every extra layer is a full ring of sections.
+             * Maximum vertical LOD pages. The streamer derives the pages from the world's actual
+             * build-height range; the default covers the complete range at every supported detail.
+             * Lowering this centres the retained pages around the player as a performance trade-off.
              */
             public static final IntSetting HEIGHT_SECTIONS =
-                    clampedInt("caustica.rt.lod.heightSections", "lod.height-sections", 2, 1, 16);
+                    clampedInt("caustica.rt.lod.heightSections", "lod.height-sections", 16, 1, 16);
             /**
-             * LOD sections started per frame. This is the streaming throttle: each one is a DH database
-             * query plus a mesh plus a BLAS build, so a high value stutters while the world loads.
+             * LOD sections started per frame. This is the streaming throttle: each one samples the
+             * native surface source, meshes it and prepares a BLAS, so a high value can cause load spikes.
              */
             public static final IntSetting SECTIONS_PER_FRAME =
                     clampedInt("caustica.rt.lod.sectionsPerFrame", "lod.sections-per-frame", 2, 1, 32);
@@ -971,7 +970,7 @@ public final class CausticaConfig {
              * reuse up to the shader's M cap; lower values shorten the effective history.
              */
             public static final FloatSetting TEMPORAL =
-                    clampedFloat("caustica.rt.restir.temporal", "restir.temporal", 0.0f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.restir.temporal", "restir.temporal", 0.90f, 0.0f, 1.0f);
 
             /**
              * Screen-space neighbour taps per pixel, 0 for temporal-only. Helps exactly where temporal
@@ -979,11 +978,11 @@ public final class CausticaConfig {
              * is. Capped at 8 in the shader.
              */
             public static final IntSetting SPATIAL_TAPS =
-                    intAtLeast("caustica.rt.restir.spatialTaps", "restir.spatial-taps", 3, 0);
+                    intAtLeast("caustica.rt.restir.spatialTaps", "restir.spatial-taps", 2, 0);
             /** Spatial tap radius in render pixels. Wider borrows more but mismatches more often. */
             public static final FloatSetting SPATIAL_RADIUS =
                     clampedFloat("caustica.rt.restir.spatialRadius", "restir.spatial-radius",
-                            8.0f, 1.0f, 64.0f);
+                            6.0f, 1.0f, 64.0f);
 
             private Restir() {
             }
@@ -1120,7 +1119,7 @@ public final class CausticaConfig {
             public static final FloatSetting GAMMA =
                     clampedFloat("caustica.rt.tonemap.gamma", "tonemap.gamma", 1.0f, 0.1f, 5.0f);
             /**
-             * SDR view transform: {@code aces2} (default), {@code agx-punchy}, or {@code agx-base}.
+             * View transform: {@code agx-punchy-hdr} (default), {@code aces2}, {@code agx-punchy}, or {@code agx-base}.
              * The AgX options are baked from sobotka/AgX — the same config the "Ultra Realism
              * Tonemapper for UE5" guide installs into Unreal — so this renderer and that Unreal setup
              * resolve to the same image transform.
@@ -1131,9 +1130,12 @@ public final class CausticaConfig {
              */
             public static final StringSetting VIEW_TRANSFORM =
                     string("caustica.rt.tonemap.viewTransform", "tonemap.view-transform",
-                            "aces2", Tonemap::sanitizeViewTransform);
+                            "agx-punchy-hdr", Tonemap::sanitizeViewTransform);
 
             private static String sanitizeViewTransform(String value) {
+                if ("agx-punchy-hdr".equalsIgnoreCase(value)) {
+                    return "agx-punchy-hdr";
+                }
                 if ("agx-punchy".equalsIgnoreCase(value)) {
                     return "agx-punchy";
                 }
@@ -1160,9 +1162,19 @@ public final class CausticaConfig {
                 return "hdr_aces2_rec2020_" + peakNits + "nit.bin";
             }
 
+            /**
+             * Scene-referred Punchy appearance followed by the ordinary ACES 2.0 display transform.
+             * Unlike the legacy AgX HDR construction, this keeps the selected HDR mastering range.
+             */
+            public static boolean punchyHdrLook() {
+                return "agx-punchy-hdr".equals(VIEW_TRANSFORM.get());
+            }
+
             /** Resource name under {@code /caustica/color/luts/} for the selected SDR view transform. */
             public static String sdrLutResource() {
                 switch (VIEW_TRANSFORM.get()) {
+                    case "agx-punchy-hdr":
+                        return "sdr_aces2_rec709.bin";
                     case "agx-punchy":
                         return "sdr_agx_punchy_rec709.bin";
                     case "agx-base":

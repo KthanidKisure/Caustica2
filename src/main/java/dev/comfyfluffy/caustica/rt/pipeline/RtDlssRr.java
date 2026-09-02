@@ -235,7 +235,13 @@ public final class RtDlssRr {
         if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
             releaseFeature(device);
         }
+        // A feature failure is session/device-local. A full RT teardown must permit a clean retry on
+        // the next Vulkan device instead of leaving RR permanently latched off for this JVM.
         initialized = false;
+        failed = false;
+        loggedAvailable = false;
+        resetHistory = false;
+        lastFrameNanos = 0L;
         lib = null;
     }
 
