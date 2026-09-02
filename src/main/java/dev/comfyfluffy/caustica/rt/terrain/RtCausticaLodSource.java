@@ -65,6 +65,7 @@ public final class RtCausticaLodSource {
     private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);
     /** Missing/corrupt files discovered by worker queries; cleared only after a successful rewrite. */
     private static final RtLodTileCache<Boolean> UNAVAILABLE_ON_DISK = new RtLodTileCache<>(32768);
+    private static final Object[] LOAD_LOCKS = createLoadLocks(256);
     // Key by final path, not chunk coordinates: writes queued for an old server/dimension must never
     // collide with or publish into the current session after a proxy/world transition.
     private static final ConcurrentHashMap<Path, Boolean> WRITE_PENDING = new ConcurrentHashMap<>();
@@ -489,28 +490,37 @@ public final class RtCausticaLodSource {
         if (UNAVAILABLE_ON_DISK.containsKey(key)) {
             return null;
         }
-        Path path = tilePath(chunkX, chunkZ);
-        if (path == null) {
-            return null;
-        }
-        if (!Files.isRegularFile(path)) {
+        synchronized (loadLock(key)) {
+            resident = MEMORY.get(key);
+            if (resident != null) {
+                return resident;
+            }
+            if (UNAVAILABLE_ON_DISK.containsKey(key)) {
+                return null;
+            }
+            Path path = tilePath(chunkX, chunkZ);
+            if (path == null) {
+                return null;
+            }
+            if (!Files.isRegularFile(path)) {
+                UNAVAILABLE_ON_DISK.put(key, Boolean.TRUE);
+                return null;
+            }
+            SurfaceTile loaded = readTile(path, chunkX, chunkZ);
+            if (loaded != null) {
+                UNAVAILABLE_ON_DISK.remove(key);
+                SurfaceTile raced = MEMORY.putIfAbsent(key, loaded);
+                KNOWN_ON_DISK.put(key, Boolean.TRUE);
+                if (LOGGED_FIRST_DISK_LOAD.compareAndSet(false, true)) {
+                    CausticaMod.LOGGER.info("CausticaLOD restored persistent native surface tile {},{}", chunkX, chunkZ);
+                }
+                return raced != null ? raced : loaded;
+            }
+            // A stale/truncated tile must not permanently suppress recapture merely because the file exists.
+            KNOWN_ON_DISK.remove(key);
             UNAVAILABLE_ON_DISK.put(key, Boolean.TRUE);
             return null;
         }
-        SurfaceTile loaded = readTile(path, chunkX, chunkZ);
-        if (loaded != null) {
-            UNAVAILABLE_ON_DISK.remove(key);
-            SurfaceTile raced = MEMORY.putIfAbsent(key, loaded);
-            KNOWN_ON_DISK.put(key, Boolean.TRUE);
-            if (LOGGED_FIRST_DISK_LOAD.compareAndSet(false, true)) {
-                CausticaMod.LOGGER.info("CausticaLOD restored persistent native surface tile {},{}", chunkX, chunkZ);
-            }
-            return raced != null ? raced : loaded;
-        }
-        // A stale/truncated tile must not permanently suppress recapture merely because the file exists.
-        KNOWN_ON_DISK.remove(key);
-        UNAVAILABLE_ON_DISK.put(key, Boolean.TRUE);
-        return null;
     }
 
     private static void scheduleWrite(SurfaceTile tile) {
@@ -617,6 +627,17 @@ public final class RtCausticaLodSource {
 
     private static short clampHeight(int y) {
         return (short) Math.clamp(y, Short.MIN_VALUE + 1, Short.MAX_VALUE);
+    }
+
+    private static Object[] createLoadLocks(int count) {
+        Object[] locks = new Object[count];
+        java.util.Arrays.setAll(locks, ignored -> new Object());
+        return locks;
+    }
+
+    private static Object loadLock(long key) {
+        long mixed = key ^ (key >>> 33) ^ (key << 11);
+        return LOAD_LOCKS[(int) mixed & (LOAD_LOCKS.length - 1)];
     }
 
     private static long chunkKey(int chunkX, int chunkZ) {

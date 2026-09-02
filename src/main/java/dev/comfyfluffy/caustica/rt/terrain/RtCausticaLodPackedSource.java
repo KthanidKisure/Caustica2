@@ -35,6 +35,7 @@ final class RtCausticaLodPackedSource {
             ThreadLocal.withInitial(SampleScratch::new);
     /** Negative cache for uncovered chunks; imported regions are immutable once the completion marker exists. */
     private static final RtLodTileCache<Boolean> MISSING = new RtLodTileCache<>(32768);
+    private static final Object[] LOAD_LOCKS = createLoadLocks(256);
     private static final AtomicBoolean LOGGED_FIRST_QUERY = new AtomicBoolean();
     private static final AtomicBoolean LOGGED_PACK_READY = new AtomicBoolean();
 
@@ -50,23 +51,26 @@ final class RtCausticaLodPackedSource {
      * only after a complete imported pack is present; ordinary live native capture remains the fallback.
      */
     static boolean available() {
+        return packReady;
+    }
+
+    /**
+     * Client-thread session/import driver. Worker-side availability/fetch stays read-only and never derives
+     * Minecraft session state or validates/kicks import files. Called only after the warm-up gate.
+     */
+    static void tick() {
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null || mc.player == null) {
-            return false;
+            return;
         }
         ensureSession(mc, level);
-        boolean ready = packReady;
-        if (!ready) {
-            // The importer publishes packReady after the completion marker is durable enough for this
-            // process. Avoid a Files.isRegularFile() metadata lookup on every LOD worker query.
+        if (!packReady) {
             RtCausticaLodImporter.tick(mc, level, root, identity);
         }
-        ready = packReady;
-        if (ready && LOGGED_PACK_READY.compareAndSet(false, true)) {
+        if (packReady && LOGGED_PACK_READY.compareAndSet(false, true)) {
             CausticaMod.LOGGER.info("CausticaLOD packed WynnLOD source is active; no DH/Voxy runtime is involved");
         }
-        return ready;
     }
 
     static RtCausticaLodSource.FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
@@ -301,22 +305,31 @@ final class RtCausticaLodPackedSource {
         if (MISSING.containsKey(key)) {
             return null;
         }
-        Path sessionRoot = root;
-        if (sessionRoot == null) {
-            return null;
+        synchronized (loadLock(key)) {
+            cached = MEMORY.get(key);
+            if (cached != null) {
+                return cached;
+            }
+            if (MISSING.containsKey(key)) {
+                return null;
+            }
+            Path sessionRoot = root;
+            if (sessionRoot == null) {
+                return null;
+            }
+            RtCausticaLodRegionStore.TileData loaded = readLiveTile(
+                    sessionRoot.resolve("c." + chunkX + "." + chunkZ + ".clod"), chunkX, chunkZ);
+            if (loaded == null) {
+                loaded = RtCausticaLodRegionStore.read(sessionRoot, chunkX, chunkZ);
+            }
+            if (loaded == null) {
+                MISSING.put(key, Boolean.TRUE);
+                return null;
+            }
+            MISSING.remove(key);
+            RtCausticaLodRegionStore.TileData raced = MEMORY.putIfAbsent(key, loaded);
+            return raced != null ? raced : loaded;
         }
-        RtCausticaLodRegionStore.TileData loaded = readLiveTile(
-                sessionRoot.resolve("c." + chunkX + "." + chunkZ + ".clod"), chunkX, chunkZ);
-        if (loaded == null) {
-            loaded = RtCausticaLodRegionStore.read(sessionRoot, chunkX, chunkZ);
-        }
-        if (loaded == null) {
-            MISSING.put(key, Boolean.TRUE);
-            return null;
-        }
-        MISSING.remove(key);
-        RtCausticaLodRegionStore.TileData raced = MEMORY.putIfAbsent(key, loaded);
-        return raced != null ? raced : loaded;
     }
 
     private static RtCausticaLodRegionStore.TileData readLiveTile(Path path, int expectedChunkX, int expectedChunkZ) {
@@ -372,6 +385,17 @@ final class RtCausticaLodPackedSource {
     private static BlockState stateById(int id) {
         BlockState state = Block.stateById(id);
         return state != null ? state : Blocks.STONE.defaultBlockState();
+    }
+
+    private static Object[] createLoadLocks(int count) {
+        Object[] locks = new Object[count];
+        java.util.Arrays.setAll(locks, ignored -> new Object());
+        return locks;
+    }
+
+    private static Object loadLock(long key) {
+        long mixed = key ^ (key >>> 33) ^ (key << 11);
+        return LOAD_LOCKS[(int) mixed & (LOAD_LOCKS.length - 1)];
     }
 
     private static long packCoords(int x, int z) {
