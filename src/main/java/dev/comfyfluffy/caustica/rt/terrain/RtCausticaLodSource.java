@@ -59,6 +59,9 @@ public final class RtCausticaLodSource {
     private static final int MAX_SCAN_PER_TICK = 96;
 
     private static final RtLodTileCache<SurfaceTile> MEMORY = new RtLodTileCache<>(8192);
+    /** Per-worker primitive scratch: avoids thousands of short-lived sample arrays/records per LOD page. */
+    private static final ThreadLocal<SampleScratch> SAMPLE_SCRATCH =
+            ThreadLocal.withInitial(SampleScratch::new);
     private static final RtLodTileCache<Boolean> KNOWN_ON_DISK = new RtLodTileCache<>(32768);
     /** Missing/corrupt files discovered by worker queries; cleared only after a successful rewrite. */
     private static final RtLodTileCache<Boolean> UNAVAILABLE_ON_DISK = new RtLodTileCache<>(32768);
@@ -383,106 +386,94 @@ public final class RtCausticaLodSource {
         int quarter = Math.max(0, scale / 4);
         int threeQuarter = Math.max(0, (scale * 3) / 4);
         int end = Math.max(0, scale - 1);
-        int[][] offsets = {
-                {half, half},
-                {quarter, quarter},
-                {threeQuarter, quarter},
-                {quarter, threeQuarter},
-                {end, end},
-        };
 
-        SurfaceColumn[] samples = new SurfaceColumn[offsets.length];
-        int sampleCount = 0;
-        SurfaceColumn highest = null;
-        for (int[] offset : offsets) {
-            SurfaceColumn sample = columnAt(cellX + offset[0], cellZ + offset[1]);
-            if (sample == null || sample.groundY == NO_HEIGHT) {
-                continue;
-            }
-            samples[sampleCount++] = sample;
-            if (highest == null || sample.surfaceY > highest.surfaceY) {
-                highest = sample;
-            }
-        }
+        SampleScratch scratch = SAMPLE_SCRATCH.get();
+        scratch.count = 0;
+        sampleColumn(scratch, cellX + half, cellZ + half);
+        sampleColumn(scratch, cellX + quarter, cellZ + quarter);
+        sampleColumn(scratch, cellX + threeQuarter, cellZ + quarter);
+        sampleColumn(scratch, cellX + quarter, cellZ + threeQuarter);
+        sampleColumn(scratch, cellX + end, cellZ + end);
+        int sampleCount = scratch.count;
         if (sampleCount == 0) {
             return null;
         }
 
-        // Detail 1-2 cells are only 2-4 blocks wide, so the old upper-envelope sample is both cheap
-        // and visually useful. Starting at detail 3 a single outlier would inflate one sampled leaf,
-        // spire or puddle across 8x8+ world blocks, so use a robust height representative instead.
+        int highest = 0;
+        for (int i = 1; i < sampleCount; i++) {
+            if (scratch.surfaceY[i] > scratch.surfaceY[highest]) {
+                highest = i;
+            }
+        }
         if (scale <= 4 || sampleCount == 1) {
-            return highest;
+            return scratch.column(highest);
         }
 
-        int[] groundHeights = new int[sampleCount];
         for (int i = 0; i < sampleCount; i++) {
-            groundHeights[i] = samples[i].groundY;
+            scratch.sortHeights[i] = scratch.groundY[i];
         }
-        java.util.Arrays.sort(groundHeights);
-        int medianGround = groundHeights[(sampleCount - 1) / 2];
-        SurfaceColumn ground = samples[0];
+        java.util.Arrays.sort(scratch.sortHeights, 0, sampleCount);
+        int medianGround = scratch.sortHeights[(sampleCount - 1) / 2];
+        int ground = 0;
         for (int i = 0; i < sampleCount; i++) {
-            if (samples[i].groundY == medianGround) {
-                ground = samples[i];
+            if (scratch.groundY[i] == medianGround) {
+                ground = i;
                 break;
             }
         }
 
-        SurfaceColumn[] elevated = new SurfaceColumn[sampleCount];
         int elevatedCount = 0;
         for (int i = 0; i < sampleCount; i++) {
-            SurfaceColumn sample = samples[i];
-            if (sample.surfaceY > sample.groundY) {
-                elevated[elevatedCount++] = sample;
+            if (scratch.surfaceY[i] > scratch.groundY[i]) {
+                scratch.elevatedIndices[elevatedCount] = i;
+                scratch.sortHeights[elevatedCount] = scratch.surfaceY[i];
+                elevatedCount++;
             }
         }
-
-        // Require at least two independent samples before spreading an elevated surface over a coarse
-        // virtual cell. This removes isolated foliage/water spikes while retaining roofs, canopies and
-        // water bodies that occupy a meaningful fraction of the cell.
         if (elevatedCount < 2) {
-            return new SurfaceColumn(ground.groundY, ground.groundY,
-                    ground.groundStateId, ground.bodyStateId, ground.groundStateId);
+            return new SurfaceColumn(scratch.groundY[ground], scratch.groundY[ground],
+                    scratch.groundStateId[ground], scratch.bodyStateId[ground], scratch.groundStateId[ground]);
         }
 
-        int[] surfaceHeights = new int[elevatedCount];
+        java.util.Arrays.sort(scratch.sortHeights, 0, elevatedCount);
+        int representativeSurface = scratch.sortHeights[(elevatedCount - 1) / 2];
+        int surface = scratch.elevatedIndices[0];
         for (int i = 0; i < elevatedCount; i++) {
-            surfaceHeights[i] = elevated[i].surfaceY;
-        }
-        java.util.Arrays.sort(surfaceHeights);
-        int representativeSurface = surfaceHeights[(elevatedCount - 1) / 2];
-        SurfaceColumn surface = elevated[0];
-        for (int i = 0; i < elevatedCount; i++) {
-            if (elevated[i].surfaceY == representativeSurface) {
-                surface = elevated[i];
+            int candidate = scratch.elevatedIndices[i];
+            if (scratch.surfaceY[candidate] == representativeSurface) {
+                surface = candidate;
                 break;
             }
         }
-        if (surface.surfaceY <= ground.groundY) {
-            return new SurfaceColumn(ground.groundY, ground.groundY,
-                    ground.groundStateId, ground.bodyStateId, ground.groundStateId);
+        if (scratch.surfaceY[surface] <= scratch.groundY[ground]) {
+            return new SurfaceColumn(scratch.groundY[ground], scratch.groundY[ground],
+                    scratch.groundStateId[ground], scratch.bodyStateId[ground], scratch.groundStateId[ground]);
         }
-        return new SurfaceColumn(ground.groundY, surface.surfaceY,
-                ground.groundStateId, ground.bodyStateId, surface.surfaceStateId);
+        return new SurfaceColumn(scratch.groundY[ground], scratch.surfaceY[surface],
+                scratch.groundStateId[ground], scratch.bodyStateId[ground], scratch.surfaceStateId[surface]);
     }
 
-    private static SurfaceColumn columnAt(int blockX, int blockZ) {
+    private static boolean sampleColumn(SampleScratch scratch, int blockX, int blockZ) {
         int chunkX = Math.floorDiv(blockX, TILE_EDGE);
         int chunkZ = Math.floorDiv(blockZ, TILE_EDGE);
         SurfaceTile tile = tile(chunkX, chunkZ);
         if (tile == null) {
-            return null;
+            return false;
         }
         int lx = Math.floorMod(blockX, TILE_EDGE);
         int lz = Math.floorMod(blockZ, TILE_EDGE);
         int index = lx * TILE_EDGE + lz;
-        return new SurfaceColumn(
-                tile.groundY[index],
-                tile.surfaceY[index],
-                tile.groundStateId[index],
-                tile.bodyStateId[index],
-                tile.surfaceStateId[index]);
+        short groundY = tile.groundY[index];
+        if (groundY == NO_HEIGHT) {
+            return false;
+        }
+        int slot = scratch.count++;
+        scratch.groundY[slot] = groundY;
+        scratch.surfaceY[slot] = tile.surfaceY[index];
+        scratch.groundStateId[slot] = tile.groundStateId[index];
+        scratch.bodyStateId[slot] = tile.bodyStateId[index];
+        scratch.surfaceStateId[slot] = tile.surfaceStateId[index];
+        return true;
     }
 
     private static SurfaceTile tile(int chunkX, int chunkZ) {
@@ -656,6 +647,22 @@ public final class RtCausticaLodSource {
             this.chunkZ = chunkZ;
             java.util.Arrays.fill(groundY, NO_HEIGHT);
             java.util.Arrays.fill(surfaceY, NO_HEIGHT);
+        }
+    }
+
+    private static final class SampleScratch {
+        int count;
+        final short[] groundY = new short[5];
+        final short[] surfaceY = new short[5];
+        final int[] groundStateId = new int[5];
+        final int[] bodyStateId = new int[5];
+        final int[] surfaceStateId = new int[5];
+        final int[] elevatedIndices = new int[5];
+        final int[] sortHeights = new int[5];
+
+        SurfaceColumn column(int index) {
+            return new SurfaceColumn(groundY[index], surfaceY[index],
+                    groundStateId[index], bodyStateId[index], surfaceStateId[index]);
         }
     }
 
