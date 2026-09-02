@@ -38,6 +38,7 @@ final class RtCausticaLodPackedSource {
     private static volatile String identity = "";
     private static volatile Path root;
     private static volatile int minY = -64;
+    private static volatile boolean packReady;
 
     private RtCausticaLodPackedSource() {
     }
@@ -54,8 +55,13 @@ final class RtCausticaLodPackedSource {
         }
         ensureSession(mc, level);
         minY = level.getMinY();
-        RtCausticaLodImporter.tick(mc, level, root, identity);
-        boolean ready = root != null && Files.isRegularFile(root.resolve("wynnlod-v2.complete"));
+        boolean ready = packReady;
+        if (!ready) {
+            // The importer publishes packReady after the completion marker is durable enough for this
+            // process. Avoid a Files.isRegularFile() metadata lookup on every LOD worker query.
+            RtCausticaLodImporter.tick(mc, level, root, identity);
+        }
+        ready = packReady;
         if (ready && LOGGED_PACK_READY.compareAndSet(false, true)) {
             CausticaMod.LOGGER.info("CausticaLOD packed WynnLOD source is active; no DH/Voxy runtime is involved");
         }
@@ -127,11 +133,22 @@ final class RtCausticaLodPackedSource {
         MISSING.remove(key);
     }
 
+    /** Called by the background importer only after every region and the completion marker are published. */
+    static synchronized void markImportedPackReady(Path completedRoot) {
+        if (completedRoot == null || root == null || !root.equals(completedRoot)) {
+            return; // import finished for a session that is no longer active
+        }
+        MISSING.clear();
+        RtCausticaLodRegionStore.reset();
+        packReady = true;
+    }
+
     static synchronized void invalidate() {
         MEMORY.clear();
         MISSING.clear();
         identity = "";
         root = null;
+        packReady = false;
         LOGGED_FIRST_QUERY.set(false);
         LOGGED_PACK_READY.set(false);
         RtCausticaLodRegionStore.reset();
@@ -347,6 +364,9 @@ final class RtCausticaLodPackedSource {
         root = FabricLoader.getInstance().getGameDir()
                 .resolve("caustica_lod")
                 .resolve(hashIdentity(nextIdentity));
+        // One metadata check per session handles packs completed by an earlier client run. A pack
+        // completed in this process uses markImportedPackReady() and needs no polling.
+        packReady = Files.isRegularFile(root.resolve("wynnlod-v2.complete"));
         LOGGED_FIRST_QUERY.set(false);
         LOGGED_PACK_READY.set(false);
     }

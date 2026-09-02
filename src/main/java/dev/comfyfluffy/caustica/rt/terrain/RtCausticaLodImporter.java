@@ -187,7 +187,7 @@ final class RtCausticaLodImporter {
                     "source=wynnlod-2.2.0\nsha256=" + WYNNLOD_SHA256
                             + "\nsections=" + stats.sections + "\ntiles=" + stats.tiles + "\nregions=" + stats.regions + "\n",
                     StandardCharsets.UTF_8);
-            RtCausticaLodRegionStore.reset();
+            RtCausticaLodPackedSource.markImportedPackReady(sessionRoot);
             CausticaMod.LOGGER.info(
                     "CausticaLOD WynnLOD import complete: {} level-0 sections -> {} surface tiles in {} packed regions; DH/Voxy are not required for rendering",
                     stats.sections, stats.tiles, stats.regions);

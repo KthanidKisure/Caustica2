@@ -43,6 +43,9 @@ final class RtCausticaLodRegionStore {
     private static final int REGION_SLOTS = REGION_EDGE * REGION_EDGE;
     private static final int HEADER_BYTES = 16 + REGION_SLOTS * 8;
     private static final int RAW_TILE_BYTES = TILE_COLUMNS * (2 + 2 + 4 + 4 + 4);
+    // DEFLATE overhead for a 4 KiB payload is tiny; leave generous headroom while rejecting
+    // damaged indexes that would otherwise request pathological heap allocations.
+    private static final int MAX_COMPRESSED_TILE_BYTES = RAW_TILE_BYTES + 1024;
 
     private static final int MAX_OPEN_READERS = 64;
     private static final LinkedHashMap<Path, RegionReader> READERS = new LinkedHashMap<>(64, 0.75f, true);
@@ -70,13 +73,22 @@ final class RtCausticaLodRegionStore {
     }
 
     static TileData read(Path root, int chunkX, int chunkZ) {
-        // Keep the cache lock through the small positional read/decompression. That makes eviction
-        // unable to close a channel that another worker is actively using, without a ref-counted FD
-        // wrapper. Region payloads are only ~4 KiB raw, so this lock is much cheaper than an OS-handle
-        // leak and disk remains far outside the render thread.
+        byte[] compressed;
+        // Hold the cache lock only while the FileChannel is in use so LRU eviction cannot close it.
+        // DEFLATE is CPU work and is intentionally outside this global lock; different terrain workers
+        // can therefore decompress independent region tiles concurrently.
         synchronized (READERS) {
             RegionReader reader = readerLocked(root, chunkX, chunkZ);
-            return reader != null ? reader.read(slot(chunkX, chunkZ)) : null;
+            compressed = reader != null ? reader.readCompressed(slot(chunkX, chunkZ)) : null;
+        }
+        if (compressed == null) {
+            return null;
+        }
+        try {
+            return decompress(compressed);
+        } catch (IOException | RuntimeException e) {
+            CausticaMod.LOGGER.debug("CausticaLOD packed tile decompression failed: {}", e.toString());
+            return null;
         }
     }
 
@@ -264,7 +276,8 @@ final class RtCausticaLodRegionStore {
                 if (offset == 0 && length == 0) {
                     continue;
                 }
-                if (offset < HEADER_BYTES || length <= 0 || Integer.toUnsignedLong(offset) + length > size) {
+                if (offset < HEADER_BYTES || length <= 0 || length > MAX_COMPRESSED_TILE_BYTES
+                        || Integer.toUnsignedLong(offset) + length > size) {
                     close();
                     throw new IOException("Invalid CausticaLOD region index entry " + i + " in " + path);
                 }
@@ -277,7 +290,7 @@ final class RtCausticaLodRegionStore {
             return lengths[index] > 0;
         }
 
-        TileData read(int index) {
+        byte[] readCompressed(int index) {
             int length = lengths[index];
             if (length <= 0) {
                 return null;
@@ -286,7 +299,7 @@ final class RtCausticaLodRegionStore {
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
             try {
                 readFully(channel, buffer, Integer.toUnsignedLong(offsets[index]));
-                return decompress(bytes);
+                return bytes;
             } catch (IOException | RuntimeException e) {
                 CausticaMod.LOGGER.debug("CausticaLOD packed tile read failed: {}", e.toString());
                 return null;

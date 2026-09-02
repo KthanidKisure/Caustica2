@@ -111,7 +111,10 @@ public final class RtGpuExecutor {
     public GraphicsUse beginGraphicsUse(VulkanCommandEncoder encoder) {
         assertRenderThread();
         checkExecutorFailure();
-        long waitValue = pendingPublishWaitValue.get();
+        // Publication and graphics-use reservation are render-thread operations, so no publisher can
+        // race this exchange. Once one graphics submission waits on the newest published build,
+        // later submissions on the same graphics queue do not need to re-attach that old wait.
+        long waitValue = pendingPublishWaitValue.getAndSet(0L);
         if (waitValue != 0L) {
             // vkQueuePresentKHR requires every transitive signal dependency of its binary wait to have
             // already been submitted. A Build is assigned its timeline value when queued on this Java
