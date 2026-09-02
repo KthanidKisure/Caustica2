@@ -101,9 +101,9 @@ float3 applyWeatherFogTint(float3 inscatter, WorldPush push) {
     return lerp(inscatter, inscatter * (tint / tintLuma), strength);
 }
 
-// One nearby emitter sample tints the participating medium around block lights. It intentionally casts
-// no extra visibility ray: the fog term is low-frequency, and adding a shadow query to every path segment
-// would cost more than the visual precision it buys. The light-grid lookup keeps this O(1).
+// One power-weighted nearby emitter sample tints the participating medium around block lights. The cell
+// coordinate seeds a stable alias-table choice, avoiding temporal sparkle without always selecting the
+// first emitter in the cell. It intentionally casts no extra visibility ray: the fog term is low-frequency.
 float3 fogLocalLightInscatter(WorldPush push, float3 position) {
     if (pc.lightBufAddr == 0 || pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0
             || push.lightCount == 0u) {
@@ -114,12 +114,15 @@ float3 fogLocalLightInscatter(WorldPush push, float3 position) {
     if (!findLightGridCell(position, cell, cellCoord) || cell.spanCount == 0u) {
         return float3(0.0);
     }
-    LightGridSpan span = ConstPtr<LightGridSpan>(pc.lightGridSpanAddr)[cell.spanOffset];
-    uint count = span.packedLightCounts & 0xffffu;
-    if (count == 0u || span.firstLight >= push.lightCount) {
+    uint seed = asuint(cellCoord.x) * 73856093u
+            ^ asuint(cellCoord.y) * 19349663u
+            ^ asuint(cellCoord.z) * 83492791u;
+    uint lightIndex;
+    selectLightGridSpanLight(cell, seed, lightIndex);
+    if (lightIndex >= push.lightCount) {
         return float3(0.0);
     }
-    Light light = ConstPtr<Light>(pc.lightBufAddr)[span.firstLight];
+    Light light = ConstPtr<Light>(pc.lightBufAddr)[lightIndex];
     float3 lightPos = light.pos + push.lightRebase.xyz;
     float3 toReceiver = position - lightPos;
     float dist2 = max(dot(toReceiver, toReceiver), 1.0);

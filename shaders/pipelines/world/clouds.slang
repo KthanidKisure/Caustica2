@@ -36,6 +36,9 @@ import bindings;
 // light march is what produces the shading gradient across a cloud.
 public static const int CLOUD_VIEW_STEPS  = 48;
 public static const int CLOUD_LIGHT_STEPS = 5;
+// Beyond this optical depth, direct light is below float-display relevance and further density samples
+// cannot change the visible result.
+public static const float CLOUD_LIGHT_DEPTH_CUTOFF = 16.0;
 // Marching past this is wasted work: at the deck's grazing angles the transmittance cutoff below always
 // trips first, and the noise domain loses fp32 precision long before this.
 public static const float CLOUD_MAX_MARCH = 60000.0;
@@ -102,11 +105,8 @@ CloudParams secondaryCloudParams(CloudParams base) {
 }
 
 // ---- Noise -------------------------------------------------------------------------------------------
-// Value noise on a hashed integer lattice. Chosen over gradient noise because clouds want the blobby,
-// isotropic character value noise already has, and it is roughly half the ALU.
-
-// Value-noise helpers removed: the base and detail fields are now baked into cloudNoiseTex
-// (RtCloudNoise), so nothing evaluates them at runtime any more.
+// The base and detail fields are precomputed in cloudNoiseTex (RtCloudNoise), keeping runtime density
+// evaluation to filtered texture fetches.
 
 // ---- Density -----------------------------------------------------------------------------------------
 
@@ -299,6 +299,9 @@ float cloudLightOpticalDepth(CloudParams c, float3 position, float3 lightDir) {
     for (int i = 0; i < lightSteps; ++i) {
         travelled += step;
         opticalDepth += cloudDensity(c, position + lightDir * travelled) * step;
+        if (opticalDepth >= CLOUD_LIGHT_DEPTH_CUTOFF) {
+            break;
+        }
         step *= 1.5;
     }
     return opticalDepth;
@@ -352,8 +355,8 @@ float3 tintCloud(float3 scattering, float3 tint709, float strength) {
     if (clamped <= 0.0) {
         return scattering;
     }
-    float3 tint = bt709ToAcesCg(max(tint709, float3(0.0)));
-    float tintLuma = dot(tint, ACESCG_LUMA);
+    float3 tint = max(tint709, float3(0.0));
+    float tintLuma = dot(tint, float3(0.2126, 0.7152, 0.0722));
     // Same trap as the fog tint: a black CLOUD_COLOR is missing data, not an instruction to render
     // black clouds. Leave the deck lit by the atmosphere when there is no usable tint.
     if (tintLuma <= 1.0e-3) {
@@ -391,6 +394,7 @@ CloudResult marchCloudLayer(CloudParams c, SkyState state, float3 origin, float3
     float3 ambient = skyViewLut.SampleLevel(zenithUv, 0.0).rgb * c.ambient;
 
     float phase = cloudPhase(dot(direction, lightDir));
+    bool hasDirectLight = dot(lightIrradiance, float3(0.2126, 0.7152, 0.0722)) > 1.0e-6;
     int viewSteps = int(max(float(CLOUD_VIEW_STEPS) * c.quality, 8.0));
     float stepSize = (tFar - tNear) / float(viewSteps);
     float t = tNear + stepSize * 0.5;
@@ -399,8 +403,12 @@ CloudResult marchCloudLayer(CloudParams c, SkyState state, float3 origin, float3
         float3 position = origin + direction * t;
         float density = cloudDensity(c, position);
         if (density > 0.0) {
-            float lightDepth = cloudLightOpticalDepth(c, position, lightDir);
-            float3 inScatter = lightIrradiance * phase * cloudBeerPowder(lightDepth) + ambient;
+            float3 directScatter = float3(0.0);
+            if (hasDirectLight) {
+                float lightDepth = cloudLightOpticalDepth(c, position, lightDir);
+                directScatter = lightIrradiance * phase * cloudBeerPowder(lightDepth);
+            }
+            float3 inScatter = directScatter + ambient;
 
             // Energy-conserving integration of the segment rather than a rectangle rule on radiance:
             // integrate(0..dt) L * sigma * e^(-sigma*s) ds = L * (1 - e^(-sigma*dt)). This stays correct as
@@ -429,8 +437,7 @@ public CloudResult marchClouds(CloudParams c, SkyState state, float3 origin, flo
     }
     CloudResult high = marchCloudLayer(highParams, state, origin, direction, tint709, tintStrength);
 
-    // Keep slab outputs on paths where Slang can prove they were assigned. This is equivalent to
-    // the old short-circuit form, but avoids reading an out value whose producer may have been skipped.
+    // Keep slab outputs on paths where Slang can prove they were assigned.
     if (!cloudsActive(c)) return high;
     float lowNear, lowFar;
     if (!cloudSlabRange(c, origin, direction, lowNear, lowFar)) return high;

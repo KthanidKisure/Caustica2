@@ -3,12 +3,8 @@
 // destination are bound as a dedicated descriptor set by RtBloomPipeline, so nothing here indexes a
 // descriptor array.
 //
-// Why a pyramid and not the previous single wide Gaussian. That pass took nine taps per axis at a spacing
-// of `radius` HALF-RES pixels (2.0 at 1080p, and it scaled with resolution, so ~2.7 at 1440p). Nine
-// bilinear taps spaced two or more texels apart is a comb, not a filter: for a small bright source the
-// output is nine shifted copies per axis, i.e. a visible 9x9 lattice of replicas — the reported "grid".
-// A pyramid only ever samples one level below itself, so every tap is within a texel or two of its
-// neighbours at that level and the kernel is dense at every scale it covers.
+// A pyramid keeps every filter tap within a texel or two of its neighbours at that level, so the kernel
+// stays dense at every scale it covers and small bright sources do not become a lattice of replicas.
 //
 // The same structure fixes the "solid block" at high intensity. One Gaussian has one width and a hard
 // support: a source far above the threshold saturates its entire footprint uniformly and clips to a flat
@@ -50,6 +46,10 @@ float rollOffBloomContribution(float contribution) {
 // `threshold + knee` the full excess passes, and the transition is C1 so a highlight sliding across the
 // threshold does not pop. The result scales the ORIGINAL colour, so hue is untouched.
 float3 prefilter(float3 color) {
+    // One non-finite path sample must not spread through every level of the pyramid.
+    if (!all(color == color)) {
+        return float3(0.0);
+    }
     color = clamp(color, float3(0.0), float3(HALF_MAX));
     float luminance = dot(color, ACESCG_LUMA);
     float knee = max(pc.softKnee, 1.0e-6);
