@@ -16,12 +16,12 @@ jobs:
         with:
           ref: codex/claude-pass
           fetch-depth: 0
-      - name: Apply FG present hardening
+      - name: Fix FG barrier struct initialization
         run: python3 .github/zz_patch_fg_present.py
       - name: Commit source patch
         run: |
           git config user.name "Caustica CI patch"
           git config user.email "actions@users.noreply.github.com"
           git add src/main/java/dev/comfyfluffy/caustica/rt/RtFramePresenter.java
-          git commit -m "Harden Vulkan frame-generation present path"
+          git commit -m "Fix Vulkan FG barrier initialization"
           git push origin HEAD:codex/claude-pass
