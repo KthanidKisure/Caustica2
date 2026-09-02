@@ -201,8 +201,12 @@ public final class NgxRuntime {
             // Stream large vendor runtimes straight to disk. Do not materialize a second 50-165 MB heap
             // array just to compare/update an already-extracted DLL.
             Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
-        } catch (Throwable t) {
-            Files.deleteIfExists(tmp);
+        } catch (IOException | RuntimeException | Error t) {
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException cleanup) {
+                t.addSuppressed(cleanup);
+            }
             throw t;
         }
         if (sameFileContents(dst, tmp)) {
