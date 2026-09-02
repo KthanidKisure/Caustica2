@@ -110,6 +110,32 @@ final class RtCausticaLodRegionStore {
         if (tiles.isEmpty()) {
             return;
         }
+        TileData[] dense = new TileData[REGION_SLOTS];
+        for (Map.Entry<Integer, TileData> entry : tiles.entrySet()) {
+            int index = entry.getKey();
+            if (index < 0 || index >= REGION_SLOTS) {
+                throw new IllegalArgumentException("CausticaLOD region slot out of range: " + index);
+            }
+            dense[index] = entry.getValue();
+        }
+        writeRegion(root, regionX, regionZ, dense);
+    }
+
+    /** Dense no-boxing path used by the WynnLOD bulk publisher. */
+    static void writeRegion(Path root, int regionX, int regionZ, TileData[] tiles) throws IOException {
+        if (tiles.length != REGION_SLOTS) {
+            throw new IllegalArgumentException("CausticaLOD dense region must contain " + REGION_SLOTS + " slots");
+        }
+        boolean any = false;
+        for (TileData tile : tiles) {
+            if (tile != null) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return;
+        }
         Files.createDirectories(root);
         Path target = regionPath(root, regionX, regionZ);
         Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
@@ -120,7 +146,7 @@ final class RtCausticaLodRegionStore {
             file.setLength(0L);
             file.seek(HEADER_BYTES);
             for (int index = 0; index < REGION_SLOTS; index++) {
-                TileData tile = tiles.get(index);
+                TileData tile = tiles[index];
                 if (tile == null) {
                     continue;
                 }

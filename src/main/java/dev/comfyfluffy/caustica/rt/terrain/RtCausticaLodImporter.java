@@ -913,7 +913,7 @@ final class RtCausticaLodImporter {
     private static final class RegionSpool implements AutoCloseable {
         private static final int MAX_OPEN_STREAMS = 32;
         private final Path root;
-        private final Set<Long> regionKeys = new HashSet<>();
+        private final LongOpenHashSet regionKeys = new LongOpenHashSet();
         private final LinkedHashMap<Long, DataOutputStream> streams = new LinkedHashMap<>(32, 0.75f, true);
 
         RegionSpool(Path root) {
@@ -932,13 +932,13 @@ final class RtCausticaLodImporter {
 
         int publish(Path sessionRoot) throws IOException {
   closeStreams();
-  ArrayList<Long> keys = new ArrayList<>(regionKeys);
-  keys.sort(Comparator.comparingLong(Long::longValue));
+  long[] keys = regionKeys.toLongArray();
+  java.util.Arrays.sort(keys);
   int count = 0;
   for (long regionKey : keys) {
       int rx = (int) (regionKey >> 32);
       int rz = (int) regionKey;
-      HashMap<Integer, RtCausticaLodRegionStore.TileData> tiles = new HashMap<>(1024);
+      RtCausticaLodRegionStore.TileData[] tiles = new RtCausticaLodRegionStore.TileData[1024];
       Path path = spoolPath(rx, rz);
       try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path), 1 << 16))) {
           while (true) {
@@ -948,20 +948,20 @@ final class RtCausticaLodImporter {
               } catch (EOFException done) {
                   break;
               }
-              if (slot < 0 || slot >= 1024) {
+              if (slot < 0 || slot >= tiles.length) {
                   throw new IOException("Invalid CausticaLOD spool slot " + slot + " in " + path);
               }
-              RtCausticaLodRegionStore.TileData previous = tiles.put(slot, readTile(in));
-              if (previous != null) {
+              if (tiles[slot] != null) {
                   throw new IOException("Duplicate CausticaLOD spool slot " + slot + " in " + path);
               }
+              tiles[slot] = readTile(in);
           }
       }
       RtCausticaLodRegionStore.writeRegion(sessionRoot, rx, rz, tiles);
       Files.deleteIfExists(path);
       count++;
-      if ((count & 31) == 0 || count == keys.size()) {
-          CausticaMod.LOGGER.info("CausticaLOD WynnLOD pack publish: {}/{} regions", count, keys.size());
+      if ((count & 31) == 0 || count == keys.length) {
+          CausticaMod.LOGGER.info("CausticaLOD WynnLOD pack publish: {}/{} regions", count, keys.length);
       }
   }
   return count;
