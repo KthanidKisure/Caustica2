@@ -177,17 +177,21 @@ final class RtCausticaLodPackedSource {
 
     private static int skirtBottom(SurfaceColumn[] grid, int gx, int gz, int groundY) {
         int bottom = groundY;
-        int[] indices = {
-                gridIndex(gx - 1, gz),
-                gridIndex(gx + 1, gz),
-                gridIndex(gx, gz - 1),
-                gridIndex(gx, gz + 1),
-        };
-        for (int index : indices) {
-            SurfaceColumn neighbor = grid[index];
-            if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
-                bottom = Math.min(bottom, neighbor.groundY);
-            }
+        SurfaceColumn neighbor = grid[gridIndex(gx - 1, gz)];
+        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor.groundY);
+        }
+        neighbor = grid[gridIndex(gx + 1, gz)];
+        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor.groundY);
+        }
+        neighbor = grid[gridIndex(gx, gz - 1)];
+        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor.groundY);
+        }
+        neighbor = grid[gridIndex(gx, gz + 1)];
+        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor.groundY);
         }
         return bottom;
     }
