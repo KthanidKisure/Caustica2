@@ -1,0 +1,30 @@
+name: Caustica runtime IO patch
+
+on:
+  push:
+    branches: [codex/claude-pass]
+    paths: [".github/workflows/zz-caustica-runtime-io.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/claude-pass
+          fetch-depth: 0
+      - name: Apply runtime IO and synchronization patch
+        run: python3 .github/zz_patch_runtime_io.py
+      - name: Commit source patch
+        run: |
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/RtGpuExecutor.java
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodRegionStore.java
+          git commit -m "Reduce CausticaLOD IO contention and stale timeline waits"
+          git push origin HEAD:codex/claude-pass
