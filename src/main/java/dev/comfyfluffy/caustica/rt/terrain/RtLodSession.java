@@ -3,8 +3,11 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import net.minecraft.SharedConstants;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.storage.LevelResource;
 
+import java.nio.file.Path;
 import java.util.Locale;
 
 /** Stable identity rules shared by every CausticaLOD persistence/source layer. */
@@ -28,7 +31,7 @@ final class RtLodSession {
     static String serverIdentity(Minecraft mc) {
         String raw = rawServer(mc);
         if (raw.isEmpty()) {
-            return "singleplayer";
+            return singleplayerIdentity(mc);
         }
         if (isWynncraftHost(raw)) {
             // Wynncraft proxy/subdomain changes must not create duplicate native databases or re-import
@@ -36,6 +39,32 @@ final class RtLodSession {
             return "wynncraft.com";
         }
         return raw;
+    }
+
+    /**
+     * A bare "singleplayer" identity aliases every local save in the instance, which can make one
+     * world's persistent distant terrain appear in another. Prefer the integrated server's save-folder
+     * identity; fall back to its level name only if the storage path is temporarily unavailable.
+     */
+    private static String singleplayerIdentity(Minecraft mc) {
+        try {
+            MinecraftServer server = mc != null ? mc.getSingleplayerServer() : null;
+            if (server != null) {
+                Path root = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize();
+                Path fileName = root.getFileName();
+                if (fileName != null && !fileName.toString().isBlank()) {
+                    return "singleplayer:" + fileName;
+                }
+                String levelName = server.getWorldData().getLevelName();
+                if (levelName != null && !levelName.isBlank()) {
+                    return "singleplayer:" + levelName;
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        // Safe during the very small interval before the integrated server object becomes available;
+        // the session is re-derived on later ticks. Never use this fallback to import WynnLOD.
+        return "singleplayer:unresolved";
     }
 
     private static String rawServer(Minecraft mc) {
