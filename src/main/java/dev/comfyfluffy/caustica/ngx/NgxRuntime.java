@@ -229,6 +229,11 @@ public final class NgxRuntime {
             }
         }
         for (String name : bundledFeatureLibraryNames()) {
+            // Required RR/FG names are also visible to the generic resource scan. Avoid streaming and
+            // byte-comparing those large DLLs twice on every startup.
+            if (current.contains(name)) {
+                continue;
+            }
             if (extractBundledNative(name, dir.resolve(name))) {
                 current.add(name);
             }
