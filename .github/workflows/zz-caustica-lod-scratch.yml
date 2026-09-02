@@ -16,7 +16,7 @@ jobs:
         with:
           ref: codex/claude-pass
           fetch-depth: 0
-      - name: Apply allocation-free LOD sampling scratch
+      - name: Remove remaining per-cell skirt allocation
         run: python3 .github/zz_patch_lod_scratch.py
       - name: Commit source patch
         run: |
@@ -24,5 +24,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodPackedSource.java
           git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodSource.java
-          git commit -m "Reduce CausticaLOD coarse-sampling allocation pressure"
+          git commit -m "Remove remaining CausticaLOD per-cell temp allocation"
           git push origin HEAD:codex/claude-pass
