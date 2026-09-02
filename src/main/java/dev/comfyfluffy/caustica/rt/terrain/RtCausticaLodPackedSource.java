@@ -30,9 +30,11 @@ final class RtCausticaLodPackedSource {
     private static final short NO_HEIGHT = RtCausticaLodRegionStore.NO_HEIGHT;
 
     private static final RtLodTileCache<RtCausticaLodRegionStore.TileData> MEMORY = new RtLodTileCache<>(8192);
-    /** Per-worker primitive scratch: avoids thousands of short-lived sample arrays/records per LOD page. */
-    private static final ThreadLocal<SampleScratch> SAMPLE_SCRATCH =
-            ThreadLocal.withInitial(SampleScratch::new);
+    private static final int GRID_EDGE = RtDhLodRegion.SECTION_BLOCKS + 2;
+    private static final int GRID_CELLS = GRID_EDGE * GRID_EDGE;
+    /** Per-worker reusable page + five-point reducer scratch; no per-page SurfaceColumn object burst. */
+    private static final ThreadLocal<PageScratch> PAGE_SCRATCH =
+            ThreadLocal.withInitial(PageScratch::new);
     /** Negative cache for uncovered chunks; imported regions are immutable once the completion marker exists. */
     private static final RtLodTileCache<Boolean> MISSING = new RtLodTileCache<>(32768);
     private static final AtomicBoolean LOGGED_FIRST_QUERY = new AtomicBoolean();
@@ -74,7 +76,7 @@ final class RtCausticaLodPackedSource {
             return new RtCausticaLodSource.FetchResult(List.of(), false);
         }
         int scale = Math.max(1, footprintBlocks / RtDhLodRegion.SECTION_BLOCKS);
-        SurfaceColumn[] surfaceGrid = sampleSurfaceGrid(originBlockX, originBlockZ, scale);
+        PageScratch surfaceGrid = sampleSurfaceGrid(originBlockX, originBlockZ, scale);
         ArrayList<RtCausticaLodSource.LodBox> boxes =
                 new ArrayList<>(RtDhLodRegion.SECTION_BLOCKS * RtDhLodRegion.SECTION_BLOCKS * 3);
         int resolvedCells = 0;
@@ -83,17 +85,18 @@ final class RtCausticaLodPackedSource {
             int cellX = originBlockX + vx * scale;
             for (int vz = 0; vz < RtDhLodRegion.SECTION_BLOCKS; vz++) {
                 int cellZ = originBlockZ + vz * scale;
-                SurfaceColumn column = surfaceGrid[gridIndex(vx + 1, vz + 1)];
-                if (column == null || column.groundY == NO_HEIGHT) {
+                int gridSlot = gridIndex(vx + 1, vz + 1);
+                short sampledGroundY = surfaceGrid.groundY[gridSlot];
+                if (sampledGroundY == NO_HEIGHT) {
                     continue;
                 }
                 resolvedCells++;
 
-                int groundY = column.groundY;
-                int surfaceY = Math.max(column.surfaceY, groundY);
-                BlockState ground = stateById(column.groundStateId);
-                BlockState body = stateById(column.bodyStateId);
-                BlockState surface = stateById(column.surfaceStateId);
+                int groundY = sampledGroundY;
+                int surfaceY = Math.max(surfaceGrid.surfaceY[gridSlot], groundY);
+                BlockState ground = stateById(surfaceGrid.groundStateId[gridSlot]);
+                BlockState body = stateById(surfaceGrid.bodyStateId[gridSlot]);
+                BlockState surface = stateById(surfaceGrid.surfaceStateId[gridSlot]);
                 if (ground.isAir()) {
                     ground = body.isAir() ? Blocks.STONE.defaultBlockState() : body;
                 }
@@ -158,51 +161,51 @@ final class RtCausticaLodPackedSource {
     }
 
     /** Pre-sample the page plus a one-cell border so cliff skirts reuse exactly the same data. */
-    private static SurfaceColumn[] sampleSurfaceGrid(int originBlockX, int originBlockZ, int scale) {
-        int edge = RtDhLodRegion.SECTION_BLOCKS + 2;
-        SurfaceColumn[] grid = new SurfaceColumn[edge * edge];
+    private static PageScratch sampleSurfaceGrid(int originBlockX, int originBlockZ, int scale) {
+        PageScratch grid = PAGE_SCRATCH.get();
+        grid.resetGrid();
         for (int gx = -1; gx <= RtDhLodRegion.SECTION_BLOCKS; gx++) {
             int x = originBlockX + gx * scale;
             for (int gz = -1; gz <= RtDhLodRegion.SECTION_BLOCKS; gz++) {
                 int z = originBlockZ + gz * scale;
-                grid[gridIndex(gx + 1, gz + 1)] = representativeColumn(x, z, scale);
+                representativeColumn(grid, gridIndex(gx + 1, gz + 1), x, z, scale);
             }
         }
         return grid;
     }
 
     private static int gridIndex(int x, int z) {
-        return x * (RtDhLodRegion.SECTION_BLOCKS + 2) + z;
+        return x * GRID_EDGE + z;
     }
 
-    private static int skirtBottom(SurfaceColumn[] grid, int gx, int gz, int groundY) {
+    private static int skirtBottom(PageScratch grid, int gx, int gz, int groundY) {
         int bottom = groundY;
-        SurfaceColumn neighbor = grid[gridIndex(gx - 1, gz)];
-        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
-            bottom = Math.min(bottom, neighbor.groundY);
+        short neighbor = grid.groundY[gridIndex(gx - 1, gz)];
+        if (neighbor != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor);
         }
-        neighbor = grid[gridIndex(gx + 1, gz)];
-        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
-            bottom = Math.min(bottom, neighbor.groundY);
+        neighbor = grid.groundY[gridIndex(gx + 1, gz)];
+        if (neighbor != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor);
         }
-        neighbor = grid[gridIndex(gx, gz - 1)];
-        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
-            bottom = Math.min(bottom, neighbor.groundY);
+        neighbor = grid.groundY[gridIndex(gx, gz - 1)];
+        if (neighbor != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor);
         }
-        neighbor = grid[gridIndex(gx, gz + 1)];
-        if (neighbor != null && neighbor.groundY != NO_HEIGHT) {
-            bottom = Math.min(bottom, neighbor.groundY);
+        neighbor = grid.groundY[gridIndex(gx, gz + 1)];
+        if (neighbor != NO_HEIGHT) {
+            bottom = Math.min(bottom, neighbor);
         }
         return bottom;
     }
 
-    private static SurfaceColumn representativeColumn(int cellX, int cellZ, int scale) {
+    private static void representativeColumn(PageScratch page, int pageSlot, int cellX, int cellZ, int scale) {
         int half = Math.max(0, scale / 2);
         int quarter = Math.max(0, scale / 4);
         int threeQuarter = Math.max(0, (scale * 3) / 4);
         int end = Math.max(0, scale - 1);
 
-        SampleScratch scratch = SAMPLE_SCRATCH.get();
+        SampleScratch scratch = page.samples;
         scratch.count = 0;
         sampleColumn(scratch, cellX + half, cellZ + half);
         sampleColumn(scratch, cellX + quarter, cellZ + quarter);
@@ -211,7 +214,7 @@ final class RtCausticaLodPackedSource {
         sampleColumn(scratch, cellX + end, cellZ + end);
         int sampleCount = scratch.count;
         if (sampleCount == 0) {
-            return null;
+            return;
         }
 
         int highest = 0;
@@ -221,7 +224,9 @@ final class RtCausticaLodPackedSource {
             }
         }
         if (scale <= 4 || sampleCount == 1) {
-            return scratch.column(highest);
+            page.set(pageSlot, scratch.groundY[highest], scratch.surfaceY[highest],
+                    scratch.groundStateId[highest], scratch.bodyStateId[highest], scratch.surfaceStateId[highest]);
+            return;
         }
 
         for (int i = 0; i < sampleCount; i++) {
@@ -246,8 +251,9 @@ final class RtCausticaLodPackedSource {
             }
         }
         if (elevatedCount < 2) {
-            return new SurfaceColumn(scratch.groundY[ground], scratch.groundY[ground],
+            page.set(pageSlot, scratch.groundY[ground], scratch.groundY[ground],
                     scratch.groundStateId[ground], scratch.bodyStateId[ground], scratch.groundStateId[ground]);
+            return;
         }
 
         java.util.Arrays.sort(scratch.sortHeights, 0, elevatedCount);
@@ -261,10 +267,11 @@ final class RtCausticaLodPackedSource {
             }
         }
         if (scratch.surfaceY[surface] <= scratch.groundY[ground]) {
-            return new SurfaceColumn(scratch.groundY[ground], scratch.groundY[ground],
+            page.set(pageSlot, scratch.groundY[ground], scratch.groundY[ground],
                     scratch.groundStateId[ground], scratch.bodyStateId[ground], scratch.groundStateId[ground]);
+            return;
         }
-        return new SurfaceColumn(scratch.groundY[ground], scratch.surfaceY[surface],
+        page.set(pageSlot, scratch.groundY[ground], scratch.surfaceY[surface],
                 scratch.groundStateId[ground], scratch.bodyStateId[ground], scratch.surfaceStateId[surface]);
     }
 
@@ -392,6 +399,27 @@ final class RtCausticaLodPackedSource {
         }
     }
 
+    private static final class PageScratch {
+        final SampleScratch samples = new SampleScratch();
+        final short[] groundY = new short[GRID_CELLS];
+        final short[] surfaceY = new short[GRID_CELLS];
+        final int[] groundStateId = new int[GRID_CELLS];
+        final int[] bodyStateId = new int[GRID_CELLS];
+        final int[] surfaceStateId = new int[GRID_CELLS];
+
+        void resetGrid() {
+            java.util.Arrays.fill(groundY, NO_HEIGHT);
+        }
+
+        void set(int index, short ground, short surface, int groundState, int bodyState, int surfaceState) {
+            groundY[index] = ground;
+            surfaceY[index] = surface;
+            groundStateId[index] = groundState;
+            bodyStateId[index] = bodyState;
+            surfaceStateId[index] = surfaceState;
+        }
+    }
+
     private static final class SampleScratch {
         int count;
         final short[] groundY = new short[5];
@@ -401,14 +429,5 @@ final class RtCausticaLodPackedSource {
         final int[] surfaceStateId = new int[5];
         final int[] elevatedIndices = new int[5];
         final int[] sortHeights = new int[5];
-
-        SurfaceColumn column(int index) {
-            return new SurfaceColumn(groundY[index], surfaceY[index],
-                    groundStateId[index], bodyStateId[index], surfaceStateId[index]);
-        }
-    }
-
-    private record SurfaceColumn(short groundY, short surfaceY,
-                                 int groundStateId, int bodyStateId, int surfaceStateId) {
     }
 }
