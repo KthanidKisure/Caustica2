@@ -21,14 +21,16 @@ import java.lang.foreign.ValueLayout;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Stream;
 
 /**
@@ -42,6 +44,10 @@ public final class NgxRuntime {
     public static final NgxRuntime INSTANCE = new NgxRuntime();
 
     private static final PlatformNatives PLATFORM_NATIVES = PlatformNatives.current();
+    // Filled while verifying/extracting bundled natives, then reused by the inventory logger so large
+    // feature DLLs are not read from disk yet another time just to print their SHA-256. acquire() is
+    // synchronized, so this map is only mutated on the serialized NGX initialization path.
+    private static final Map<String, NativeFingerprint> BUNDLED_FINGERPRINTS = new HashMap<>();
 
     private NgxLibrary lib;
     private boolean initialized;
@@ -180,6 +186,7 @@ public final class NgxRuntime {
                 .resolve("natives").resolve(PLATFORM_NATIVES.platformDir());
         try {
             Files.createDirectories(dir);
+            BUNDLED_FINGERPRINTS.clear();
             boolean hasShim = extractBundledNative(PLATFORM_NATIVES.shimName(), dir.resolve(PLATFORM_NATIVES.shimName()));
             extractBundledFeatureLibraries(dir);
             return hasShim && Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.shimName()))
@@ -192,15 +199,40 @@ public final class NgxRuntime {
 
     private static boolean extractBundledNative(String name, Path dst) throws IOException {
         String resource = PLATFORM_NATIVES.resourceDir() + name;
+
+        // Common launch path: compare the bundled resource directly against the previously extracted file.
+        // No temporary 50-165 MB write is performed when the DLL is unchanged. The digest is computed from
+        // the bundled bytes during the same pass and reused by logNativeInventory().
+        if (Files.isRegularFile(dst)) {
+            try (InputStream raw = NgxRuntime.class.getResourceAsStream(resource)) {
+                if (raw == null) {
+                    return false;
+                }
+                MessageDigest digest = newSha256();
+                try (DigestInputStream bundled = new DigestInputStream(raw, digest);
+                        InputStream existing = Files.newInputStream(dst)) {
+                    long size = compareStreams(bundled, existing);
+                    if (size >= 0L) {
+                        BUNDLED_FINGERPRINTS.put(name,
+                                new NativeFingerprint(size, HexFormat.of().formatHex(digest.digest())));
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // First install or changed runtime: stream to a sibling temp file, hash while copying, then publish
+        // atomically. This keeps partial/crashed updates from replacing the last known-good native.
         Path tmp = dst.resolveSibling(dst.getFileName() + ".tmp");
         Files.deleteIfExists(tmp);
-        try (InputStream in = NgxRuntime.class.getResourceAsStream(resource)) {
-            if (in == null) {
+        MessageDigest digest = newSha256();
+        try (InputStream raw = NgxRuntime.class.getResourceAsStream(resource)) {
+            if (raw == null) {
                 return false;
             }
-            // Stream large vendor runtimes straight to disk. Do not materialize a second 50-165 MB heap
-            // array just to compare/update an already-extracted DLL.
-            Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+            try (DigestInputStream in = new DigestInputStream(raw, digest)) {
+                Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException | RuntimeException | Error t) {
             try {
                 Files.deleteIfExists(tmp);
@@ -209,16 +241,40 @@ public final class NgxRuntime {
             }
             throw t;
         }
-        if (sameFileContents(dst, tmp)) {
-            Files.deleteIfExists(tmp);
-            return true;
-        }
+        long size = Files.size(tmp);
+        BUNDLED_FINGERPRINTS.put(name, new NativeFingerprint(size, HexFormat.of().formatHex(digest.digest())));
         try {
             Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException atomicUnsupported) {
             Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING);
         }
         return true;
+    }
+
+    /**
+     * Compare two streams without retaining the file in heap. Returns the number of identical bundled bytes
+     * when both streams reach EOF together, or -1 at the first mismatch.
+     */
+    private static long compareStreams(InputStream bundled, InputStream existing) throws IOException {
+        byte[] left = new byte[64 * 1024];
+        byte[] right = new byte[64 * 1024];
+        long total = 0L;
+        while (true) {
+            int ln = bundled.readNBytes(left, 0, left.length);
+            int rn = existing.readNBytes(right, 0, right.length);
+            if (ln != rn) {
+                return -1L;
+            }
+            if (ln == 0) {
+                return total;
+            }
+            for (int i = 0; i < ln; i++) {
+                if (left[i] != right[i]) {
+                    return -1L;
+                }
+            }
+            total += ln;
+        }
     }
 
     private static void extractBundledFeatureLibraries(Path dir) throws IOException {
@@ -310,8 +366,13 @@ public final class NgxRuntime {
                     .sorted((a, b) -> a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString()))
                     .forEach(path -> {
                         try {
+                            String name = path.getFileName().toString();
+                            long size = Files.size(path);
+                            NativeFingerprint bundled = BUNDLED_FINGERPRINTS.get(name);
+                            String digest = bundled != null && bundled.size() == size
+                                    ? bundled.sha256() : sha256(path);
                             CausticaMod.LOGGER.info("NGX native {}: {} bytes, sha256={}",
-                                    path.getFileName(), Files.size(path), sha256(path));
+                                    path.getFileName(), size, digest);
                         } catch (IOException e) {
                             CausticaMod.LOGGER.debug("Could not fingerprint NGX native {}: {}", path, e.toString());
                         }
@@ -321,13 +382,16 @@ public final class NgxRuntime {
         }
     }
 
-    private static String sha256(Path path) throws IOException {
-        final MessageDigest digest;
+    private static MessageDigest newSha256() {
         try {
-            digest = MessageDigest.getInstance("SHA-256");
+            return MessageDigest.getInstance("SHA-256");
         } catch (NoSuchAlgorithmException impossible) {
             throw new IllegalStateException("SHA-256 unavailable", impossible);
         }
+    }
+
+    private static String sha256(Path path) throws IOException {
+        MessageDigest digest = newSha256();
         try (InputStream in = Files.newInputStream(path)) {
             byte[] buffer = new byte[64 * 1024];
             int read;
@@ -340,33 +404,7 @@ public final class NgxRuntime {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    private static boolean sameFileContents(Path a, Path b) throws IOException {
-        try {
-            if (Files.size(a) != Files.size(b)) {
-                return false;
-            }
-        } catch (NoSuchFileException e) {
-            return false;
-        }
-        try (InputStream left = Files.newInputStream(a); InputStream right = Files.newInputStream(b)) {
-            byte[] lb = new byte[64 * 1024];
-            byte[] rb = new byte[64 * 1024];
-            while (true) {
-                int ln = left.readNBytes(lb, 0, lb.length);
-                int rn = right.readNBytes(rb, 0, rb.length);
-                if (ln != rn) {
-                    return false;
-                }
-                if (ln == 0) {
-                    return true;
-                }
-                for (int i = 0; i < ln; i++) {
-                    if (lb[i] != rb[i]) {
-                        return false;
-                    }
-                }
-            }
-        }
+    private record NativeFingerprint(long size, String sha256) {
     }
 
     // Native wchar_t width differs by platform: 2 bytes (UTF-16) on Windows, 4 bytes (UTF-32)
