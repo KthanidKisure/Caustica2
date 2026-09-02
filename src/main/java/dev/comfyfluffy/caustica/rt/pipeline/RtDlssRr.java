@@ -72,6 +72,15 @@ public final class RtDlssRr {
     }
 
     /**
+     * Discard temporal reconstruction history without destroying the feature. Used for teleports,
+     * same-dimension world/proxy swaps and long render discontinuities where old motion/history is invalid.
+     */
+    public void invalidateHistory() {
+        resetHistory = true;
+        lastFrameNanos = 0L;
+    }
+
+    /**
      * Record a DLSS-RR evaluation: denoise + upscale the noisy path-traced color (at render res) using
      * the guide buffers, writing the display-res result into {@code out}. {@code jitterX/jitterY} is the
      * sub-pixel camera jitter applied to the primary ray this frame, in render pixels. Returns false

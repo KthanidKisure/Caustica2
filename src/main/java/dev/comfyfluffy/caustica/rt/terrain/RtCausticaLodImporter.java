@@ -92,6 +92,12 @@ final class RtCausticaLodImporter {
     private static final int VOXY_LUT_OFFSET = 16 + VOXY_MAPPING_BYTES;
     private static final int MAX_VOXY_RAW_BYTES = VOXY_LUT_OFFSET + VOXY_SECTION_VOLUME * 8;
     private static final long PROGRESS_STEP = 64L * 1024L * 1024L;
+    // Reuse one connection pool for Maven sidecars/tools and the ~592 MiB WynnLOD archive instead of
+    // constructing a fresh HttpClient/executor for every request in the one-time import.
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "caustica-lod-import");
@@ -612,43 +618,101 @@ final class RtCausticaLodImporter {
         Files.createDirectories(target.getParent());
         Files.deleteIfExists(target);
         Path part = target.resolveSibling(target.getFileName() + ".part");
-        Files.deleteIfExists(part);
+        long resumeOffset = Files.isRegularFile(part) ? Files.size(part) : 0L;
 
-        HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofHours(2))
-                .header("User-Agent", "CausticaLOD/0.1")
-                .GET().build();
-        HttpResponse<InputStream> response = http().send(request, HttpResponse.BodyHandlers.ofInputStream());
-        if (response.statusCode() / 100 != 2) {
-            response.body().close();
-            throw new IOException("HTTP " + response.statusCode() + " downloading " + uri);
-        }
-        long expectedBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
-        CausticaMod.LOGGER.info("CausticaLOD downloading {}{}", uri,
-                expectedBytes > 0 ? " (" + expectedBytes / (1024 * 1024) + " MiB)" : "");
-        try (InputStream in = new BufferedInputStream(response.body(), 1 << 20);
-             var out = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20)) {
-            byte[] buffer = new byte[1 << 20];
-            long total = 0L;
-            long nextProgress = PROGRESS_STEP;
-            int read;
-            while ((read = in.read(buffer)) >= 0) {
-                if (read == 0) {
+        // At most one retry is needed here: a server may ignore/reject Range, in which case we fall back
+        // to a clean full request. Genuine network failures keep the .part file for the importer's normal
+        // 30-second retry rather than throwing away hundreds of already-downloaded MiB.
+        for (int requestAttempt = 0; requestAttempt < 2; requestAttempt++) {
+            HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                    .timeout(Duration.ofHours(2))
+                    .header("User-Agent", "CausticaLOD/0.1");
+            if (resumeOffset > 0L) {
+                request.header("Range", "bytes=" + resumeOffset + "-");
+            }
+            HttpResponse<InputStream> response = HTTP.send(request.GET().build(), HttpResponse.BodyHandlers.ofInputStream());
+            int status = response.statusCode();
+            boolean append = resumeOffset > 0L && status == 206;
+
+            if (resumeOffset > 0L && status == 416) {
+                response.body().close();
+                // A completed .part can produce 416 (range starts at EOF); verify before discarding it.
+                if (digest(part, algorithm).equalsIgnoreCase(expectedHex)) {
+                    publishDownload(part, target);
+                    return;
+                }
+                Files.deleteIfExists(part);
+                resumeOffset = 0L;
+                continue;
+            }
+            if (status / 100 != 2) {
+                response.body().close();
+                throw new IOException("HTTP " + status + " downloading " + uri);
+            }
+            if (append) {
+                String range = response.headers().firstValue("Content-Range").orElse("");
+                if (!range.startsWith("bytes " + resumeOffset + "-")) {
+                    response.body().close();
+                    Files.deleteIfExists(part);
+                    resumeOffset = 0L;
                     continue;
                 }
-                out.write(buffer, 0, read);
-                total += read;
-                if (total >= nextProgress) {
-                    CausticaMod.LOGGER.info("CausticaLOD download progress: {} MiB", total / (1024 * 1024));
-                    nextProgress += PROGRESS_STEP;
+            } else if (resumeOffset > 0L) {
+                // A 2xx response other than 206 ignored our Range header. Its body is the complete file,
+                // so safely replace the partial rather than appending duplicate bytes.
+                resumeOffset = 0L;
+            }
+
+            long responseBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
+            long expectedTotal = responseBytes >= 0L ? resumeOffset + responseBytes : -1L;
+            if (append) {
+                CausticaMod.LOGGER.info("CausticaLOD resuming {} from {} MiB{}", uri,
+                        resumeOffset / (1024 * 1024),
+                        expectedTotal > 0L ? " (about " + expectedTotal / (1024 * 1024) + " MiB total)" : "");
+            } else {
+                CausticaMod.LOGGER.info("CausticaLOD downloading {}{}", uri,
+                        responseBytes > 0L ? " (" + responseBytes / (1024 * 1024) + " MiB)" : "");
+            }
+
+            long total = resumeOffset;
+            long nextProgress = ((total / PROGRESS_STEP) + 1L) * PROGRESS_STEP;
+            var rawOut = append
+                    ? Files.newOutputStream(part, StandardOpenOption.CREATE, StandardOpenOption.APPEND)
+                    : Files.newOutputStream(part, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            try (InputStream in = new BufferedInputStream(response.body(), 1 << 20);
+                 var out = new BufferedOutputStream(rawOut, 1 << 20)) {
+                byte[] buffer = new byte[1 << 20];
+                int read;
+                while ((read = in.read(buffer)) >= 0) {
+                    if (read == 0) {
+                        continue;
+                    }
+                    out.write(buffer, 0, read);
+                    total += read;
+                    if (total >= nextProgress) {
+                        CausticaMod.LOGGER.info("CausticaLOD download progress: {} MiB", total / (1024 * 1024));
+                        nextProgress += PROGRESS_STEP;
+                    }
                 }
             }
+            if (expectedTotal >= 0L && total != expectedTotal) {
+                // Keep the partial for a Range retry. This is different from a completed-but-wrong digest.
+                throw new IOException("Incomplete download for " + uri + ": expected " + expectedTotal
+                        + " bytes, received " + total);
+            }
+
+            String actual = digest(part, algorithm);
+            if (!actual.equalsIgnoreCase(expectedHex)) {
+                Files.deleteIfExists(part);
+                throw new IOException("Digest mismatch for " + uri + ": expected " + expectedHex + ", got " + actual);
+            }
+            publishDownload(part, target);
+            return;
         }
-        String actual = digest(part, algorithm);
-        if (!actual.equalsIgnoreCase(expectedHex)) {
-            Files.deleteIfExists(part);
-            throw new IOException("Digest mismatch for " + uri + ": expected " + expectedHex + ", got " + actual);
-        }
+        throw new IOException("Unable to restart download after Range negotiation failed for " + uri);
+    }
+
+    private static void publishDownload(Path part, Path target) throws IOException {
         try {
             Files.move(part, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException atomicUnsupported) {
@@ -669,10 +733,7 @@ final class RtCausticaLodImporter {
     }
 
     private static HttpClient http() {
-        return HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
+        return HTTP;
     }
 
     private static String digest(Path path, String algorithm) throws Exception {

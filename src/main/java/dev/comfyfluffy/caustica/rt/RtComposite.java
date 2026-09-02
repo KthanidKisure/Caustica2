@@ -19,6 +19,7 @@ import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float3;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.client.renderer.texture.TextureAtlas;
@@ -297,6 +298,16 @@ public final class RtComposite {
     private boolean mvHasPrev;
     private float previousWaterWaveTime;
     private boolean waterWaveTimeValid;
+    // Temporal reconstruction must never bridge a proxy/world replacement, teleport, or long pause.
+    // Those discontinuities invalidate RR, ReSTIR, FG and camera/water reprojection together.
+    private static final long TEMPORAL_GAP_NS = 750_000_000L;
+    private static final double TEMPORAL_JUMP_DISTANCE_SQ = 64.0 * 64.0;
+    private ClientLevel temporalLevel;
+    private long temporalLastFrameNanos;
+    private double temporalLastCamX;
+    private double temporalLastCamY;
+    private double temporalLastCamZ;
+    private boolean temporalPositionValid;
     private long atlasSampler;
     private boolean failed;
     private boolean loggedActive;
@@ -696,6 +707,7 @@ public final class RtComposite {
                 return false;
             }
             refreshMaterialBindingsIfNeeded(ctx);
+            updateTemporalContinuity(Minecraft.getInstance().level);
             updateMotion();
             recordFrame(ctx, active, nativeColor);
             if (!loggedActive) {
@@ -1069,6 +1081,39 @@ public final class RtComposite {
      * into the previous frame's clip space, plus the per-frame camera translation. On the first frame
      * (or after a reset) push the current view-projection with zero delta so MVs come out zero.
      */
+    private void updateTemporalContinuity(ClientLevel level) {
+        long now = System.nanoTime();
+        boolean levelChanged = level != temporalLevel;
+        boolean longGap = temporalLastFrameNanos != 0L && now - temporalLastFrameNanos > TEMPORAL_GAP_NS;
+        boolean cameraJump = false;
+        if (temporalPositionValid) {
+            double dx = camX - temporalLastCamX;
+            double dy = camY - temporalLastCamY;
+            double dz = camZ - temporalLastCamZ;
+            cameraJump = dx * dx + dy * dy + dz * dz > TEMPORAL_JUMP_DISTANCE_SQ;
+        }
+        if (levelChanged || longGap || cameraJump) {
+            invalidateTemporalHistory(levelChanged);
+        }
+        temporalLevel = level;
+        temporalLastFrameNanos = now;
+        temporalLastCamX = camX;
+        temporalLastCamY = camY;
+        temporalLastCamZ = camZ;
+        temporalPositionValid = true;
+    }
+
+    private void invalidateTemporalHistory(boolean resetExposure) {
+        mvHasPrev = false;
+        reservoirHistoryValid = false;
+        fgReset = true;
+        waterWaveTimeValid = false;
+        RtDlssRr.INSTANCE.invalidateHistory();
+        if (resetExposure) {
+            exposure.requestReset();
+        }
+    }
+
     private void updateMotion() {
         mvCurProjView.set(frameProjection).mul(frameViewRotation);
         if (mvHasPrev) {
@@ -1848,6 +1893,13 @@ public final class RtComposite {
         fgInterpW = -1;
         fgInterpH = -1;
         fgInterpFormat = Integer.MIN_VALUE;
+        temporalLevel = null;
+        temporalLastFrameNanos = 0L;
+        temporalPositionValid = false;
+        mvHasPrev = false;
+        reservoirHistoryValid = false;
+        fgReset = true;
+        waterWaveTimeValid = false;
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
@@ -2031,15 +2083,21 @@ public final class RtComposite {
                 }
                 RtUiOverlay.markConsumed();
             }
-            // Swapchain UNDEFINED -> TRANSFER_DST, plus make the HDR compute writes visible to the blit read.
-            VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
-            toDst.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
+            // Swapchain UNDEFINED -> TRANSFER_DST, plus make only this HDR image's prior writes visible
+            // to the transfer read. A global memory barrier needlessly serialized unrelated RT resources.
+            VkImageMemoryBarrier2.Buffer beforeBlit = VkImageMemoryBarrier2.calloc(2, stack).sType$Default();
+            beforeBlit.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(swapchainImage);
-            toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
-            VkMemoryBarrier2.Buffer srcVis = VkMemoryBarrier2.calloc(1, stack).sType$Default();
-            srcVis.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(4096L).dstAccessMask(2048L);
-            VkDependencyInfo dep1 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toDst).pMemoryBarriers(srcVis);
+            beforeBlit.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            beforeBlit.get(1).sType$Default().srcStageMask(65536L).srcAccessMask(65536L)
+                    .dstStageMask(4096L).dstAccessMask(2048L)
+                    .oldLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                    .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(src.image);
+            beforeBlit.get(1).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VkDependencyInfo dep1 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(beforeBlit);
             KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep1);
 
             // Blit HDR (GENERAL) -> swapchain (TRANSFER_DST), Y-flipped like vanilla.
@@ -2058,9 +2116,7 @@ public final class RtComposite {
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).newLayout(1000001002)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(swapchainImage);
             toPresent.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
-            VkMemoryBarrier2.Buffer mem2 = VkMemoryBarrier2.calloc(1, stack).sType$Default();
-            mem2.get(0).srcStageMask(4096L).srcAccessMask(2048L).dstStageMask(65536L).dstAccessMask(98304L);
-            VkDependencyInfo dep2 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toPresent).pMemoryBarriers(mem2);
+            VkDependencyInfo dep2 = VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(toPresent);
             KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep2);
 
             if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {

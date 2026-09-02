@@ -48,6 +48,7 @@ public final class CausticaClient implements ClientModInitializer {
 			// geometry from poisoning the long-lived server/dimension cache.
 			if (RtCausticaLodWarmup.ready(client.level)) {
 				RtCausticaLodSource.tick();
+				RtDhLodSource.tick();
 			}
 
 			// Bring up the RT device/context once; terrain residency + the composite follow below.

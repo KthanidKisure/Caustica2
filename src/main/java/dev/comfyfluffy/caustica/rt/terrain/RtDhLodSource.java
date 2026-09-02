@@ -33,9 +33,12 @@ public final class RtDhLodSource {
     }
 
     public static boolean available() {
-        // Calling packed availability also starts the one-time WynnLOD conversion when the current
-        // server is Wynncraft and LOD is enabled. It only schedules background work; no IO happens here.
         return RtCausticaLodPackedSource.available() || RtCausticaLodSource.available();
+    }
+
+    /** Client-thread driver for packed-session discovery and the optional one-time WynnLOD import. */
+    public static void tick() {
+        RtCausticaLodPackedSource.tick();
     }
 
     /** True when this coarse page intersects the vanilla/full-resolution RT terrain window. */
