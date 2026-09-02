@@ -118,7 +118,9 @@ final class RtCausticaLodPackedSource {
             }
         }
         if (resolvedCells == 0) {
-            return new RtCausticaLodSource.FetchResult(List.of(), false);
+            // The imported pack is immutable once packReady is true. No covered cells is therefore a
+            // confirmed empty/uncovered result, not a transient source failure that should stall other pages.
+            return new RtCausticaLodSource.FetchResult(List.of(), true);
         }
         if (LOGGED_FIRST_QUERY.compareAndSet(false, true)) {
             CausticaMod.LOGGER.info("CausticaLOD packed query succeeded: {}/{} cells, {} surface boxes",

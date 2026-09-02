@@ -181,8 +181,8 @@ public final class RtTerrain {
     /** Render-frame deadline before an empty/failed native LOD region may be queried again. Render-thread only. */
     private final Long2LongOpenHashMap lodRetryAfterFrame = new Long2LongOpenHashMap();
     private static final long LOD_RETRY_COOLDOWN_FRAMES = 600L;
-    private static final long LOD_TRANSIENT_RETRY_NANOS = 1_000_000_000L;
-    private long lodSourceRetryAfterNanos;
+    /** Per-page retry for live-cache misses; never stalls unrelated LOD pages. */
+    private static final long LOD_TRANSIENT_RETRY_FRAMES = 60L;
     /** Monotonic render-owned epoch for native LOD work. Every release/config change invalidates old callbacks. */
     private long lodGeneration = 1L;
     private int lodActiveDetail = Integer.MIN_VALUE;
@@ -1518,9 +1518,6 @@ public final class RtTerrain {
         }
 
         publishLodPrepared(ctx, pbx, pby, pbz);
-        if (System.nanoTime() < lodSourceRetryAfterNanos) {
-            return;
-        }
 
         int detail = requestedDetail;
         int scale = 1 << detail;
@@ -1559,6 +1556,13 @@ public final class RtTerrain {
                         int lx = centreX + dx;
                         int lz = centreZ + dz;
                         int ly = startPageY + dy;
+                        int originX = lx * sectionBlocks;
+                        int originZ = lz * sectionBlocks;
+                        // The source rejects these too, but skipping here is essential: near pages must
+                        // not consume the nearest-first dispatch budget and starve the actual distant ring.
+                        if (RtDhLodSource.overlapsFullResolution(sectionBlocks, originX, originZ)) {
+                            continue;
+                        }
                         long key = lodKey(lx, ly, lz, detail);
                         if (lodResident.containsKey(key) || lodInFlight.contains(key)) {
                             continue;
@@ -1685,19 +1689,13 @@ public final class RtTerrain {
                 retrySoon = new ArrayList<>(lodRetrySoon);
                 lodRetrySoon.clear();
             }
-            int currentDeferred = 0;
+            long retryAfter = RtComposite.frameCounter() + LOD_TRANSIENT_RETRY_FRAMES;
             for (LodCompletion completion : retrySoon) {
                 if (completion.generation() != currentGeneration) {
                     continue;
                 }
                 lodInFlight.remove(completion.key());
-                currentDeferred++;
-            }
-            if (currentDeferred != 0) {
-                lodSourceRetryAfterNanos = System.nanoTime() + LOD_TRANSIENT_RETRY_NANOS;
-                CausticaMod.LOGGER.info(
-                        "CausticaLOD source not query-ready; retrying in 1 second ({} regions deferred)",
-                        currentDeferred);
+                lodRetryAfterFrame.put(completion.key(), retryAfter);
             }
         }
 
@@ -1727,6 +1725,7 @@ public final class RtTerrain {
         }
 
         boolean changed = false;
+        int currentRadius = CausticaConfig.Rt.Lod.RADIUS.value();
         for (LodPrepared completion : batch) {
             PreparedSection ps = completion.prepared();
             if (completion.generation() != currentGeneration
@@ -1738,6 +1737,17 @@ public final class RtTerrain {
 
             lodInFlight.remove(ps.key());
             lodRetryAfterFrame.remove(ps.key());
+            int sectionBlocks = RtDhLodRegion.SECTION_BLOCKS * completion.scale();
+            int centreX = Math.floorDiv(pbx, sectionBlocks);
+            int centreZ = Math.floorDiv(pbz, sectionBlocks);
+            int lx = Math.floorDiv(ps.sx(), sectionBlocks);
+            int lz = Math.floorDiv(ps.sz(), sectionBlocks);
+            boolean outside = Math.max(Math.abs(lx - centreX), Math.abs(lz - centreZ)) > currentRadius + 2;
+            boolean overlapsNear = RtDhLodSource.overlapsFullResolution(sectionBlocks, ps.sx(), ps.sz());
+            if (outside || overlapsNear) {
+                destroyPreparedSection(ps);
+                continue;
+            }
             if (lodResident.containsKey(ps.key())) {
                 destroyPreparedSection(ps);
                 continue;
@@ -1788,7 +1798,9 @@ public final class RtTerrain {
             SectionGeom g = entry.getValue();
             int lx = Math.floorDiv(g.sx, sectionBlocks);
             int lz = Math.floorDiv(g.sz, sectionBlocks);
-            if (Math.max(Math.abs(lx - centreX), Math.abs(lz - centreZ)) <= retainRadius) {
+            boolean insideRetainRing = Math.max(Math.abs(lx - centreX), Math.abs(lz - centreZ)) <= retainRadius;
+            boolean overlapsNear = RtDhLodSource.overlapsFullResolution(sectionBlocks, g.sx, g.sz);
+            if (insideRetainRing && !overlapsNear) {
                 continue;
             }
             iterator.remove();
@@ -1832,7 +1844,6 @@ public final class RtTerrain {
         }
         lodActiveDetail = Integer.MIN_VALUE;
         lodActiveHeightSections = Integer.MIN_VALUE;
-        lodSourceRetryAfterNanos = 0L;
 
         List<LodPrepared> completed;
         synchronized (lodPrepared) {

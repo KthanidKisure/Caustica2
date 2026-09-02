@@ -38,26 +38,32 @@ public final class RtDhLodSource {
         return RtCausticaLodPackedSource.available() || RtCausticaLodSource.available();
     }
 
+    /** True when this coarse page intersects the vanilla/full-resolution RT terrain window. */
+    static boolean overlapsFullResolution(int footprintBlocks, int originBlockX, int originBlockZ) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) {
+            return false;
+        }
+        int fullRadius = (Math.max(1, mc.options.getEffectiveRenderDistance()) + 2) * 16;
+        int px = mc.player.getBlockX();
+        int pz = mc.player.getBlockZ();
+        long minX = originBlockX;
+        long minZ = originBlockZ;
+        long maxX = minX + Math.max(1, footprintBlocks) - 1L;
+        long maxZ = minZ + Math.max(1, footprintBlocks) - 1L;
+        return maxX >= (long) px - fullRadius && minX <= (long) px + fullRadius
+                && maxZ >= (long) pz - fullRadius && minZ <= (long) pz + fullRadius;
+    }
+
     public static FetchResult fetchArea(int footprintBlocks, int originBlockX, int originBlockZ) {
         // The coarse cache is a replacement only for terrain that has left the full-resolution window.
         // Never let a virtual LOD section overlap current vanilla/RT chunks: apart from wasting BLAS
         // memory, duplicate surfaces cause z-fighting and make LOD warm-up look like a terrain failure.
         // A two-chunk pad gives the ordinary section streamer room for its neighbour-correct extraction.
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.player != null) {
-            int fullRadius = (Math.max(1, mc.options.getEffectiveRenderDistance()) + 2) * 16;
-            int px = mc.player.getBlockX();
-            int pz = mc.player.getBlockZ();
-            long minX = originBlockX;
-            long minZ = originBlockZ;
-            long maxX = minX + Math.max(1, footprintBlocks) - 1L;
-            long maxZ = minZ + Math.max(1, footprintBlocks) - 1L;
-            if (maxX >= (long) px - fullRadius && minX <= (long) px + fullRadius
-                    && maxZ >= (long) pz - fullRadius && minZ <= (long) pz + fullRadius) {
-                // Retry rather than mark empty: after the player moves this same persistent region may
-                // become distant and should become eligible immediately, not after the empty cooldown.
-                return new FetchResult(List.of(), false);
-            }
+        if (overlapsFullResolution(footprintBlocks, originBlockX, originBlockZ)) {
+            // Retry rather than mark empty: after the player moves this same persistent region may
+            // become distant and should become eligible immediately, not after the empty cooldown.
+            return new FetchResult(List.of(), false);
         }
 
         // A completed imported pack is authoritative for the far map and also checks live per-chunk
