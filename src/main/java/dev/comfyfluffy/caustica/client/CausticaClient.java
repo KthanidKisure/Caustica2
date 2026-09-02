@@ -69,8 +69,7 @@ public final class CausticaClient implements ClientModInitializer {
 					// until we're in a world with the block atlas loaded, or once already created.
 					RtComposite.INSTANCE.ensureResourcesReady(ctx);
 					RtTerrain.update(ctx);
-					// Log DLSS-FG availability once when frame generation is enabled (capability query only;
-					// the present-loop integration that consumes it is built separately).
+					// Resolve the driver capability before the present path decides whether FG is active.
 					if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
 						dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
 					}

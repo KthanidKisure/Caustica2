@@ -374,11 +374,11 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * DLSS Frame Generation (slice 2): after Minecraft blits the real frame into its acquired swapchain image
+	 * After Minecraft blits the real frame into its acquired swapchain image
 	 * (but before {@code present()} shows it), present the generated frame(s) into additional swapchain images
 	 * via {@link RtFramePresenter}, so the display order is generated-then-real. Runs only on the normal
 	 * present path — the HDR/PQ present hooks cancel {@code blitFromTexture} at HEAD, so this TAIL is
-	 * skipped there (HDR+FG deferred). Iteration 1 duplicates the final frame (no DLSSG eval yet).
+	 * skipped there; the HDR hook below supplies the equivalent path explicitly.
 	 */
 	@Inject(method = "blitFromTexture", at = @At("TAIL"))
 	private void caustica$presentGeneratedFrames(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {

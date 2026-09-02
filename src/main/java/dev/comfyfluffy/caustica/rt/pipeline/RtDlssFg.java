@@ -19,9 +19,8 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * DLSS Frame Generation (DLSSG) backend. Shares the NGX instance with DLSS-RR via {@link NgxRuntime};
- * owns only the DLSSG feature handle. This turn provides availability detection and the feature
- * create/destroy lifecycle — the per-frame {@code evaluate} + the multi-present loop that consumes it land
- * with the present-path refactor. Gated by {@code caustica.rt.fg} (default off) and hardware/driver support.
+ * owns only the DLSSG feature handle. The per-frame evaluation is consumed by the swapchain
+ * multi-present path. Gated by {@code caustica.rt.fg} (default off) and hardware/driver support.
  */
 public final class RtDlssFg {
     public static final RtDlssFg INSTANCE = new RtDlssFg();
@@ -58,8 +57,13 @@ public final class RtDlssFg {
 
     /** Requested generated-frame count clamped to the driver maximum (>=1 once available). */
     public int effectiveMultiFrameCount() {
-        int requested = CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value();
-        return multiFrameCountMax > 0 ? Math.clamp(requested, 1, multiFrameCountMax) : requested;
+        return clampMultiFrameCount(CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value(), multiFrameCountMax);
+    }
+
+    static int clampMultiFrameCount(int requested, int driverMaximum) {
+        // An older runtime may expose FG but not the MFG-capability parameter. Unknown means the baseline
+        // one generated frame, never an unbounded user-configured count.
+        return Math.clamp(requested, 1, Math.max(1, driverMaximum));
     }
 
     public boolean isReady() {
