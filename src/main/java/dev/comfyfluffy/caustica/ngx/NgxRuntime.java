@@ -125,6 +125,9 @@ public final class NgxRuntime {
     }
 
     private void init(VulkanDevice device) {
+        // Never carry bundled-file fingerprints across NGX lifetimes or into an explicit external native
+        // override. External runtimes are hashed from the files that will actually be loaded.
+        BUNDLED_FINGERPRINTS.clear();
         if (!PLATFORM_NATIVES.supported()) {
             throw new IllegalStateException("NGX natives are not bundled for " + PLATFORM_NATIVES.platformDir());
         }
@@ -186,7 +189,6 @@ public final class NgxRuntime {
                 .resolve("natives").resolve(PLATFORM_NATIVES.platformDir());
         try {
             Files.createDirectories(dir);
-            BUNDLED_FINGERPRINTS.clear();
             boolean hasShim = extractBundledNative(PLATFORM_NATIVES.shimName(), dir.resolve(PLATFORM_NATIVES.shimName()));
             extractBundledFeatureLibraries(dir);
             return hasShim && Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.shimName()))
