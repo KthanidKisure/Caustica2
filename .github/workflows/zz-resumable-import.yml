@@ -1,0 +1,29 @@
+name: Resumable WynnLOD download
+
+on:
+  push:
+    branches: [codex/postmerge-streamline-lod]
+    paths: [".github/workflows/zz-resumable-import.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/postmerge-streamline-lod
+          fetch-depth: 0
+      - name: Apply resumable importer patch
+        run: python3 .github/zz_patch_resumable_import.py
+      - name: Verify generated source
+        run: git diff --check
+      - name: Commit importer patch
+        run: |
+          git config user.name "Caustica CI patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/main/java/dev/comfyfluffy/caustica/rt/terrain/RtCausticaLodImporter.java
+          git commit -m "Resume interrupted WynnLOD downloads"
+          git push origin HEAD:codex/postmerge-streamline-lod
