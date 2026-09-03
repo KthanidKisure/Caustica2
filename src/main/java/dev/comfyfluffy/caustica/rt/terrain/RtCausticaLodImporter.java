@@ -92,6 +92,10 @@ final class RtCausticaLodImporter {
     private static final int VOXY_LUT_OFFSET = 16 + VOXY_MAPPING_BYTES;
     private static final int MAX_VOXY_RAW_BYTES = VOXY_LUT_OFFSET + VOXY_SECTION_VOLUME * 8;
     private static final long PROGRESS_STEP = 64L * 1024L * 1024L;
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "caustica-lod-import");
@@ -313,16 +317,12 @@ final class RtCausticaLodImporter {
       int baseChunkX = sx * 2;
       int baseChunkZ = sz * 2;
 
-      // Exactly four 16x16 chunks cover one 32x32 Voxy section footprint. Pre-seeding these
-      // builders makes ingestSection allocation-free no matter how many vertical slabs exist.
-      HashMap<Long, TileBuilder> tiles = new HashMap<>(8);
-      for (int dx = 0; dx < 2; dx++) {
-          for (int dz = 0; dz < 2; dz++) {
-              int cx = baseChunkX + dx;
-              int cz = baseChunkZ + dz;
-              tiles.put(packCoords(cx, cz), new TileBuilder());
-          }
-      }
+      // Exactly four 16x16 chunks cover one 32x32 Voxy section footprint. Keep them in fixed
+      // quadrant order instead of a boxed HashMap<Long,...>: ingestSection touches these builders for
+      // every X/Z column of every vertical slab, so direct indexing removes a very hot hash/boxing path.
+      TileBuilder[] tiles = {
+              new TileBuilder(), new TileBuilder(), new TileBuilder(), new TileBuilder()
+      };
 
       for (int sy = maxSectionY[0]; sy >= minSectionY[0]; sy--) {
           long sectionKey = voxySectionKey(sx, sy, sz);
@@ -347,15 +347,16 @@ final class RtCausticaLodImporter {
           }
       }
 
-      for (Map.Entry<Long, TileBuilder> entry : tiles.entrySet()) {
-          RtCausticaLodRegionStore.TileData tile = entry.getValue().finish();
-          if (tile == null) {
-              continue;
+      for (int dx = 0; dx < 2; dx++) {
+          for (int dz = 0; dz < 2; dz++) {
+              int tileIndex = (dx << 1) | dz;
+              RtCausticaLodRegionStore.TileData tile = tiles[tileIndex].finish();
+              if (tile == null) {
+                  continue;
+              }
+              spool.append(baseChunkX + dx, baseChunkZ + dz, tile);
+              usableTiles++;
           }
-          int chunkX = (int) (entry.getKey() >> 32);
-          int chunkZ = (int) (long) entry.getKey();
-          spool.append(chunkX, chunkZ, tile);
-          usableTiles++;
       }
 
       int done = columnIndex + 1;
@@ -380,11 +381,11 @@ final class RtCausticaLodImporter {
         }
     }
 
-    private static boolean allGroundResolved(HashMap<Long, TileBuilder> tiles) {
-        for (TileBuilder tile : tiles.values()) {
-  if (!tile.complete()) {
-      return false;
-  }
+    private static boolean allGroundResolved(TileBuilder[] tiles) {
+        for (TileBuilder tile : tiles) {
+            if (!tile.complete()) {
+                return false;
+            }
         }
         return true;
     }
@@ -443,7 +444,7 @@ final class RtCausticaLodImporter {
     }
 
     private static void ingestSection(long key, byte[] raw, BlockState[] states,
-                                      HashMap<Long, TileBuilder> tiles) throws IOException {
+                                      TileBuilder[] tiles) throws IOException {
         if (raw.length < VOXY_LUT_OFFSET) {
             throw new IOException("Voxy section is only " + raw.length + " bytes");
         }
@@ -459,22 +460,16 @@ final class RtCausticaLodImporter {
             throw new IOException("Invalid Voxy LUT size " + lutCount);
         }
 
-        int sectionX = voxyX(key);
         int sectionY = voxyY(key);
-        int sectionZ = voxyZ(key);
-        int baseX = sectionX * VOXY_SECTION_EDGE;
         int baseY = sectionY * VOXY_SECTION_EDGE;
-        int baseZ = sectionZ * VOXY_SECTION_EDGE;
 
         for (int lx = 0; lx < VOXY_SECTION_EDGE; lx++) {
-            int worldX = baseX + lx;
-            int chunkX = Math.floorDiv(worldX, RtCausticaLodRegionStore.TILE_EDGE);
-            int tileX = Math.floorMod(worldX, RtCausticaLodRegionStore.TILE_EDGE);
+            int tileX = lx & (RtCausticaLodRegionStore.TILE_EDGE - 1);
+            int tileDx = lx >>> 4;
             for (int lz = 0; lz < VOXY_SECTION_EDGE; lz++) {
-                int worldZ = baseZ + lz;
-                int chunkZ = Math.floorDiv(worldZ, RtCausticaLodRegionStore.TILE_EDGE);
-                int tileZ = Math.floorMod(worldZ, RtCausticaLodRegionStore.TILE_EDGE);
-                TileBuilder tile = tiles.computeIfAbsent(packCoords(chunkX, chunkZ), ignored -> new TileBuilder());
+                int tileZ = lz & (RtCausticaLodRegionStore.TILE_EDGE - 1);
+                int tileDz = lz >>> 4;
+                TileBuilder tile = tiles[(tileDx << 1) | tileDz];
                 int column = tileX * RtCausticaLodRegionStore.TILE_EDGE + tileZ;
 
                 BlockState highest = null;
@@ -610,27 +605,44 @@ final class RtCausticaLodImporter {
             return;
         }
         Files.createDirectories(target.getParent());
-        Files.deleteIfExists(target);
         Path part = target.resolveSibling(target.getFileName() + ".part");
-        Files.deleteIfExists(part);
+        long existing = Files.isRegularFile(part) ? Files.size(part) : 0L;
 
-        HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofHours(2))
-                .header("User-Agent", "CausticaLOD/0.1")
-                .GET().build();
-        HttpResponse<InputStream> response = http().send(request, HttpResponse.BodyHandlers.ofInputStream());
-        if (response.statusCode() / 100 != 2) {
+        HttpResponse<InputStream> response = sendDownload(uri, existing);
+        boolean append = existing > 0L && response.statusCode() == 206
+                && contentRangeStartsAt(response, existing);
+        if (existing > 0L && !append) {
+            // The origin/CDN ignored or rejected our Range request. Never append a full response to a
+            // partial file: close it, discard only the partial staging file, and retry from byte zero.
             response.body().close();
-            throw new IOException("HTTP " + response.statusCode() + " downloading " + uri);
+            Files.deleteIfExists(part);
+            existing = 0L;
+            response = sendDownload(uri, 0L);
         }
-        long expectedBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
-        CausticaMod.LOGGER.info("CausticaLOD downloading {}{}", uri,
-                expectedBytes > 0 ? " (" + expectedBytes / (1024 * 1024) + " MiB)" : "");
+        if (response.statusCode() / 100 != 2) {
+            int status = response.statusCode();
+            response.body().close();
+            throw new IOException("HTTP " + status + " downloading " + uri);
+        }
+
+        long remainingBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
+        long expectedTotal = remainingBytes >= 0L ? existing + remainingBytes : -1L;
+        if (existing > 0L) {
+            CausticaMod.LOGGER.info("CausticaLOD resuming {} at {} MiB{}", uri, existing / (1024 * 1024),
+                    expectedTotal > 0L ? " / " + expectedTotal / (1024 * 1024) + " MiB" : "");
+        } else {
+            CausticaMod.LOGGER.info("CausticaLOD downloading {}{}", uri,
+                    expectedTotal > 0L ? " (" + expectedTotal / (1024 * 1024) + " MiB)" : "");
+        }
+
+        StandardOpenOption[] outputOptions = existing > 0L
+                ? new StandardOpenOption[]{StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND}
+                : new StandardOpenOption[]{StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING};
+        long total = existing;
         try (InputStream in = new BufferedInputStream(response.body(), 1 << 20);
-             var out = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20)) {
+             var out = new BufferedOutputStream(Files.newOutputStream(part, outputOptions), 1 << 20)) {
             byte[] buffer = new byte[1 << 20];
-            long total = 0L;
-            long nextProgress = PROGRESS_STEP;
+            long nextProgress = ((total / PROGRESS_STEP) + 1L) * PROGRESS_STEP;
             int read;
             while ((read = in.read(buffer)) >= 0) {
                 if (read == 0) {
@@ -640,12 +652,19 @@ final class RtCausticaLodImporter {
                 total += read;
                 if (total >= nextProgress) {
                     CausticaMod.LOGGER.info("CausticaLOD download progress: {} MiB", total / (1024 * 1024));
-                    nextProgress += PROGRESS_STEP;
+                    nextProgress = ((total / PROGRESS_STEP) + 1L) * PROGRESS_STEP;
                 }
             }
         }
+        if (expectedTotal >= 0L && total != expectedTotal) {
+            // Keep the partial staging file: the next retry can resume exactly where this response ended.
+            throw new IOException("Truncated download for " + uri + ": expected " + expectedTotal
+                    + " bytes, have " + total);
+        }
+
         String actual = digest(part, algorithm);
         if (!actual.equalsIgnoreCase(expectedHex)) {
+            // A complete-but-invalid payload is not resumable. Throw it away so the next retry starts clean.
             Files.deleteIfExists(part);
             throw new IOException("Digest mismatch for " + uri + ": expected " + expectedHex + ", got " + actual);
         }
@@ -656,23 +675,34 @@ final class RtCausticaLodImporter {
         }
     }
 
+    private static HttpResponse<InputStream> sendDownload(URI uri, long offset) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofHours(2))
+                .header("User-Agent", "CausticaLOD/0.1")
+                .GET();
+        if (offset > 0L) {
+            request.header("Range", "bytes=" + offset + "-");
+        }
+        return HTTP.send(request.build(), HttpResponse.BodyHandlers.ofInputStream());
+    }
+
+    private static boolean contentRangeStartsAt(HttpResponse<?> response, long offset) {
+        String expected = "bytes " + offset + "-";
+        return response.headers().firstValue("Content-Range")
+                .map(value -> value.toLowerCase(Locale.ROOT).startsWith(expected))
+                .orElse(false);
+    }
+
     private static String downloadText(URI uri) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofMinutes(2))
                 .header("User-Agent", "CausticaLOD/0.1")
                 .GET().build();
-        HttpResponse<String> response = http().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.US_ASCII));
+        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.US_ASCII));
         if (response.statusCode() / 100 != 2) {
             throw new IOException("HTTP " + response.statusCode() + " downloading " + uri);
         }
         return response.body();
-    }
-
-    private static HttpClient http() {
-        return HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
     }
 
     private static String digest(Path path, String algorithm) throws Exception {
@@ -883,7 +913,7 @@ final class RtCausticaLodImporter {
     private static final class RegionSpool implements AutoCloseable {
         private static final int MAX_OPEN_STREAMS = 32;
         private final Path root;
-        private final Set<Long> regionKeys = new HashSet<>();
+        private final LongOpenHashSet regionKeys = new LongOpenHashSet();
         private final LinkedHashMap<Long, DataOutputStream> streams = new LinkedHashMap<>(32, 0.75f, true);
 
         RegionSpool(Path root) {
@@ -902,13 +932,13 @@ final class RtCausticaLodImporter {
 
         int publish(Path sessionRoot) throws IOException {
   closeStreams();
-  ArrayList<Long> keys = new ArrayList<>(regionKeys);
-  keys.sort(Comparator.comparingLong(Long::longValue));
+  long[] keys = regionKeys.toLongArray();
+  java.util.Arrays.sort(keys);
   int count = 0;
   for (long regionKey : keys) {
       int rx = (int) (regionKey >> 32);
       int rz = (int) regionKey;
-      HashMap<Integer, RtCausticaLodRegionStore.TileData> tiles = new HashMap<>(1024);
+      RtCausticaLodRegionStore.TileData[] tiles = new RtCausticaLodRegionStore.TileData[1024];
       Path path = spoolPath(rx, rz);
       try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path), 1 << 16))) {
           while (true) {
@@ -918,20 +948,20 @@ final class RtCausticaLodImporter {
               } catch (EOFException done) {
                   break;
               }
-              if (slot < 0 || slot >= 1024) {
+              if (slot < 0 || slot >= tiles.length) {
                   throw new IOException("Invalid CausticaLOD spool slot " + slot + " in " + path);
               }
-              RtCausticaLodRegionStore.TileData previous = tiles.put(slot, readTile(in));
-              if (previous != null) {
+              if (tiles[slot] != null) {
                   throw new IOException("Duplicate CausticaLOD spool slot " + slot + " in " + path);
               }
+              tiles[slot] = readTile(in);
           }
       }
       RtCausticaLodRegionStore.writeRegion(sessionRoot, rx, rz, tiles);
       Files.deleteIfExists(path);
       count++;
-      if ((count & 31) == 0 || count == keys.size()) {
-          CausticaMod.LOGGER.info("CausticaLOD WynnLOD pack publish: {}/{} regions", count, keys.size());
+      if ((count & 31) == 0 || count == keys.length) {
+          CausticaMod.LOGGER.info("CausticaLOD WynnLOD pack publish: {}/{} regions", count, keys.length);
       }
   }
   return count;
