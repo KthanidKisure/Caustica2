@@ -1533,8 +1533,10 @@ public final class RtComposite {
                 RtLookPackage.Bloom bloom = LOOK.bloom();
                 // The tent radius is in source texels, so it needs no resolution scaling: the pyramid's
                 // reach is set by its level count, and each level's texel already scales with the frame.
-                bloomPipeline.dispatch(cmd, bloomLevels,
-                        bloom.thresholdSceneLinear(), bloom.softKneeFraction(), bloom.radius());
+                if (bloom.strength() > 0.0f) {
+                    bloomPipeline.dispatch(cmd, bloomLevels,
+                            bloom.thresholdSceneLinear(), bloom.softKneeFraction(), bloom.radius());
+                }
             }
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "map RT to display");

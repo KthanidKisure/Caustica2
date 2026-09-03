@@ -147,8 +147,8 @@ public bool fogAppliesTo(Medium m) {
 //   tau   = sigma * integral of n(ro.y + rd.y*s) ds
 //         = sigma * a * (1 - exp(-b*t)) / b,   a = n(ro.y), b = rd.y * falloff
 //
-// The b -> 0 limit (a level ray, which is the common case when looking at the horizon) is the removable
-// singularity sigma*a*t, taken by an explicit branch rather than by an epsilon in the denominator.
+// The b*t -> 0 limit is evaluated as a short series. Branching on the dimensionless exponent catches
+// both near-horizontal rays and short segments, where subtracting exp(-b*t) from one loses precision.
 public float fogOpticalDepth(FogParams f, float3 ro, float3 rd, float t) {
     float travel = clamp(t, 0.0, FOG_MAX_DISTANCE);
     if (travel <= 0.0) {
@@ -156,11 +156,12 @@ public float fogOpticalDepth(FogParams f, float3 ro, float3 rd, float t) {
     }
     float density = exp(-clamp((ro.y - f.referenceY) * f.falloff, -FOG_EXP_CLAMP, FOG_EXP_CLAMP));
     float b = rd.y * f.falloff;
+    float x = b * travel;
     float integral;
-    if (abs(b) < 1.0e-5) {
-        integral = density * travel;
+    if (abs(x) < 1.0e-3) {
+        integral = density * travel * (1.0 - 0.5 * x + x * x * (1.0 / 6.0));
     } else {
-        integral = density * (1.0 - exp(-clamp(b * travel, -FOG_EXP_CLAMP, FOG_EXP_CLAMP))) / b;
+        integral = density * (1.0 - exp(-clamp(x, -FOG_EXP_CLAMP, FOG_EXP_CLAMP))) / b;
     }
     return f.sigma * max(integral, 0.0);
 }
