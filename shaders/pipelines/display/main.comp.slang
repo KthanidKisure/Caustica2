@@ -117,6 +117,17 @@ float3 sampleBloom(int2 outputPixel, uint outputWidth, uint outputHeight) {
     return bloomImage.SampleLevel(uv, 0.0).rgb;
 }
 
+float lensTransmission(int2 outputPixel, uint outputWidth, uint outputHeight) {
+    float strength = clamp(pc.lensVignette, 0.0, 0.5);
+    if (strength <= 0.0) {
+        return 1.0;
+    }
+    float2 ndc = ((float2(outputPixel) + 0.5) / float2(outputWidth, outputHeight)) * 2.0 - 1.0;
+    float radius2 = saturate(dot(ndc, ndc) * 0.5);
+    float edge = smoothstep(0.18, 1.0, radius2);
+    return 1.0 - strength * edge * edge;
+}
+
 // Artistic gamma after the view/display transform. Apply the curve to display luminance and scale
 // RGB uniformly instead of exponentiating each channel: this lifts shadows/midtones without pulling
 // chromaticities toward white. The uniform scale is limited at the display boundary so saturated
@@ -214,6 +225,7 @@ float3 tonemapHdr(float3 lookedAcesCg) {
 float3 gradedAcesCg(int2 pix, float exposure, uint w, uint h) {
     float3 exposedAcesCg = max(rtImage[pix].rgb * exposure, float3(0.0));
     exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
+    exposedAcesCg *= lensTransmission(pix, w, h);
     return applyGrade(applyPunchyHdrLook(applyLook(exposedAcesCg)));
 }
 

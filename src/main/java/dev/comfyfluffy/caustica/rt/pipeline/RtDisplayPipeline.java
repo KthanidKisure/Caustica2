@@ -206,7 +206,7 @@ public final class RtDisplayPipeline {
                          float gamma, float hdrPeakNits, boolean lookEnabled, boolean punchyHdrLook, int lookLutSize,
                          float bloomStrength, boolean gradeEnabled, float saturation, float contrast,
                          float gain, float highlightSaturation, float highlightGain,
-                         float highlightsMin, float sharpness) {
+                         float highlightsMin, float sharpness, float lensVignette) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display compute")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
@@ -214,7 +214,7 @@ public final class RtDisplayPipeline {
             new DisplayPushData(hdrEnabled ? 1 : 0, (float) lutSize, gamma, hdrPeakNits,
                     lookEnabled ? 1 : 0, punchyHdrLook ? 1 : 0, (float) lookLutSize, bloomStrength,
                     gradeEnabled ? 1 : 0, saturation, contrast, gain,
-                    highlightSaturation, highlightGain, highlightsMin, sharpness).write(push);
+                    highlightSaturation, highlightGain, highlightsMin, sharpness, lensVignette).write(push);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

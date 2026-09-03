@@ -91,6 +91,8 @@ public struct DisplayPush {
     public float highlightsMin;          // luma where the highlight region starts blending in
     // ---- RCAS. 0 disables it and its four extra taps.
     public float sharpness;
+    // Analytic lens-edge exposure falloff. 0 disables it and costs only the comparison.
+    public float lensVignette;
 };
 
 public struct BloomPush {

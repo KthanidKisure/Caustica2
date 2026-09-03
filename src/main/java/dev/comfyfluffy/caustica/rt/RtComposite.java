@@ -29,8 +29,8 @@ import net.minecraft.data.AtlasIds;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
-import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.world.level.MoonPhase;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.material.FluidState;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
@@ -74,6 +74,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtToneLut;
 import dev.comfyfluffy.caustica.rt.terrain.RtCloudNoise;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
+import dev.comfyfluffy.caustica.rt.terrain.RtWynncraftWeather;
 
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
@@ -1197,9 +1198,8 @@ public final class RtComposite {
             // a cloud deck are whole-sky properties, so sampling them per-pixel would buy nothing but a
             // seam where two biomes meet.
             //
-            // Vanilla interpolates rain and thunder over ~½ second, and getRainLevel already returns the
-            // smoothed value, so weather ramps in and out without any easing of ours. Thunder is layered
-            // on top of rain rather than replacing it — vanilla raises both during a storm.
+            // Vanilla weather is used outside Wynncraft. Wynncraft does not send a useful weather state,
+            // so the native regional controller supplies a smoothly changing atmosphere there.
             float rainLevel = 0f;
             float thunderLevel = 0f;
             // Biome climate stands in for the per-biome sky colours that 26.2 no longer carries:
@@ -1211,9 +1211,19 @@ public final class RtComposite {
             float wetness = 0f;
             float biomeTemperature = 0.8f;
             boolean biomeHasPrecipitation = true;
+            boolean biomeSnow = false;
+            boolean biomeRain = true;
+            boolean biomeDry = false;
+            RtWynncraftWeather.Sample wynnWeather = RtWynncraftWeather.sample(
+                    Minecraft.getInstance(), level, cameraBlockPos);
             if (level != null) {
-                rainLevel = Mth.clamp(level.getRainLevel(1.0f), 0f, 1f);
-                thunderLevel = Mth.clamp(level.getThunderLevel(1.0f), 0f, 1f);
+                if (wynnWeather.active()) {
+                    rainLevel = wynnWeather.rainLevel();
+                    thunderLevel = wynnWeather.thunderLevel();
+                } else {
+                    rainLevel = Mth.clamp(level.getRainLevel(1.0f), 0f, 1f);
+                    thunderLevel = Mth.clamp(level.getThunderLevel(1.0f), 0f, 1f);
+                }
                 // A negative override means "use the world". Applied after reading rather than instead
                 // of it, so turning the override off returns to live weather without a reload.
                 float rainOverride = CausticaConfig.Rt.Weather.RAIN_OVERRIDE.value();
@@ -1225,35 +1235,35 @@ public final class RtComposite {
                     thunderLevel = thunderOverride;
                 }
                 var biome = level.getBiome(cameraBlockPos).value();
-                // getBaseTemperature is roughly 0 (snowy) to 2 (desert/nether) in vanilla data.
                 biomeTemperature = Mth.clamp(biome.getBaseTemperature(), 0f, 2f);
-                biomeHasPrecipitation = biome.hasPrecipitation();
+                Biome.Precipitation precipitation = biome.getPrecipitationAt(cameraBlockPos, level.getSeaLevel());
+                biomeSnow = precipitation == Biome.Precipitation.SNOW;
+                biomeRain = precipitation == Biome.Precipitation.RAIN;
+                biomeDry = precipitation == Biome.Precipitation.NONE;
+                biomeHasPrecipitation = !biomeDry;
                 float climate = (1f - biomeTemperature * 0.5f) * (biomeHasPrecipitation ? 1f : 0.35f);
                 float biomeResponse = CausticaConfig.Rt.Fog.BIOME_RESPONSE.value();
                 biomeHaze = Mth.lerp(biomeResponse, 1f, 0.4f + climate * 1.2f);
-                // Wetness needs actual liquid water falling. A biome with no precipitation (desert) gets
-                // nothing, and one cold enough for snow gets nothing either — snow accumulates, it does
-                // not soak in, and a glossy snowfield would be plainly wrong. The 0.15 cutoff is where
-                // vanilla's own precipitation type flips.
-                boolean rainsHere = biomeHasPrecipitation && biomeTemperature > 0.15f;
+                boolean rainsHere = wynnWeather.active()
+                        ? wynnWeather.weatherType() == RtWynncraftWeather.WEATHER_RAIN
+                        : biomeRain;
                 wetness = rainsHere ? rainLevel * CausticaConfig.Rt.Clouds.WETNESS.value() : 0f;
             }
             float weatherIntensity = Math.min(rainLevel + thunderLevel * 0.5f, 1f);
-            // 0 = rain/ordinary atmosphere, 1 = snowstorm, 2 = dry hot-biome dust/sandstorm. The
-            // classification is camera-biome based so crossing into a snowy or desert biome changes
-            // precipitation without a per-pixel biome lookup in the path tracer.
-            int weatherType = 0;
-            if (weatherIntensity > 0.01f) {
-                if (biomeHasPrecipitation && biomeTemperature <= 0.15f) {
-                    weatherType = 1;
-                } else if (!biomeHasPrecipitation && biomeTemperature >= 1.2f) {
-                    weatherType = 2;
-                }
-            }
+            // 0 rain/ordinary, 1 snow, 2 sand/dust, 3 smog. Native Wynncraft regions are explicit;
+            // ordinary worlds retain the biome's own precipitation decision.
+            int weatherType = wynnWeather.active() ? wynnWeather.weatherType()
+                    : biomeSnow ? RtWynncraftWeather.WEATHER_SNOW
+                    : biomeDry && biomeTemperature >= 1.2f ? RtWynncraftWeather.WEATHER_SAND
+                    : RtWynncraftWeather.WEATHER_RAIN;
             float fogWeather = 1f + rainLevel * CausticaConfig.Rt.Fog.WEATHER_RESPONSE.value();
             float fogScaleHeight = Math.max(CausticaConfig.Rt.Fog.SCALE_HEIGHT.value(), 1.0e-2f);
-            float precipitationFog = weatherType == 1 ? weatherIntensity * 0.010f
-                    : weatherType == 2 ? weatherIntensity * 0.020f : 0f;
+            float precipitationFog = weatherType == RtWynncraftWeather.WEATHER_SNOW
+                    ? weatherIntensity * 0.010f
+                    : weatherType == RtWynncraftWeather.WEATHER_SAND
+                    ? weatherIntensity * 0.020f
+                    : weatherType == RtWynncraftWeather.WEATHER_SMOG
+                    ? weatherIntensity * 0.014f : 0f;
             Float4 fog = new Float4(
                     CausticaConfig.Rt.Fog.DENSITY.value() * fogWeather * biomeHaze + precipitationFog,
                     1.0f / fogScaleHeight,
@@ -1274,8 +1284,10 @@ public final class RtComposite {
             float cloudWeather = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value() * weatherIntensity;
             // Dry-biome storms are carried mainly by the dust volume; retaining a little cloud response
             // keeps the sky coherent without turning a desert storm into a tropical overcast.
-            if (weatherType == 2) {
+            if (weatherType == RtWynncraftWeather.WEATHER_SAND) {
                 cloudWeather *= 0.30f;
+            } else if (weatherType == RtWynncraftWeather.WEATHER_SMOG) {
+                cloudWeather *= 0.55f;
             }
             // Cloud colour and height come from the same attribute system. CLOUD_HEIGHT is a world Y,
             // so it is rebased alongside everything else below.
@@ -1299,12 +1311,17 @@ public final class RtComposite {
                     && !Float.isNaN(vanillaCloudHeight)
                     ? vanillaCloudHeight
                     : CausticaConfig.Rt.Clouds.ALTITUDE.value();
-            float cloudCoverage = CausticaConfig.Rt.Clouds.COVERAGE.value();
+            // The perceptual response keeps the slider endpoints while opening substantially more sky
+            // at ordinary mid-range settings before weather expands the deck.
+            float cloudCoverage = (float) Math.pow(CausticaConfig.Rt.Clouds.COVERAGE.value(), 1.35);
             cloudCoverage += (1f - cloudCoverage) * cloudWeather * 0.85f;
-            float secondaryCoverage = Math.clamp(cloudCoverage * 0.36f
-                    + (weatherType == 1 ? weatherIntensity * 0.18f : 0f), 0f, 0.68f);
-            if (weatherType == 2) {
+            float secondaryCoverage = Math.clamp(cloudCoverage * 0.24f
+                    + (weatherType == RtWynncraftWeather.WEATHER_SNOW
+                    ? weatherIntensity * 0.10f : 0f), 0f, 0.45f);
+            if (weatherType == RtWynncraftWeather.WEATHER_SAND) {
                 secondaryCoverage *= 0.20f;
+            } else if (weatherType == RtWynncraftWeather.WEATHER_SMOG) {
+                secondaryCoverage *= 0.50f;
             }
             Float4 cloud3 = new Float4(CausticaConfig.Rt.Clouds.QUALITY.value(),
                     weatherType, weatherIntensity, secondaryCoverage);
@@ -1552,7 +1569,8 @@ public final class RtComposite {
                         CausticaConfig.Rt.Grade.HIGHLIGHT_SATURATION.value(),
                         CausticaConfig.Rt.Grade.HIGHLIGHT_GAIN.value(),
                         CausticaConfig.Rt.Grade.HIGHLIGHTS_MIN.value(),
-                        CausticaConfig.Rt.Grade.SHARPNESS.value());
+                        CausticaConfig.Rt.Grade.SHARPNESS.value(),
+                        CausticaConfig.Rt.Grade.LENS_VIGNETTE.value());
             }
             hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite

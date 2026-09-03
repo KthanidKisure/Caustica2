@@ -60,7 +60,7 @@ public struct CloudParams {
     public float featureSize;  // blocks per noise period; smaller means more, tighter cloud masses
     public float ambient;      // fraction of zenith sky scattered in as multiple-scattering stand-in
     public float quality;      // scales the march step counts; 1 is reference, 0.5 is half the samples
-    public int weatherType;   // 0 ordinary/rain, 1 snow, 2 sand/dust
+    public int weatherType;   // 0 ordinary/rain, 1 snow, 2 sand/dust, 3 smog
     public float weatherIntensity;
     public float secondaryCoverage; // higher altocumulus deck
 };
@@ -89,14 +89,15 @@ public bool cloudsActive(CloudParams c) {
 CloudParams secondaryCloudParams(CloudParams base) {
     CloudParams high = base;
     high.coverage = base.secondaryCoverage;
-    high.density = base.density * (base.weatherType == 1 ? 0.58 : 0.42);
+    high.density = base.density * (base.weatherType == 1 ? 0.58
+            : base.weatherType == 3 ? 0.35 : 0.42);
     high.bottomY = base.bottomY + base.thickness * 1.35;
     high.thickness = max(base.thickness * 0.34, 20.0);
     high.wind = base.wind * 1.55 + float2(19.0, -11.0);
     high.detail = clamp(max(base.detail, 0.62), 0.0, 1.0);
     high.featureSize = max(base.featureSize * 0.46, 32.0);
     high.ambient = base.ambient * 1.15;
-    high.quality = max(base.quality * 0.48, 0.22);
+    high.quality = max(base.quality * 0.34, 0.20);
     high.secondaryCoverage = 0.0;
     if (base.weatherType == 2) {
         high.coverage *= 0.20;
@@ -112,11 +113,15 @@ CloudParams secondaryCloudParams(CloudParams base) {
 
 // Vertical profile: a soft rounded base and a wider billowing top, both zero at the deck boundaries so the
 // march never terminates against a hard slab face.
-float cloudHeightProfile(float relativeHeight) {
+float cloudHeightProfile(CloudParams c, float relativeHeight) {
     float h = clamp(relativeHeight, 0.0, 1.0);
     float base = smoothstep(0.0, 0.22, h);
     float top = 1.0 - smoothstep(0.55, 1.0, h);
-    return base * top;
+    float cumulus = base * top;
+    float layered = smoothstep(0.0, 0.08, h) * (1.0 - smoothstep(0.76, 1.0, h));
+    float layerBias = c.weatherType == 2 ? 0.12
+            : c.weatherType == 3 ? 0.72 : c.weatherType == 1 ? 0.38 : 0.52;
+    return lerp(cumulus, layered, c.weatherIntensity * layerBias);
 }
 
 public float cloudDensity(CloudParams c, float3 position) {
@@ -124,7 +129,7 @@ public float cloudDensity(CloudParams c, float3 position) {
     if (relativeHeight <= 0.0 || relativeHeight >= 1.0) {
         return 0.0;
     }
-    float profile = cloudHeightProfile(relativeHeight);
+    float profile = cloudHeightProfile(c, relativeHeight);
     if (profile <= 0.0) {
         return 0.0;
     }
@@ -137,14 +142,21 @@ public float cloudDensity(CloudParams c, float3 position) {
     // 1.5 blocks/second moved the field 0.2% of a feature width per second — visually frozen. "Almost
     // no clouds" and "clouds do not move" were one mistake, not two.
     float baseFrequency = 1.0 / max(c.featureSize, 1.0);
-    float3 domain = float3(position.x + c.wind.x, position.y, position.z + c.wind.y);
+    // Height-dependent shear leans cloud towers and stops successive horizontal slices from reading as
+    // copies. It changes only arithmetic around the existing samples, so variety adds no texture fetch.
+    float shear = (relativeHeight - 0.5) * c.featureSize
+            * lerp(0.14, 0.06, c.weatherIntensity);
+    float3 domain = float3(position.x + c.wind.x + shear, position.y,
+                          position.z + c.wind.y - shear * 0.55);
     float3 baseCoord = float3(domain.x * baseFrequency,
                               domain.y * baseFrequency * 2.9,
                               domain.z * baseFrequency);
     // One filtered fetch instead of four octaves of hashed value noise. The texture tiles, so the
     // repeat address mode does the domain wrapping for free and the coordinate needs no fract().
     float4 noise = cloudNoiseTex.SampleLevel(baseCoord, 0.0);
-    float shape = noise.x;
+    // The already-fetched detail channel creates broad internal gaps before the dedicated erosion fetch.
+    // Clear-weather cumulus gets more breakup; storm layers retain larger connected fronts.
+    float shape = noise.x - (1.0 - noise.y) * lerp(0.11, 0.035, c.weatherIntensity);
 
     // Coverage as a threshold remap, not a multiply. Multiplying would raise a flat haze everywhere as
     // coverage rises; subtracting a threshold and renormalizing grows the clouds that exist outward from
@@ -198,14 +210,18 @@ float cloudDensityCoarse(CloudParams c, float3 position) {
     if (relativeHeight <= 0.0 || relativeHeight >= 1.0) {
         return 0.0;
     }
-    float3 domain = float3(position.x + c.wind.x, position.y, position.z + c.wind.y);
+    float shear = (relativeHeight - 0.5) * c.featureSize
+            * lerp(0.14, 0.06, c.weatherIntensity);
+    float3 domain = float3(position.x + c.wind.x + shear, position.y,
+                          position.z + c.wind.y - shear * 0.55);
     float baseFrequency = 1.0 / max(c.featureSize, 1.0);
-    float shape = cloudNoiseTex.SampleLevel(float3(domain.x * baseFrequency,
-                                                  domain.y * baseFrequency * 2.9,
-                                                  domain.z * baseFrequency), 0.0).x;
+    float4 noise = cloudNoiseTex.SampleLevel(float3(domain.x * baseFrequency,
+                                                    domain.y * baseFrequency * 2.9,
+                                                    domain.z * baseFrequency), 0.0);
+    float shape = noise.x - (1.0 - noise.y) * lerp(0.11, 0.035, c.weatherIntensity);
     float threshold = 1.0 - c.coverage;
     return saturate((shape - threshold) / max(1.0 - threshold, 1.0e-3))
-            * cloudHeightProfile(relativeHeight) * c.density;
+            * cloudHeightProfile(c, relativeHeight) * c.density;
 }
 
 // Fraction of celestial light reaching `position` through the deck. `strength` scales the optical depth;
