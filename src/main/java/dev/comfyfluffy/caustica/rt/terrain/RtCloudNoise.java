@@ -19,8 +19,8 @@ import org.lwjgl.system.MemoryUtil;
  * the lattice has to wrap modulo the texture size at every octave. {@link #hash} therefore takes
  * already-wrapped integer coordinates, and each octave wraps at its own frequency.
  *
- * <p>The consequence is that the sky repeats every {@code feature-size} blocks. At the default 140
- * that is a 140-block period, which is invisible from the ground because the deck is only ~90 blocks
+ * <p>The consequence is that the sky repeats every {@code feature-size} blocks. At the default 160
+ * that is a 160-block period, which is invisible from the ground because the deck is only ~90 blocks
  * thick and the horizon cuts it off long before a repeat becomes legible. It would be visible from
  * far above the deck looking down, which is not a view Minecraft offers.
  *

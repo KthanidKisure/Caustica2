@@ -59,7 +59,7 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Fog.DENSITY, Rt.Clouds.COVERAGE, Rt.Grade.ENABLED, Rt.Tonemap.VIEW_TRANSFORM, Rt.Pom.DEPTH, Rt.Restir.TEMPORAL,
-            Rt.Weather.RAIN_OVERRIDE, Rt.Lod.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
+            Rt.Weather.WYNNCRAFT_DYNAMIC, Rt.Weather.RAIN_OVERRIDE, Rt.Lod.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -100,6 +100,11 @@ public final class CausticaConfig {
                 " Volumetric cloud deck. coverage 0 disables it entirely (and costs nothing).\n"
                         + " altitude is the deck base in world Y; thickness is its depth in blocks.\n"
                         + " Clouds are lit from the sun/moon through the same atmosphere as the sky, so they have no colour setting.");
+        FILE.setComment("weather",
+                " Wynncraft can use Caustica's native regional weather because the server sends no ordinary rain state.\n"
+                        + " Manual rain/thunder overrides affect only rendering; -1 uses the native or world value.");
+        FILE.setComment("grade",
+                " Scene-referred grading plus display finishing. lens-vignette is a subtle sample-free edge falloff.");
         FILE.setComment("lights",
                 " Controls direct lighting from glowing blocks such as torches, glowstone, and lava.\n"
                         + " Set ris-candidates to 0 to disable it. stats, dump, and dump-radius are debugging options.");
@@ -735,14 +740,14 @@ public final class CausticaConfig {
         }
 
         /**
-         * Volumetric cloud system. A moderate natural-sky coverage is enabled by default: {@code coverage} 0 skips the march entirely, so a
-         * default build pays nothing. The deck is marched only on rays that may see the sun and moon
+         * Volumetric cloud system. Scattered natural-sky coverage is enabled by default; {@code coverage}
+         * 0 skips the march entirely. The deck is marched only on rays that may see the sun and moon
          * discs (primary and specular), so it does not contribute to bounce lighting.
          */
         public static final class Clouds {
             /** 0 clear, 1 overcast. Raising it grows existing clouds outward rather than fading in haze. */
             public static final FloatSetting COVERAGE =
-                    clampedFloat("caustica.rt.clouds.coverage", "clouds.coverage", 0.45f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.clouds.coverage", "clouds.coverage", 0.38f, 0.0f, 1.0f);
             /** Extinction per block inside fully dense cloud. Higher reads as darker, more solid cumulus. */
             public static final FloatSetting DENSITY =
                     clampedFloat("caustica.rt.clouds.density", "clouds.density", 0.045f, 0.0f, 1.0f);
@@ -862,6 +867,10 @@ public final class CausticaConfig {
              */
             public static final FloatSetting SHARPNESS =
                     clampedFloat("caustica.rt.grade.sharpness", "grade.sharpness", 0.12f, 0.0f, 1.0f);
+            /** Subtle optical edge falloff. Analytic and sample-free; 0 disables it. */
+            public static final FloatSetting LENS_VIGNETTE =
+                    clampedFloat("caustica.rt.grade.lensVignette", "grade.lens-vignette",
+                            0.08f, 0.0f, 0.5f);
 
             private Grade() {
             }
@@ -892,24 +901,18 @@ public final class CausticaConfig {
         }
 
         /**
-         * ReSTIR temporal reuse for the block-emitter reservoirs. Enabled by default with conservative history weighting. Reuses last frame's
-         * chosen emitter where the surface is unchanged, so a pixel accumulates far more effective
-         * candidates than one frame's budget allows — the difference shows up in caves and at night,
-         * where the light sampling is the noise floor.
-         */
-        /**
-         * Manual weather override for the renderer's fog, cloud and wetness response.
+         * Weather controls for the renderer's fog, cloud and wetness response.
          *
-         * <p>This exists because servers frequently never send rain packets — Wynncraft being the
-         * case in point — so {@code level.getRainLevel()} sits at zero forever and none of the storm
-         * visuals can be seen or tuned. Client-side weather mods solve this properly by driving
-         * vanilla's own rain state; this is the fallback for when no such mod is available for your
-         * Minecraft version.
+         * <p>Wynncraft does not report ordinary vanilla weather, so Caustica can run its own regional
+         * client-side atmosphere there. Other servers and single-player worlds use the level's weather.
          *
          * <p>It overrides only what the RENDERER reads. It does not make it rain: no particles, no
          * sound, no gameplay effect. Vanilla's own weather is untouched.
          */
         public static final class Weather {
+            /** Native regional rain, thunder, snowfall, sandstorms and smog while connected to Wynncraft. */
+            public static final BooleanSetting WYNNCRAFT_DYNAMIC =
+                    bool("caustica.rt.weather.wynncraftDynamic", "weather.wynncraft-dynamic", true);
             /** Rain level 0..1, or -1 to use whatever the world reports. */
             public static final FloatSetting RAIN_OVERRIDE =
                     clampedFloat("caustica.rt.weather.rainOverride", "weather.rain-override",

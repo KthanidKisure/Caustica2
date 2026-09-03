@@ -62,11 +62,12 @@ public bool fogActive(FogParams f) {
 
 static const int WEATHER_SNOW = 1;
 static const int WEATHER_SAND = 2;
+static const int WEATHER_SMOG = 3;
 
 float weatherFogStructure(WorldPush push, float3 position) {
     float intensity = clamp(push.fog2.z, 0.0, 1.0);
     int weatherType = int(round(push.fog2.y));
-    if (intensity <= 0.0 || (weatherType != WEATHER_SNOW && weatherType != WEATHER_SAND)) {
+    if (intensity <= 0.0) {
         return 1.0;
     }
     float time = push.waterParams.w;
@@ -76,28 +77,46 @@ float weatherFogStructure(WorldPush push, float3 position) {
         // a stable density field without per-ray procedural noise or frame-to-frame sparkling.
         coord = float3((position.x + time * 22.0) * 0.010, position.y * 0.035,
                        (position.z + time * 8.0) * 0.010);
-    } else {
+    } else if (weatherType == WEATHER_SNOW) {
         // Snowfall varies more vertically and drifts slowly sideways. This is the participating-medium
         // component; visible vanilla/particle flakes remain a separate foreground layer.
         coord = float3((position.x + time * 2.5) * 0.022, (position.y + time * 9.0) * 0.030,
                        (position.z + time * 1.5) * 0.022);
+    } else if (weatherType == WEATHER_SMOG) {
+        // Silent Expanse smog is broad, low-frequency and slow. Keeping the structure world-space avoids
+        // the screen-locked swimming that a post-process fog texture would produce while walking.
+        coord = float3((position.x + time * 1.1) * 0.008, position.y * 0.020,
+                       (position.z - time * 0.7) * 0.008);
+    } else {
+        // Vertically elongated rain curtains. The same single volume lookup used by the other weather
+        // modes gives visible depth variation without tracing individual drops or adding a second pass.
+        coord = float3((position.x + time * 3.0) * 0.018, (position.y + time * 26.0) * 0.006,
+                       (position.z + time * 0.8) * 0.018);
     }
     float n = cloudNoiseTex.SampleLevel(coord, 0.0).x;
-    float structured = weatherType == WEATHER_SAND ? lerp(0.55, 1.55, n) : lerp(0.72, 1.32, n);
+    float structured = weatherType == WEATHER_SAND ? lerp(0.55, 1.55, n)
+            : weatherType == WEATHER_SNOW ? lerp(0.72, 1.32, n)
+            : weatherType == WEATHER_SMOG ? lerp(0.62, 1.48, n)
+            : lerp(0.84, 1.20, n);
     return lerp(1.0, structured, intensity);
 }
 
 float3 applyWeatherFogTint(float3 inscatter, WorldPush push) {
     float intensity = clamp(push.fog2.z, 0.0, 1.0);
     int weatherType = int(round(push.fog2.y));
-    if (intensity <= 0.0 || weatherType == 0) {
+    if (intensity <= 0.0) {
         return inscatter;
     }
     float3 tint709 = weatherType == WEATHER_SAND
-            ? float3(0.82, 0.50, 0.24) : float3(0.82, 0.90, 1.0);
+            ? float3(0.82, 0.50, 0.24)
+            : weatherType == WEATHER_SNOW ? float3(0.82, 0.90, 1.0)
+            : weatherType == WEATHER_SMOG ? float3(0.64, 0.72, 0.58)
+            : float3(0.78, 0.86, 0.95);
     float3 tint = bt709ToAcesCg(tint709);
     float tintLuma = max(dot(tint, ACESCG_LUMA), 1.0e-5);
-    float strength = intensity * (weatherType == WEATHER_SAND ? 0.78 : 0.38);
+    float strength = intensity * (weatherType == WEATHER_SAND ? 0.78
+            : weatherType == WEATHER_SMOG ? 0.52
+            : weatherType == WEATHER_SNOW ? 0.38 : 0.14);
     return lerp(inscatter, inscatter * (tint / tintLuma), strength);
 }
 

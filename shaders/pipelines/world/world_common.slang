@@ -115,7 +115,7 @@ public struct WorldPush {
     // dimCloud: rgb = vanilla CLOUD_COLOR (linear BT.709), w = tint strength (0 = leave the deck lit
     // purely by the atmosphere).
     public float4   dimCloud;
-    // cloud3: x cloud march quality scale, y weather type (0 rain/normal, 1 snow, 2 sand/dust),
+    // cloud3: x cloud march quality scale, y weather type (0 rain/normal, 1 snow, 2 sand/dust, 3 smog),
     // z weather intensity, w secondary high-cloud coverage.
     public float4   cloud3;
     // fog2: x debug mode, y weather type, z weather intensity, w reserved.
