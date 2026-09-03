@@ -190,6 +190,12 @@ public final class RtTerrain {
     private volatile long lodGeneration = 1L;
     private int lodActiveDetail = Integer.MIN_VALUE;
     private int lodActiveHeightSections = Integer.MIN_VALUE;
+    private int lodScanCursor;
+    private int lodScanCentreX = Integer.MIN_VALUE;
+    private int lodScanCentreZ = Integer.MIN_VALUE;
+    private int lodScanStartY = Integer.MIN_VALUE;
+    private int lodScanRadius = -1;
+    private int lodScanHeight = -1;
     private int lodLoggedEmptyCount = -1;
     /**
      * Keeps LOD keys clear of real section keys. The key packs scy into 12 signed bits, and legal
@@ -1549,41 +1555,45 @@ public final class RtTerrain {
         }
         int budget = lodDispatchBudget(requestedBudget, lodInFlight.size());
 
-        outer:
-        for (int ring = 0; ring <= radius; ring++) {
-            for (int dx = -ring; dx <= ring; dx++) {
-                for (int dz = -ring; dz <= ring; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) {
-                        continue;
-                    }
-                    for (int dy = 0; dy < heightSections; dy++) {
-                        if (budget <= 0) {
-                            break outer;
-                        }
-                        int lx = centreX + dx;
-                        int lz = centreZ + dz;
-                        int ly = startPageY + dy;
-                        int originX = lx * sectionBlocks;
-                        int originZ = lz * sectionBlocks;
-                        // The source rejects these too, but skipping here is essential: near pages must
-                        // not consume the nearest-first dispatch budget and starve the actual distant ring.
-                        if (RtDhLodSource.overlapsFullResolution(sectionBlocks, originX, originZ)) {
-                            continue;
-                        }
-                        long key = lodKey(lx, ly, lz, detail);
-                        if (lodResident.containsKey(key) || lodInFlight.contains(key)) {
-                            continue;
-                        }
-                        long retryAfter = lodRetryAfterFrame.get(key);
-                        if (retryAfter > frame) {
-                            continue;
-                        }
-                        lodRetryAfterFrame.remove(key);
-                        dispatchLodSection(ctx, level, key, lx, ly, lz, detail, scale, sectionBlocks);
-                        budget--;
-                    }
-                }
+        int side = radius * 2 + 1;
+        int slotCount = side * side * heightSections;
+        if (centreX != lodScanCentreX || centreZ != lodScanCentreZ || startPageY != lodScanStartY
+                || radius != lodScanRadius || heightSections != lodScanHeight) {
+            lodScanCursor = 0;
+            lodScanCentreX = centreX;
+            lodScanCentreZ = centreZ;
+            lodScanStartY = startPageY;
+            lodScanRadius = radius;
+            lodScanHeight = heightSections;
+        }
+        int scanBudget = lodScanBudget(requestedBudget, slotCount);
+        for (int scanned = 0; scanned < scanBudget && budget > 0; scanned++) {
+            int slot = lodScanCursor;
+            lodScanCursor = (lodScanCursor + 1) % slotCount;
+            int horizontal = slot / heightSections;
+            int dy = slot % heightSections;
+            long offset = lodHorizontalOffset(horizontal);
+            int lx = centreX + (int) (offset >> 32);
+            int lz = centreZ + (int) offset;
+            int ly = startPageY + dy;
+            int originX = lx * sectionBlocks;
+            int originZ = lz * sectionBlocks;
+            // The source rejects these too, but skipping here is essential: near pages must not consume
+            // the nearest-first dispatch budget and starve the actual distant ring.
+            if (RtDhLodSource.overlapsFullResolution(sectionBlocks, originX, originZ)) {
+                continue;
             }
+            long key = lodKey(lx, ly, lz, detail);
+            if (lodResident.containsKey(key) || lodInFlight.contains(key)) {
+                continue;
+            }
+            long retryAfter = lodRetryAfterFrame.get(key);
+            if (retryAfter > frame) {
+                continue;
+            }
+            lodRetryAfterFrame.remove(key);
+            dispatchLodSection(ctx, level, key, lx, ly, lz, detail, scale, sectionBlocks);
+            budget--;
         }
     }
 
@@ -1594,6 +1604,39 @@ public final class RtTerrain {
         int maxInFlight = Math.min(LOD_MAX_IN_FLIGHT,
                 Math.max(LOD_MIN_IN_FLIGHT, requested * LOD_PIPELINE_FRAMES));
         return Math.min(requested, Math.max(0, maxInFlight - Math.max(inFlight, 0)));
+    }
+
+    static int lodScanBudget(int requested, int slotCount) {
+        if (requested <= 0 || slotCount <= 0) {
+            return 0;
+        }
+        return Math.min(slotCount, Math.max(256, requested * 128));
+    }
+
+    static long lodHorizontalOffset(int ordinal) {
+        if (ordinal <= 0) {
+            return 0L;
+        }
+        int ring = (int) Math.ceil((Math.sqrt(ordinal + 1.0) - 1.0) * 0.5);
+        int innerSide = ring * 2 - 1;
+        int perimeter = ordinal - innerSide * innerSide;
+        int edge = ring * 2;
+        int dx;
+        int dz;
+        if (perimeter < edge) {
+            dx = -ring + perimeter;
+            dz = -ring;
+        } else if (perimeter < edge * 2) {
+            dx = ring;
+            dz = -ring + perimeter - edge;
+        } else if (perimeter < edge * 3) {
+            dx = ring - (perimeter - edge * 2);
+            dz = ring;
+        } else {
+            dx = -ring;
+            dz = ring - (perimeter - edge * 3);
+        }
+        return ((long) dx << 32) | (dz & 0xffff_ffffL);
     }
 
     private void dispatchLodSection(RtContext ctx, ClientLevel level, long key,
@@ -1936,6 +1979,12 @@ public final class RtTerrain {
         }
         lodActiveDetail = Integer.MIN_VALUE;
         lodActiveHeightSections = Integer.MIN_VALUE;
+        lodScanCursor = 0;
+        lodScanCentreX = Integer.MIN_VALUE;
+        lodScanCentreZ = Integer.MIN_VALUE;
+        lodScanStartY = Integer.MIN_VALUE;
+        lodScanRadius = -1;
+        lodScanHeight = -1;
 
         List<LodPrepared> completed;
         synchronized (lodPrepared) {

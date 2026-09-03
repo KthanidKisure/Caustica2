@@ -174,7 +174,15 @@ public void storeReservoir(int2 pix, uint parity, PackedReservoir p) {
     }
 }
 
+void capReservoirStream(inout Reservoir r) {
+    if (r.M > RESTIR_M_CAP) {
+        r.wSum *= RESTIR_M_CAP / r.M;
+        r.M = RESTIR_M_CAP;
+    }
+}
+
 public PackedReservoir toPacked(Reservoir r) {
+    capReservoirStream(r);
     PackedReservoir p;
     p.pos = r.pos;
     p.lnrm = r.lnrm;
@@ -246,14 +254,15 @@ public Reservoir temporalCombine(Reservoir current, PackedReservoir history,
     float phat;
     evalSampleContrib(history.pos, history.lnrm, history.le, history.area,
                       hitPos, n, v, rd, diffAlb, F0, rough, twoSided, sss, phat);
+    float historyM = min(history.M, RESTIR_M_CAP);
     if (phat <= 0.0) {
         // The remembered emitter contributes nothing here — behind the surface now, or facing away.
         // Its M is still evidence about how much was sampled, but the sample itself cannot survive.
-        current.M += min(history.M, RESTIR_M_CAP);
+        current.M += historyM;
+        capReservoirStream(current);
         current.W = current.phat > 0.0 ? current.wSum / (current.M * current.phat) : 0.0;
         return current;
     }
-    float historyM = min(history.M, RESTIR_M_CAP);
     float weight = phat * history.W * historyM;
     current.wSum += weight;
     current.M += historyM;
@@ -264,6 +273,9 @@ public Reservoir temporalCombine(Reservoir current, PackedReservoir history,
         current.area = history.area;
         current.phat = phat;
     }
+    // M and wSum describe the same weighted stream and must be capped together. Capping only persisted M
+    // changes W*M after unpacking, producing an energy step and making each spatial tap overconfident.
+    capReservoirStream(current);
     // Rebuild the contribution weight from the merged stream. Guarding on phat keeps a survivor whose
     // target function collapsed from producing an infinite W and a white fireflies pixel.
     current.W = current.phat > 0.0 ? current.wSum / (current.M * current.phat) : 0.0;
